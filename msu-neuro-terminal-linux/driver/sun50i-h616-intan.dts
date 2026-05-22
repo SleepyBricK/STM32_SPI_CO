@@ -1,0 +1,44 @@
+/*
+ * Device Tree overlay для Intan RHS2116 на SPI1 CS1
+ * Orange Pi Zero 2W (H618)
+ *
+ * Как в оригинальном проекте:
+ * - SPI1, chip select 1, 25 МГц, mode 0
+ * - GPIO PH2 (питание Intan) = power-gpios
+ *
+ * overlays=intan в /boot/orangepiEnv.txt
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "allwinner,sun50i-h616";
+
+	fragment@0 {
+		target-path = "/aliases";
+		__overlay__ {
+			spi1 = "/soc/spi@5011000";
+		};
+	};
+
+	fragment@1 {
+		target = <&spi1>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&spi1_pins>, <&spi1_cs1_pin>;
+
+			intan@1 {
+				compatible = "msu,intan-rhs2116";
+				status = "okay";
+				reg = <1>;
+				spi-max-frequency = <25000000>;
+				/* PH2 = питание Intan, как GPIO 226 в Python */
+				power-gpios = <&pio 7 2 0>;
+			};
+		};
+	};
+};

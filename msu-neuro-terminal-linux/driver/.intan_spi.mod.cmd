@@ -1,0 +1,1 @@
+cmd_/home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.mod := printf '%s\n'   intan_spi.o | awk '!x[$$0]++ { print("/home/orangepi/msu-neuro-terminal-linux/driver/"$$0) }' > /home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.mod

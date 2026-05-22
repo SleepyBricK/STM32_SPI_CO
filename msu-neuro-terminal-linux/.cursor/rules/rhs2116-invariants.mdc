@@ -1,0 +1,16 @@
+---
+description: Enforce RHS2116 register and mode invariants
+alwaysApply: true
+---
+
+# RHS2116 Invariants
+
+- Treat `services/server/rhs2116_profiles.py` as the source of truth for shared RHS2116 register defaults and init order.
+- Compute `R0` only from actual total ADC rate; do not hardcode unrelated bias values per file.
+- `R1` is mode-specific. For phase measurement, explicitly clear `absmode` (bit 5), `DSPen` (bit 4), and `DSP cutoff` (bits 3:0), then restore the original register afterward.
+- `R2/R3` are Zcheck-only registers. Always return to `R2=0x0000` and `R3=0x0080` after impedance/phase work.
+- `R32/R33` are global stimulation unlock words, not per-channel masks. Use `0xAAAA` and `0x00FF` only for stimulation ownership; keep both `0x0000` in recording/impedance safe-state.
+- `R38` must stay `0xFFFF` in all modes. Do not repurpose `R9` as DC amp power control.
+- Triggered registers (`R10`, `R12`, `R42`, `R44`, `R46`, `R48`, `R64-R79`, `R96-R111`) follow one rule: write shadow state with `U=0`, then commit once via `R42` with `U=1`.
+- Do not mix old `spidev` pipeline assumptions with `/dev/intan` driver paths.
+- UDP recording changes must preserve the little-endian `v2` packet contract and GUI must keep a single socket reader/parser path.

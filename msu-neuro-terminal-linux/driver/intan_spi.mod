@@ -1,0 +1,1 @@
+/home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.o

@@ -1,0 +1,1 @@
+cmd_/home/orangepi/msu-neuro-terminal-linux/driver/modules.order := {   echo /home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.ko; :; } > /home/orangepi/msu-neuro-terminal-linux/driver/modules.order

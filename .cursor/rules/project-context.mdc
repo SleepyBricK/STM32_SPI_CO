@@ -1,0 +1,10 @@
+---
+description: Контекст репозитория WeActSTM32H743 — читать перед работой при потере контекста
+alwaysApply: true
+---
+
+# WeActSTM32H743
+
+Перед изменениями или при неясной архитектуре **прочитайте корневой файл `AGENTS.md`**: там МК STM32H743VIT6, HSE 8 MHz, пины SPI2/USART1/USB3300 ULPI, USB HS vendor bulk для Orange Pi, договорённости по Intan RHS2116 (`intan_spi.c` / 32-битные кадры, CS PE11), сборка CMake и ссылка на `msu-neuro-terminal-linux/`.
+
+В `Core/Src/main.c` в заголовке указана отсылка к `AGENTS.md`. Пользователь предпочитает ответы **на русском**. Соблюдайте блоки `USER CODE` в файлах STM32Cube.

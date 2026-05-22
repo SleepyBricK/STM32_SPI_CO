@@ -1,0 +1,34 @@
+# Build outputs
+build/
+build-ulpi/
+**/build/
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.su
+
+# IAR EWARM
+EWARM/**/Obj/
+EWARM/**/Exe/
+EWARM/**/List/
+EWARM/**/*.dep
+EWARM/**/*.ewd
+EWARM/**/*.ewt
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json

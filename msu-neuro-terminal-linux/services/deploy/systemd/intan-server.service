@@ -1,0 +1,17 @@
+[Unit]
+Description=Intan RHS2116 TCP/UDP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/admin/Stimulator_2.0_orangepizero2w/services/server
+ExecStart=/usr/bin/python3 /home/admin/Stimulator_2.0_orangepizero2w/services/server/intan_server.py --verbose
+Restart=always
+RestartSec=2
+User=orangepi
+Group=orangepi
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

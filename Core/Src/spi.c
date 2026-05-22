@@ -1,0 +1,169 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    spi.c
+  * @brief   This file provides code for the configuration
+  *          of the SPI instances. SPI2 (Intan): без HAL_SPI_Init —
+  *          см. Intan_SPI4_HwInit() в Core/Src/intan_spi4_hw.c.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "spi.h"
+#include "usart.h"
+#include "intan_spi4_hw.h"
+
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+SPI_HandleTypeDef hspi2;
+
+/* SPI2 init function */
+void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_32BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 0x0;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi2.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi2.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi2.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi2.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi2.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi2.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi2.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi2.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi2.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  UART_DebugMark("[S] MX_SPI2 MspInit + register init (no HAL_SPI_Init)\r\n");
+  hspi2.State = HAL_SPI_STATE_RESET;
+  HAL_SPI_MspInit(&hspi2);
+  if (Intan_SPI4_HwInit(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  UART_DebugMark("[S] MX_SPI2 Intan_SPI4_HwInit OK\r\n");
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
+
+}
+
+void HAL_SPI_MspInit(SPI_HandleTypeDef* spiHandle)
+{
+
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+  if(spiHandle->Instance==SPI2)
+  {
+  /* USER CODE BEGIN SPI2_MspInit 0 */
+    UART_DebugMark("[S] SPI2_MspInit enter\r\n");
+    /* HSE 8 MHz: SPI2 kernel = PLL2P = 200 MHz; SCK = 200 MHz / 8 = 25 MHz (лимит RHS2116). */
+    UART_DebugMark("[S] SPI123 HAL_RCCEx_PeriphCLKConfig (PLL2)...\r\n");
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SPI123;
+    PeriphClkInitStruct.Spi123ClockSelection = RCC_SPI123CLKSOURCE_PLL2;
+    PeriphClkInitStruct.PLL2.PLL2M = 2;
+    PeriphClkInitStruct.PLL2.PLL2N = 100;
+    PeriphClkInitStruct.PLL2.PLL2P = 2;
+    PeriphClkInitStruct.PLL2.PLL2Q = 4;
+    PeriphClkInitStruct.PLL2.PLL2R = 2;
+    PeriphClkInitStruct.PLL2.PLL2RGE = RCC_PLL2VCIRANGE_2;
+    PeriphClkInitStruct.PLL2.PLL2VCOSEL = RCC_PLL2VCOMEDIUM;
+    PeriphClkInitStruct.PLL2.PLL2FRACN = 0;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    UART_DebugMark("[S] SPI123 PeriphCLK OK\r\n");
+
+    __HAL_RCC_SPI2_CLK_ENABLE();
+    UART_DebugMark("[S] SPI2 kernel clock enabled\r\n");
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    /**SPI2 GPIO Configuration
+    PA9     ------> SPI2_SCK
+    PB14    ------> SPI2_MISO
+    PC1     ------> SPI2_MOSI
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_14;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    UART_DebugMark("[S] SPI2 GPIO PA9/PB14/PC1 init done\r\n");
+    UART_DebugMark("[S] SPI2_MspInit done\r\n");
+
+  /* USER CODE END SPI2_MspInit 0 */
+
+  /* USER CODE BEGIN SPI2_MspInit 1 */
+
+  /* USER CODE END SPI2_MspInit 1 */
+  }
+}
+
+void HAL_SPI_MspDeInit(SPI_HandleTypeDef* spiHandle)
+{
+
+  if(spiHandle->Instance==SPI2)
+  {
+  /* USER CODE BEGIN SPI2_MspDeInit 0 */
+
+  /* USER CODE END SPI2_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_SPI2_CLK_DISABLE();
+
+    /**SPI2 GPIO Configuration
+    PA9     ------> SPI2_SCK
+    PB14    ------> SPI2_MISO
+    PC1     ------> SPI2_MOSI
+    */
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_9);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_14);
+    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_1);
+
+  /* USER CODE BEGIN SPI2_MspDeInit 1 */
+
+  /* USER CODE END SPI2_MspDeInit 1 */
+  }
+}
+
+/* USER CODE BEGIN 1 */
+
+/* USER CODE END 1 */
+
