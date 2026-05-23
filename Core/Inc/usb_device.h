@@ -6,8 +6,6 @@ extern "C" {
 #endif
 
 void USB_DEVICE_Init(void);
-void USB_DEVICE_FinalizeAttach(void);
-void USB_DEVICE_PollEvents(void);
 
 #ifdef __cplusplus
 }

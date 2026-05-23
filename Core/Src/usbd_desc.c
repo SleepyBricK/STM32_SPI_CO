@@ -2,8 +2,8 @@
 #include "usbd_ctlreq.h"
 
 #define USBD_MANUFACTURER_STRING         "warforterritory"
-#define USBD_PRODUCT_STRING_HS           "STM32H743 Intan HS Bulk"
-#define USBD_SERIALNUMBER_STRING_HS      "000000000001"
+#define USBD_PRODUCT_STRING_HS           "STM32H743 RHS1 USB HS"
+#define USBD_SERIALNUMBER_STRING_HS      "000000000002"
 #define USBD_CONFIGURATION_STRING_HS     "HS Bulk Config"
 #define USBD_INTERFACE_STRING_HS         "Vendor Bulk Interface"
 
@@ -30,8 +30,8 @@ __ALIGN_BEGIN static uint8_t USBD_HS_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
 {
   USB_LEN_DEV_DESC,
   USB_DESC_TYPE_DEVICE,
-  0x00, 0x02,                       /* bcdUSB = 2.00 */
-  0x00,                             /* Class is specified at interface level. */
+  0x00, 0x02,
+  0x00,
   0x00,
   0x00,
   USB_MAX_EP0_SIZE,
@@ -39,7 +39,7 @@ __ALIGN_BEGIN static uint8_t USBD_HS_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
   HIBYTE(USBD_VID),
   LOBYTE(USBD_PID_HS_VENDOR_BULK),
   HIBYTE(USBD_PID_HS_VENDOR_BULK),
-  0x00, 0x02,                       /* bcdDevice = 2.00 */
+  0x00, 0x02,
   USBD_IDX_MFC_STR,
   USBD_IDX_PRODUCT_STR,
   USBD_IDX_SERIAL_STR,

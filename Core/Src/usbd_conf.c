@@ -1,8 +1,7 @@
 #include "usbd_conf.h"
 #include "usbd_core.h"
-#include "usart.h"
 #include "usb3300_ulpi_hw.h"
-#include <stdio.h>
+#include "main.h"
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
@@ -12,7 +11,18 @@ volatile uint32_t g_usb_ev_reset;
 volatile uint32_t g_usb_ev_connect;
 volatile uint32_t g_usb_ev_disconnect;
 
-static USBD_StatusTypeDef USBD_Get_USB_Status(HAL_StatusTypeDef hal_status);
+static USBD_StatusTypeDef USBD_Get_USB_Status(HAL_StatusTypeDef hal_status)
+{
+  switch (hal_status)
+  {
+    case HAL_OK:
+      return USBD_OK;
+    case HAL_BUSY:
+      return USBD_BUSY;
+    default:
+      return USBD_FAIL;
+  }
+}
 
 void HAL_PCD_SetupStageCallback(PCD_HandleTypeDef *hpcd)
 {
@@ -78,12 +88,9 @@ void HAL_PCD_MspInit(PCD_HandleTypeDef *pcdHandle)
 {
   if (pcdHandle->Instance == USB_OTG_HS)
   {
-    UART_DebugMark("[USB] HAL_PCD_MspInit HS enter\r\n");
     USB3300_ULPI_HwInit();
-
     HAL_NVIC_SetPriority(OTG_HS_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
-    UART_DebugMark("[USB] HAL_PCD_MspInit HS done\r\n");
   }
 }
 
@@ -107,7 +114,6 @@ USBD_StatusTypeDef USBD_LL_Init(USBD_HandleTypeDef *pdev)
     hpcd_USB_OTG_HS.Instance = USB_OTG_HS;
     hpcd_USB_OTG_HS.Init.dev_endpoints = 9;
 #if (USB_DEBUG_FORCE_FULL_SPEED == 1U)
-    UART_DebugMark("[USB] DEBUG forcing Full Speed over ULPI\r\n");
     hpcd_USB_OTG_HS.Init.speed = PCD_SPEED_HIGH_IN_FULL;
 #else
     hpcd_USB_OTG_HS.Init.speed = PCD_SPEED_HIGH;
@@ -121,13 +127,10 @@ USBD_StatusTypeDef USBD_LL_Init(USBD_HandleTypeDef *pdev)
     hpcd_USB_OTG_HS.Init.vbus_sensing_enable = DISABLE;
     hpcd_USB_OTG_HS.Init.use_dedicated_ep1 = DISABLE;
 
-    UART_DebugMark("[USB] HAL_PCD_Init HS...\r\n");
     if (HAL_PCD_Init(&hpcd_USB_OTG_HS) != HAL_OK)
     {
-      UART_DebugMark("[USB] HAL_PCD_Init HS failed\r\n");
       Error_Handler();
     }
-    UART_DebugMark("[USB] HAL_PCD_Init HS OK\r\n");
 
     HAL_PCDEx_SetRxFiFo(&hpcd_USB_OTG_HS, 0x200);
     HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS, 0, 0x40);
@@ -230,40 +233,4 @@ void *USBD_static_malloc(uint32_t size)
 void USBD_static_free(void *p)
 {
   (void)p;
-}
-
-static USBD_StatusTypeDef USBD_Get_USB_Status(HAL_StatusTypeDef hal_status)
-{
-  switch (hal_status)
-  {
-    case HAL_OK:
-      return USBD_OK;
-    case HAL_BUSY:
-      return USBD_BUSY;
-    default:
-      return USBD_FAIL;
-  }
-}
-
-void USBD_LogStatus(const char *tag)
-{
-  char line[160];
-  USB_OTG_GlobalTypeDef *usb = USB_OTG_HS;
-  USB_OTG_DeviceTypeDef *dev = (USB_OTG_DeviceTypeDef *)((uint32_t)usb + USB_OTG_DEVICE_BASE);
-  uint32_t dsts = dev->DSTS;
-  uint32_t dctl = dev->DCTL;
-  uint32_t gotg = usb->GOTGCTL;
-
-  (void)snprintf(line, sizeof(line),
-                 "[USB] %s dev_state=%u rst=%lu conn=%lu disc=%lu "
-                 "DSTS=0x%08lX DCTL=0x%08lX GOTGCTL=0x%08lX\r\n",
-                 (tag != NULL) ? tag : "?",
-                 (unsigned)hUsbDeviceHS.dev_state,
-                 (unsigned long)g_usb_ev_reset,
-                 (unsigned long)g_usb_ev_connect,
-                 (unsigned long)g_usb_ev_disconnect,
-                 (unsigned long)dsts,
-                 (unsigned long)dctl,
-                 (unsigned long)gotg);
-  UART_DebugMark(line);
 }

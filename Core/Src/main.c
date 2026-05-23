@@ -27,10 +27,8 @@
 #include "gpio.h"
 #include "intan_spi.h"
 #include "intan_uart_cli.h"
-#include "intan_usb_bulk.h"
 #include "usb_device.h"
-#include "usb3300_ulpi_hw.h"
-#include "usbd_conf.h"
+#include "usb_stream_service.h"
 #include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
@@ -69,17 +67,6 @@ static void MPU_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void UART_EarlyAlive(void)
-{
-  const char msg[] = "\r\nBOOT\r\n";
-  (void)HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)(sizeof(msg) - 1U), 200U);
-}
-
-static void UART_Mark(const char *s)
-{
-  UART_DebugMark(s);
-}
-
 /* USER CODE END 0 */
 
 /**
@@ -103,7 +90,6 @@ int main(void)
 
   /* USER CODE BEGIN Init */
   UART_EarlyMinInit(64000000U);
-  UART_EarlyPrint("\r\nEARLY\r\n");
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -111,58 +97,32 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
   UART_EarlyMinInit(60000000U);
-  UART_EarlyPrint("CLK\r\n");
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  /* USART до RTC: RTC/LSE опциональны (BOARD_HAS_LSE), не блокируют UART/USB */
+  /* USART до RTC: RTC/LSE опциональны (BOARD_HAS_LSE), не блокируют UART */
   MX_USART1_UART_Init();
-  UART_DebugMark("[M] post MX_GPIO + MX_USART1\r\n");
-  UART_EarlyAlive();
-  UART_DebugMark("[M] before USB3300 ULPI init\r\n");
-  USB3300_ULPI_HwInit();
-  UART_DebugMark("[M] USB3300 ULPI pins/clocks init\r\n");
-  if (__HAL_PWR_GET_FLAG(PWR_FLAG_USB33RDY) == 0U)
-  {
-    UART_DebugMark("[M] WARN USB33RDY is not set\r\n");
-  }
-  UART_DebugMark("[M] before USB_DEVICE_Init\r\n");
-  USB_DEVICE_Init();
-  UART_DebugMark("[M] USB HS device init\r\n");
-  UART_DebugMark("[M] before MX_RTC_Init\r\n");
   MX_RTC_Init();
-  UART_DebugMark("[M] after MX_RTC_Init\r\n");
-  UART_Mark("\r\n+RTC\r\n");
 #if (INTAN_HW_PRESENT == 1)
-  UART_DebugMark("[M] before MX_SPI2_Init\r\n");
   MX_SPI2_Init();
-  UART_DebugMark("[M] after MX_SPI2_Init\r\n");
-  UART_Mark("\r\n+SPI\r\n");
 #endif
   /* USER CODE BEGIN 2 */
 #if (INTAN_HW_PRESENT == 1)
-  UART_DebugMark("[M] before Intan_SPI_Init\r\n");
   Intan_SPI_Init(&hspi2);
   if (Intan_ChipBringup() != HAL_OK)
   {
-    UART_DebugMark("[M] Intan_ChipBringup failed (SPI/Intan?)\r\n");
+    /* Intan недоступен — без UART-диагностики. */
   }
   {
     uint16_t ign = 0U;
     (void)Intan_ReadReg(255U, &ign);
     (void)Intan_ReadReg(255U, &ign);
   }
-  UART_DebugMark("[M] after Intan_SPI_Init + bringup\r\n");
-  UART_Mark("\r\n+INTAN_GPIO\r\n");
-#else
-  UART_DebugMark("[M] INTAN_HW_PRESENT=0 — skip SPI2/Intan (USB/UART test mode)\r\n");
 #endif
-  UART_DebugMark("[M] before Intan_UART_CLI_Init\r\n");
   Intan_UART_CLI_Init();
-  UART_DebugMark("[M] after Intan_UART_CLI_Init (main loop)\r\n");
-  USB_DEVICE_FinalizeAttach();
-  UART_DebugMark("[M] ready: UART HELP/PING | USB3300 replug if rst=0, then usb_intan_cmd.py\r\n");
+  USB_DEVICE_Init();
+  UsbStreamService_Init();
 
   /* USER CODE END 2 */
 
@@ -173,9 +133,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    UsbVendorBulk_ProcessOutCommands();
+    UsbStreamService_Process();
+    UsbStreamService_TxPump();
     Intan_UART_CLI_Process();
-    Intan_USB_Bulk_Process();
-    USB_DEVICE_PollEvents();
   }
   /* USER CODE END 3 */
 }
@@ -191,7 +152,7 @@ void SystemClock_Config(void)
 
   /*
    * Как WorkingVER (CDC 5740): VSCALE2, HSE-only, 240 MHz SYSCLK.
-   * LSE включается позже в MX_RTC_Init — не блокирует UART/USB при старте.
+   * LSE включается позже в MX_RTC_Init — не блокирует UART при старте.
    */
   HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
 
@@ -281,6 +242,20 @@ void MPU_Config(void)
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
+  /** D2 SRAM (0x30000000): .dma_buffer — SPI DMA, без D-Cache (STM32H7). */
+  MPU_InitStruct.Number = MPU_REGION_NUMBER1;
+  MPU_InitStruct.BaseAddress = 0x30000000U;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_512KB;
+  MPU_InitStruct.SubRegionDisable = 0x00U;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
   /* Enables the MPU */
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 
@@ -294,7 +269,6 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   UART_EarlyMinInit(60000000U);
-  UART_EarlyPrint("\r\n!ERR_HANDLER\r\n");
   UART_SosBlinkPB6();
   /* USER CODE END Error_Handler_Debug */
 }

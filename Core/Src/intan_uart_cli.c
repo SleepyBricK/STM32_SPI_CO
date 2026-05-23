@@ -1,6 +1,6 @@
 /**
  * @file intan_uart_cli.c
- * @brief Текстовый протокол по USART1 (115200 8N1): команды Intan и бенч регистрации.
+ * @brief Команды по USART1 RX (115200 8N1). Ответы на TX отключены (тишина на линии).
  */
 
 #include "intan_uart_cli.h"
@@ -23,11 +23,8 @@ static volatile uint8_t s_line_ready;
 
 static void uart_tx_str(const char *s)
 {
-  size_t n = strlen(s);
-  if (n > 0U)
-  {
-    (void)HAL_UART_Transmit(&huart1, (uint8_t *)s, (uint16_t)n, UART_IO_TIMEOUT_MS);
-  }
+  (void)s;
+  /* Текстовый ответ по UART отключён. Приём команд (RX IT) сохранён. */
 }
 
 static void reply_ok(const char *msg)
@@ -84,11 +81,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     {
       s_line[s_line_len] = (char)c;
       s_line_len++;
-      /* Эхо печатных символов: без него в screen кажется, что строка не набирается. */
-      if (c >= 32U && c <= 126U)
-      {
-        (void)HAL_UART_Transmit(&huart1, &c, 1U, 10U);
-      }
     }
   }
 
@@ -151,11 +143,11 @@ static void cmd_help(void)
       "  spec: ALL,*|0,2|0-3  pol 0=neg 1=pos  h,d: DSP/DC flags\r\n");
 #else
   uart_tx_str(
-      "OK CMDS: HELP PING — Intan не подключён (INTAN_HW_PRESENT=0)\r\n"
-      "  USB: python3 tools/usb_intan_cmd.py PING / ECHO text\r\n");
+      "OK CMDS: HELP PING — Intan не подключён (INTAN_HW_PRESENT=0)\r\n");
 #endif
 }
 
+#if (INTAN_HW_PRESENT == 0)
 static int cmd_needs_intan(const char *cmd)
 {
   if (strcmp(cmd, "HELP") == 0 || strcmp(cmd, "?") == 0 || strcmp(cmd, "PING") == 0)
@@ -164,6 +156,7 @@ static int cmd_needs_intan(const char *cmd)
   }
   return 1;
 }
+#endif
 
 static void dispatch_line(char *line)
 {
@@ -804,27 +797,16 @@ static void dispatch_line(char *line)
 
 void Intan_UART_CLI_Init(void)
 {
-  UART_DebugMark("[C] CLI_Init enter\r\n");
   s_line_len = 0U;
   s_line_ready = 0U;
   s_line[0] = '\0';
 
   Intan_App_DWT_Reset();
-  UART_DebugMark("[C] DWT reset OK\r\n");
 
   HAL_NVIC_SetPriority(USART1_IRQn, 6U, 0U);
   HAL_NVIC_EnableIRQ(USART1_IRQn);
-  UART_DebugMark("[C] USART1 IRQ enabled\r\n");
 
   (void)HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1U);
-  UART_DebugMark("[C] UART RX IT started\r\n");
-
-  uart_tx_str("\r\nINTAN_UART_READY\r\n");
-#if (INTAN_HW_PRESENT == 0)
-  uart_tx_str("OK mode: no Intan HW — UART PING, USB PING/ECHO\r\n");
-#endif
-  cmd_help();
-  UART_DebugMark("[C] CLI_Init done\r\n");
 }
 
 void Intan_UART_CLI_Process(void)

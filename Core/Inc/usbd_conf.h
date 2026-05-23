@@ -21,8 +21,7 @@ extern "C" {
 #define USBD_CLASS_BOS_ENABLED           0U
 
 #define DEVICE_HS                        0U
-/* Diagnostic mode: run OTG_HS through ULPI at Full Speed (12 Mbit/s) instead of HS. */
-#define USB_DEBUG_FORCE_FULL_SPEED        0U
+#define USB_DEBUG_FORCE_FULL_SPEED       0U
 
 #define USBD_malloc                      (void *)USBD_static_malloc
 #define USBD_free                        USBD_static_free
@@ -40,8 +39,6 @@ void USBD_static_free(void *p);
 extern volatile uint32_t g_usb_ev_reset;
 extern volatile uint32_t g_usb_ev_connect;
 extern volatile uint32_t g_usb_ev_disconnect;
-
-void USBD_LogStatus(const char *tag);
 
 #ifdef __cplusplus
 }

@@ -42,11 +42,12 @@ void MX_USART1_UART_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
-/** Отладочная строка в USART1 (безопасна до MX_USART1: не шлёт, если UART не инициализирован). */
+/** Отладочные метки USART1 выключены (пустая реализация). */
 void UART_DebugMark(const char *line);
 
 /** Минимальный USART1 PB6/PB7 до HAL clock config (ядро USART = kernel_hz). */
 void UART_EarlyMinInit(uint32_t kernel_hz);
+/** Ранний printf на строку — вывод отключён. */
 void UART_EarlyPrint(const char *line);
 void UART_SosBlinkPB6(void);
 

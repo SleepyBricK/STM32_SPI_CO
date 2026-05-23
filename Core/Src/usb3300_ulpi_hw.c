@@ -1,9 +1,6 @@
 #include "usb3300_ulpi_hw.h"
-#include "usart.h"
+#include "main.h"
 
-/*
- * STM32H743VIT6: USB3300 ULPI + bypass USBREGEN + PLL3 48 MHz (как WorkingVER).
- */
 #ifndef USB_VDD33_BYPASS
 #define USB_VDD33_BYPASS  1U
 #endif
@@ -12,7 +9,7 @@
 #define USB3300_XTAL_STARTUP_MS  10U
 #endif
 
-static uint8_t s_ulpi_hw_done;
+static uint8_t s_done;
 
 static void USB_ULPI_ClockInit(void)
 {
@@ -31,14 +28,11 @@ static void USB_ULPI_ClockInit(void)
 
   if (HAL_RCCEx_PeriphCLKConfig(&clk) != HAL_OK)
   {
-    UART_DebugMark("[ULPI] RCC USB PLL3 FAILED\r\n");
     Error_Handler();
   }
-
-  UART_DebugMark("[ULPI] RCC USB PLL3 48MHz OK\r\n");
 }
 
-static HAL_StatusTypeDef USB_PowerInit(void)
+static void USB_PowerInit(void)
 {
   uint32_t t0;
 
@@ -51,39 +45,30 @@ static HAL_StatusTypeDef USB_PowerInit(void)
   {
     if ((HAL_GetTick() - t0) > 500U)
     {
-      UART_DebugMark("[ULPI] PWR: USB33RDY timeout, continue\r\n");
-      return HAL_OK;
+      return;
     }
   }
-
-  UART_DebugMark("[ULPI] PWR: USB33RDY=1\r\n");
-  return HAL_OK;
 #else
-  if (HAL_PWREx_EnableUSBReg() == HAL_OK)
+  if (HAL_PWREx_EnableUSBReg() != HAL_OK)
   {
+    (void)HAL_PWREx_DisableUSBReg();
     HAL_PWREx_EnableUSBVoltageDetector();
-    return HAL_OK;
   }
-
-  (void)HAL_PWREx_DisableUSBReg();
-  HAL_PWREx_EnableUSBVoltageDetector();
 
   t0 = HAL_GetTick();
   while (__HAL_PWR_GET_FLAG(PWR_FLAG_USB33RDY) == 0U)
   {
     if ((HAL_GetTick() - t0) > 500U)
     {
-      return HAL_ERROR;
+      return;
     }
   }
-
-  return HAL_OK;
 #endif
 }
 
 static void USB3300_ULPI_GpioInit(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitTypeDef gpio = {0};
 
   __HAL_RCC_SYSCFG_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -93,20 +78,20 @@ static void USB3300_ULPI_GpioInit(void)
   HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC2, SYSCFG_SWITCH_PC2_CLOSE);
   HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC3, SYSCFG_SWITCH_PC3_CLOSE);
 
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF10_OTG1_HS;
+  gpio.Mode = GPIO_MODE_AF_PP;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  gpio.Alternate = GPIO_AF10_OTG1_HS;
 
-  GPIO_InitStruct.Pin = GPIO_PIN_3 | GPIO_PIN_5;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  gpio.Pin = GPIO_PIN_3 | GPIO_PIN_5;
+  HAL_GPIO_Init(GPIOA, &gpio);
 
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_5 | GPIO_PIN_10 |
-                        GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_5 | GPIO_PIN_10 |
+             GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13;
+  HAL_GPIO_Init(GPIOB, &gpio);
 
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_2 | GPIO_PIN_3;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+  gpio.Pin = GPIO_PIN_0 | GPIO_PIN_2 | GPIO_PIN_3;
+  HAL_GPIO_Init(GPIOC, &gpio);
 
   __HAL_RCC_USB1_OTG_HS_CLK_ENABLE();
   __HAL_RCC_USB1_OTG_HS_ULPI_CLK_ENABLE();
@@ -114,18 +99,14 @@ static void USB3300_ULPI_GpioInit(void)
 
 void USB3300_ULPI_HwInit(void)
 {
-  if (s_ulpi_hw_done != 0U)
+  if (s_done != 0U)
   {
     return;
   }
 
-  UART_DebugMark("[ULPI] wait USB3300 XTAL\r\n");
   HAL_Delay(USB3300_XTAL_STARTUP_MS);
-
   USB_ULPI_ClockInit();
-  (void)USB_PowerInit();
+  USB_PowerInit();
   USB3300_ULPI_GpioInit();
-
-  s_ulpi_hw_done = 1U;
-  UART_DebugMark("[ULPI] HwInit done\r\n");
+  s_done = 1U;
 }

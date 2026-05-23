@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../STM32_SPI_CO"
+		}
+	],
+	"settings": {}
+}

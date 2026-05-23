@@ -22,8 +22,6 @@
 
 /* USER CODE BEGIN 0 */
 
-#include <string.h>
-
 void UART_EarlyMinInit(uint32_t kernel_hz)
 {
   uint32_t brr;
@@ -53,18 +51,8 @@ void UART_EarlyMinInit(uint32_t kernel_hz)
 
 void UART_EarlyPrint(const char *line)
 {
-  if (line == NULL)
-  {
-    return;
-  }
-
-  while (*line != '\0')
-  {
-    while ((USART1->ISR & USART_ISR_TXE_TXFNF) == 0U)
-    {
-    }
-    USART1->TDR = (uint8_t)(*line++);
-  }
+  (void)line;
+  /* Вывод по UART отключён (нет отладочных строк на линию). */
 }
 
 void UART_SosBlinkPB6(void)
@@ -90,16 +78,8 @@ void UART_SosBlinkPB6(void)
 
 void UART_DebugMark(const char *line)
 {
-  if (line == NULL)
-  {
-    return;
-  }
-  if (huart1.Instance != USART1)
-  {
-    UART_EarlyPrint(line);
-    return;
-  }
-  (void)HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)strlen(line), 80U);
+  (void)line;
+  /* Отладочный вывод USART1 выключен. */
 }
 
 /* USER CODE END 0 */
@@ -146,7 +126,6 @@ void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-  UART_DebugMark("[U] MX_USART1 done\r\n");
 
   /* USER CODE END USART1_Init 2 */
 

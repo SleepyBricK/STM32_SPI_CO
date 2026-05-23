@@ -6,9 +6,11 @@
 
 ## Назначение
 
-Прошивка для платы на **STM32H743VIT6** (Cortex-M7, LQFP100). Проект начинался как порт для отладочной платы **WeAct STM32H743**, затем перенесён на пользовательскую плату с HSE 8 MHz и USB3300 ULPI. В репозитории есть порт логики работы с **Intan RHS2116** по SPI (совместимость с Linux/Python-проектом в каталоге `msu-neuro-terminal-linux/`).
+Прошивка для платы на **STM32H743VIT6** (Cortex-M7, LQFP100). Проект начинался как порт для отладочной платы **WeAct STM32H743**, затем перенесён на пользовательскую плату с HSE 8 MHz. В репозитории есть порт логики работы с **Intan RHS2116** по SPI (совместимость с Linux/Python-проектом в каталоге `msu-neuro-terminal-linux/`).
 
-Эталон **рабочего USB на этой плате**: каталог **`WorkingVER/STM32H743/`** (CDC `0483:5740`, без Intan). Основной проект — vendor bulk `0483:5741` + Intan; **порядок clocks/USB3300/GPIO** должен совпадать с WorkingVER.
+**USB HS Streaming V2** (vendor bulk `0483:5741`, RHS1 4096 B) — реализован с нуля по **`usb_hs_streaming_v2_clean_slate_guide.md`**. Synthetic `SYNTH_STREAM` на host: **~3 M kS/s**, **~6 MB/s**, **errors=0** (запас ~4× относительно цели **713 kS/s** / **1.426 MB/s**). Следующий риск — **совместная работа SPI + USB**, не сам USB-тракт.
+
+Эталон **старого CDC** (не использовать для нового транспорта): **`WorkingVER/STM32H743/`** (`0483:5740`).
 
 ## Железо
 
@@ -24,20 +26,17 @@
 ### Такты (см. `SystemClock_Config` в `Core/Src/main.c`)
 
 - HSE **8 MHz** (PH0/PH1). **LSE 32.768 kHz** (PC14/PC15) — **опционально**, только для RTC (`BOARD_HAS_LSE`).
-- **В `SystemClock_Config` включается только HSE** (не LSE). LSE не должен блокировать UART/USB при старте.
+- **В `SystemClock_Config` включается только HSE** (не LSE). LSE не должен блокировать UART при старте.
 - PLL1 (как WorkingVER): HSE / 4 × 240 / 2 → **SYSCLK = 240 MHz**; AHB = **120 MHz** (`RCC_HCLK_DIV2`).
 - PLL2 (отдельно, для SPI2): HSE / 2 × 100 / 2 → **PLL2P = 200 MHz**.
-- USB kernel clock: **PLL3** → **48 MHz** (`RCC_USBCLKSOURCE_PLL3` в `usb3300_ulpi_hw.c`, HSE / 4 × 96 / 4).
 
-> Старый вариант VSCALE0 / 480 MHz + LSE в `HAL_RCC_OscConfig` при boot давал «тишину» на UART и нестабильный USB — **не возвращать без причины**.
+> Старый вариант VSCALE0 / 480 MHz + LSE в `HAL_RCC_OscConfig` при boot давал «тишину» на UART — **не возвращать без причины**.
 
 ### Выводы периферии (из `WeActSTM32H743.ioc` + код)
 
 - **SPI2**: PA9 SCK, PB14 MISO, PC1 MOSI; ядро SPI1/2/3 от **PLL2P = 200 MHz**, **SCK ≈ 25 MHz**, кадр RHS2116 **32 бита**. Init только при **`INTAN_HW_PRESENT=1`**.
 - **USART1**: PB6 TX, PB7 RX — **115200** 8N1.
-- **USB3300 / USB OTG HS ULPI**: PC0 STP, PC2_C DIR, PC3_C NXT, PA3 D0, PA5 CLK, PB0 D1, PB1 D2, PB10–PB13 D3–D6, PB5 D7. Init: `Core/Src/usb3300_ulpi_hw.c` — **10 ms XTAL**, **PLL3 48 MHz**, `DisableUSBReg` + `USB33RDY`, GPIO ULPI, analog switch PC2/PC3.
-- **USB 2.0 High Speed device**: … **`Transmit()`** copy для text, **`TransmitZc()`** zero-copy для STREAM; очередь **3** слота; **`TxIdle()`**; PCD **DMA** + cache clean; EP1 TX FIFO **0x180**.
-- **Отладка**: PA13 SWDIO, PA14 SWCLK. ST-Link **≠** USB3300: для USB-тестов кабель на **USB3300 → хост**.
+- **Отладка**: PA13 SWDIO, PA14 SWCLK.
 
 ### Intan RHS2116 (не из Cube — задано в коде)
 
@@ -45,46 +44,15 @@
 
 - **CS**: **PE11**, активный низкий.
 - Протокол: три CS-транзакции на READ/WRITE/CONVERT; упаковка `(b0<<24)|(b1<<16)|(b2<<8)|b3`.
-- **`STREAM` / `STREAM8`**: ping-pong **2×4096**, `TransmitZc`, очередь **2**; `STREAM8` — interleaved CONVERT ch **0–7** (~total/8 ksps на канал).
 
-Сборка **без запаянного Intan** (по умолчанию): **`INTAN_HW_PRESENT=0`** — пропуск `MX_SPI2_Init` и bringup; USB `PING`/`ECHO`/`HELP`, UART `PING`/`HELP`; команды Intan → `ERR no intan hw`.
+Сборка **без запаянного Intan** (по умолчанию): **`INTAN_HW_PRESENT=0`** — пропуск `MX_SPI2_Init` и bringup; приём команд UART по-прежнему работает без вывода.
 
 ### UART CLI
 
-- После сброса (типовой лог): `EARLY` → `CLK` → `BOOT` → USB `[ULPI]`/`[USB]` → `[R] BOARD_HAS_LSE=0 …` (если LSE off) → `INTAN_UART_READY`.
-- Метки: **`[M]`** main, **`[U]`** USART, **`[R]`** RTC, **`[S]`** SPI2, **`[I]`** Intan, **`[C]`** CLI, **`[ULPI]`** / **`[USB]`** USB3300/stack.
-- **Ранний UART** до PLL: `UART_EarlyMinInit` / `UART_EarlyPrint` в `usart.c` (`EARLY`, `CLK`). **`Error_Handler`**: SOS на PB6 + `!ERR_HANDLER`.
-- **Не логировать из USB ISR** (`HAL_PCD_*Callback`) — блокирующий UART ломает EP0/enumeration.
-- Файлы: `Core/Src/intan_uart_cli.c`, `Core/Src/intan_app.c`.
-
-## USB (vendor bulk)
-
-- Init: `USB_DEVICE_Init()` → `DevDisconnect` / 50 ms / `DevConnect`; после полного init — **`USB_DEVICE_FinalizeAttach()`** (late reconnect).
-- Main loop: `Intan_USB_Bulk_Process()` + **`USB_DEVICE_PollEvents()`** (счётчики reset/connect, смена `dev_state` без UART в IRQ).
-- Команды обрабатываются в **main loop**, не в USB IRQ. OUT → очередь → `dispatch_usb_command` → ответ Bulk IN.
-- Текстовые USB-команды (при `INTAN_HW_PRESENT=1`): … **`BENCH` / `BENCH_FAST` / `BENCH_DMA` / `BENCH_TIMCS n [ch] [target_ksps]`** (замер ksps по SPI, текстовый ответ), `STREAM n [ch] [flags]`, **`STREAM8 n [flags]`** (8 ch round-robin 0–7). `STREAM`/`STREAM8` → только бинарный IN (16-bit LE).
-- Host: `tools/usb_intan_cmd.py`, `tools/usb_spi_bench.py` (SPI ksps без bulk samples), `tools/usb_stream_bench.py`, `tools/usb_bulk_loopback.py` (echo через `ECHO`). Orange Pi Stimulator: `Stimulator_2.0_orangepizero2w/services/server/intan_usb_transport.py`.
-
-### Проверка на Mac / Linux
-
-```bash
-python3 tools/usb_intan_cmd.py PING          # OK PONG
-python3 tools/usb_intan_cmd.py ECHO hello
-python3 -c "import usb.core; d=usb.core.find(idVendor=0x0483,idProduct=0x5741); print(d.speed)"  # 3 = HS
-```
-
-После прошивки через ST-Link: **переподключить кабель USB3300** (или дождаться late reconnect). В UART: `[USB] host reset`, затем `dev_state=3` (CONFIGURED).
-
-`system_profiler SPUSBDataType` на новых macOS часто **пустой** для vendor-устройств — ориентир: **PyUSB + PING**.
-
-### Типичные ошибки (не повторять)
-
-| Симптом | Причина |
-|---------|---------|
-| UART молчит | LSE/HSE в `SystemClock_Config` до `MX_USART1`, падение в `Error_Handler` без early UART |
-| `device 0483:5741 not found`, `rst=0` | Нет PLL3/XTAL ULPI; нет reconnect после ST-Link; GPIO ULPI в ANALOG |
-| Enumeration обрыв | UART/`snprintf` в USB ISR; слишком большой `USBD_VENDOR_BULK_Transmit` |
-| `[R] FAIL LSE` | Нет кварца на PC14/PC15 — **не критично** для USB; использовать `BOARD_HAS_LSE=OFF` |
+- **На линии TX USART1 сообщений нет**: `UART_DebugMark` / `UART_EarlyPrint` и ответы CLI (`uart_tx_str`) — заглушки; нет строк старта, `HELP`, `OK`/`ERR`, эхо ввода.
+- **RX**: прерывание и разбор строк в `Intan_UART_CLI_Process` сохранены (команды исполняются «втихую»).
+- При **`Error_Handler` / HardFault**: только **мигание SOS на PB6** (`UART_SosBlinkPB6`), без UART-текста.
+- Файлы: `Core/Src/intan_uart_cli.c`, `Core/Src/intan_app.c`, `Core/Src/usart.c`.
 
 ## Сборка
 
@@ -113,10 +81,6 @@ cmake --build build
 - ELF: `build/WeActSTM32H743.elf`
 - Прошивка: `STM32_Programmer_CLI -c port=SWD freq=400 ap=0 reset=HWrst -w build/WeActSTM32H743.elf -v -rst`
 
-### Автономная ULPI-прошивка (`ulpi-fw/`)
-
-Отдельный проект, VID:PID **`0483:5742`**. Host: `ulpi-fw/tools/usb_test.py`.
-
 ## Версии инструментов (ориентиры)
 
 - STM32CubeMX 6.17.x, пакет **STM32Cube FW_H7 V1.13.0** (см. `.ioc`).
@@ -125,16 +89,16 @@ cmake --build build
 
 | Путь | Содержание |
 |------|------------|
-| `Core/Src/main.c` | Boot, clocks, порядок init, `USB_DEVICE_FinalizeAttach` |
-| `Core/Src/gpio.c` | Clock enable A/B/C/H; PE analog (Intan); **ULPI не в ANALOG** |
+| `Core/Src/main.c` | Boot, clocks, main loop (USB stream + UART + Intan) |
+| `Core/Src/gpio.c` | Clock enable A/B/C/H; PE analog (Intan) |
 | `Core/Src/rtc.c` | LSE только при `BOARD_HAS_LSE=1` |
-| `Core/Src/usb3300_ulpi_hw.c` | USB3300: XTAL, PLL3, power, ULPI GPIO |
-| `Core/Src/usb_device.c` | USB stack, late reconnect, `PollEvents` |
-| `Core/Src/usbd_conf.c` | PCD/ULPI; FIFO TX0=0x40, TX1=0x100; **без UART в callbacks** |
-| `Core/Src/usbd_vendor_bulk.c` | Bulk class, TX ≤512 B |
-| `Core/Src/intan_usb_bulk.c` | USB-команды Intan / PING / STREAM |
 | `Core/Src/intan_spi.c`, `intan_spi4_hw.c` | Intan SPI (если `INTAN_HW_PRESENT=1`) |
-| `WorkingVER/STM32H743/` | **Эталон USB+UART** (CDC 5740) для сравнения |
+| `Core/Src/intan_stream.c` | Producer в frame ring (заглушка → SPI RESPONSE) |
+| `Core/Src/usb_stream_*.c`, `usb_vendor_bulk.c`, `usb_device.c` | RHS1 ring, vendor bulk, ULPI |
+| `Core/Src/intan_uart_cli.c` | UART CLI |
+| `Core/Src/intan_app.c` | INIT_RECORD, бенчи, стим-паттерны |
+| `tools/usb_frame_bench.py` | Валидация RHS1; `FRAME_HDR = "<IHHIIIIII"` (32 B, 9 полей) |
+| `WorkingVER/STM32H743/` | Эталон CDC (исторический) |
 | `WeActSTM32H743.ioc` | Cube; не ломать блоки `USER CODE` |
 
 ## Справочный проект Linux
@@ -147,9 +111,13 @@ cmake --build build
 ## Ограничения и заметки
 
 - FreeRTOS в `.ioc` **не включён**.
-- Пины Intan/USB править в **`intan_spi.h`**, `usb3300_ulpi_hw.c`, `.ioc`.
-- Cube `.ioc` может расходиться с `main.c` по clocks — **источник правды для boot/USB: `main.c` + WorkingVER**.
+- Пины Intan править в **`intan_spi.h`**, `.ioc`.
+- Cube `.ioc` может расходиться с `main.c` по clocks — **источник правды для boot: `main.c` + WorkingVER**.
+- **USB V2**: producer-consumer — `SPI/DMA → frame ring (.dma_buffer) → USB bulk IN`; SPI **не ждёт** USB; при переполнении ring — `usb_overflow_count`, без блокировок в acquisition path.
+- **Проверки host**: `python3 tools/usb_intan_cmd.py PING`; `python3 tools/usb_frame_bench.py -n 50000 --no-reset --runs 5`; длинный: `-n 5000000 --runs 3`. HS: `lsusb -t` → **480M**.
+- **Интеграция SPI (порядок)**: (1) длинный USB-only bench; (2) SPI-only ~713 kS/s; (3) `SPI_STREAM` — TIM+DMA + счётчик в RHS1; (4) `SPI_STREAM_REAL` — реальный RESPONSE.
+- **Host**: `python3 tools/usb_frame_bench.py -n 50000 --spi-stream --no-reset`; реальный SPI: `--spi-stream-real`. Диагностика SPI: `python3 tools/usb_intan_cmd.py "SPI_RATE 50000 0 0" --timeout-ms 60000`; упаковка без USB TX: `SPI_TO_RAM n ch flags`; **STATS** — `spi_xfer32`, `xfer_per_resp_x1000` (1000≈1.0 transfer/response, ~1002 с pipeline +2).
 
 ## Обновление этого файла
 
-При существенных изменениях (clocks, USB, Intan, новые CMake-флаги) — обновляйте этот файл.
+При существенных изменениях (clocks, Intan, новые CMake-флаги, возврат USB) — обновляйте этот файл.

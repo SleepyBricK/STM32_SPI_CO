@@ -24,7 +24,7 @@ extern "C" {
 #define INTAN_SPI_TIMEOUT_MS        100U
 
 /*
- * 0 — Intan не запаян: без SPI2 init/bringup; USB/UART PING/ECHO/HELP работают.
+ * 0 — Intan не запаян: без SPI2 init/bringup; UART PING/HELP работают.
  * 1 — полный Intan (cmake -DWITH_INTAN_HW=ON или #define INTAN_HW_PRESENT 1).
  */
 #ifndef INTAN_HW_PRESENT
@@ -37,6 +37,7 @@ static inline uint8_t Intan_HW_IsPresent(void)
 }
 
 #define INTAN_IMPEDANCE_MAX_SAMPLES 128U
+#define INTAN_DMA_CHUNK_SLOTS         8192U
 
 /* Chip Select: выход, idle = high */
 #define INTAN_CS_GPIO_PORT   GPIOE
@@ -51,8 +52,9 @@ typedef struct {
 } IntanImpedanceArg;
 
 void Intan_SPI_Init(SPI_HandleTypeDef *hspi);
+uint8_t Intan_SPI_IsReady(void);
 
-/** Вызывается из busy-wait SPI/DMA (например USB pump при ping-pong STREAM). NULL = off. */
+/** Вызывается из busy-wait SPI/DMA (например при длительном bench). NULL = off. */
 typedef void (*Intan_IdleHookFn)(void *ctx);
 void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx);
 
@@ -84,6 +86,12 @@ HAL_StatusTypeDef Intan_RawCmd(const uint8_t cmd4[4]);
 /** READ 255 с M=1 — сброс compliance monitor (как clear_compliance_monitor в Python). */
 HAL_StatusTypeDef Intan_ClearComplianceMonitor(void);
 HAL_StatusTypeDef Intan_MeasureImpedance(IntanImpedanceArg *arg);
+/** Останов TIM+DMA+SPI (CS в GPIO) — между STREAM и текстовыми SPI-командами. */
+void Intan_DmaPathRelease(void);
+
+void Intan_SpiStats_Reset(void);
+uint32_t Intan_SpiStats_GetXfer32Count(void);
+void Intan_SpiStats_AddXfer32(uint32_t count);
 
 #ifdef __cplusplus
 }

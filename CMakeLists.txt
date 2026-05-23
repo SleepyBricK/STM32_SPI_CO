@@ -49,12 +49,16 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi4_hw.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_app.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_uart_cli.c
-    ${CMAKE_SOURCE_DIR}/Core/Src/intan_usb_bulk.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/intan_stream.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/usb_stream_frame.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/usb_stream_ring.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/usb_stream_service.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/usb_commands.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/usb_vendor_bulk.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usb3300_ulpi_hw.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usb_device.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usbd_conf.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usbd_desc.c
-    ${CMAKE_SOURCE_DIR}/Core/Src/usbd_vendor_bulk.c
     ${STM32CUBE_H7_ROOT}/Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_core.c
     ${STM32CUBE_H7_ROOT}/Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ctlreq.c
     ${STM32CUBE_H7_ROOT}/Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ioreq.c
@@ -70,7 +74,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${STM32CUBE_H7_ROOT}/Drivers/STM32H7xx_HAL_Driver/Inc
 )
 
-# User: Intan RHS2116 on SPI2 (PE11 CS). OFF by default for USB-only bring-up.
+# User: Intan RHS2116 on SPI2 (PE11 CS). OFF by default.
 option(WITH_INTAN_HW "Intan RHS2116 soldered on SPI2" OFF)
 # User: 32.768 kHz LSE on PC14/PC15. OFF if crystal not populated.
 option(BOARD_HAS_LSE "Board has 32.768 kHz LSE on PC14/PC15" OFF)
@@ -79,7 +83,6 @@ option(BOARD_HAS_LSE "Board has 32.768 kHz LSE on PC14/PC15" OFF)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     INTAN_HW_PRESENT=$<IF:$<BOOL:${WITH_INTAN_HW}>,1,0>
     BOARD_HAS_LSE=$<IF:$<BOOL:${BOARD_HAS_LSE}>,1,0>
-    USB_PCD_DMA_ENABLE=0
 )
 
 # Remove wrong libob.a library dependency when using cpp files

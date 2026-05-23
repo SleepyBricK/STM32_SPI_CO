@@ -1,0 +1,135 @@
+#include "usb_commands.h"
+#include <stdlib.h>
+#include <string.h>
+
+static int streq_ci(const char *a, const char *b)
+{
+  if (a == NULL || b == NULL)
+  {
+    return 0;
+  }
+
+  while (*a != '\0' && *b != '\0')
+  {
+    char ca = (*a >= 'a' && *a <= 'z') ? (char)(*a - 32) : *a;
+    char cb = (*b >= 'a' && *b <= 'z') ? (char)(*b - 32) : *b;
+    if (ca != cb)
+    {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+
+  return (*a == '\0' && *b == '\0') ? 1 : 0;
+}
+
+UsbCommand UsbCommands_ParseLine(const char *line)
+{
+  UsbCommand cmd = {USB_CMD_NONE, 0U};
+  char buf[128];
+  char *ctx = NULL;
+  char *tok;
+  size_t n;
+
+  if (line == NULL)
+  {
+    return cmd;
+  }
+
+  n = strlen(line);
+  if (n >= sizeof(buf))
+  {
+    n = sizeof(buf) - 1U;
+  }
+  memcpy(buf, line, n);
+  buf[n] = '\0';
+
+  while (n > 0U && (buf[n - 1U] == '\n' || buf[n - 1U] == '\r' || buf[n - 1U] == ' '))
+  {
+    buf[--n] = '\0';
+  }
+
+  tok = strtok_r(buf, " \t", &ctx);
+  if (tok == NULL)
+  {
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PING"))
+  {
+    cmd.id = USB_CMD_PING;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "STOP"))
+  {
+    cmd.id = USB_CMD_STOP;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "STATS"))
+  {
+    cmd.id = USB_CMD_STATS;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SYNTH_STREAM"))
+  {
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.id = USB_CMD_SYNTH_STREAM;
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_STREAM_REAL"))
+  {
+    cmd.id = USB_CMD_SPI_STREAM_REAL;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_STREAM"))
+  {
+    cmd.id = USB_CMD_SPI_STREAM;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_TO_RAM"))
+  {
+    cmd.id = USB_CMD_SPI_TO_RAM;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_RATE"))
+  {
+    cmd.id = USB_CMD_SPI_RATE;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  cmd.id = USB_CMD_UNKNOWN;
+  return cmd;
+}

@@ -1,7 +1,13 @@
-#ifndef USBD_VENDOR_BULK_H
-#define USBD_VENDOR_BULK_H
+#ifndef USB_VENDOR_BULK_H
+#define USB_VENDOR_BULK_H
 
+#include "usbd_conf.h"
 #include "usbd_ioreq.h"
+#include "usb_stream_frame.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define VENDOR_BULK_IN_EP                0x81U
 #define VENDOR_BULK_OUT_EP               0x01U
@@ -16,8 +22,16 @@
 
 extern USBD_ClassTypeDef USBD_VENDOR_BULK;
 
+typedef void (*USBD_VENDOR_BULK_TxCompleteFn)(uint32_t len);
+
 uint8_t USBD_VENDOR_BULK_Transmit(uint8_t *buf, uint16_t len);
-uint8_t USBD_VENDOR_BULK_TxReady(void);
+uint8_t USBD_VENDOR_BULK_TransmitFrame(const uint8_t *buf, uint32_t len);
+void USBD_VENDOR_BULK_SetTxCompleteCallback(USBD_VENDOR_BULK_TxCompleteFn cb);
+uint8_t USBD_VENDOR_BULK_TxIdle(void);
 uint8_t USBD_VENDOR_BULK_PollRx(uint8_t *buf, uint16_t max_len, uint16_t *len_out);
 
+#ifdef __cplusplus
+}
 #endif
+
+#endif /* USB_VENDOR_BULK_H */

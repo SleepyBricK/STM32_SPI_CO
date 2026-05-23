@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* USER CODE BEGIN Includes */
 #include "usart.h"
+#include "usbd_conf.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,7 +58,6 @@
 /* External variables --------------------------------------------------------*/
 
 /* USER CODE BEGIN EV */
-extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
 /* USER CODE END EV */
 
@@ -86,7 +86,6 @@ void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
   UART_EarlyMinInit(64000000U);
-  UART_EarlyPrint("\r\n!HARDFAULT\r\n");
   UART_SosBlinkPB6();
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
@@ -202,6 +201,8 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+
+extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
 void USART1_IRQHandler(void)
 {

@@ -5,12 +5,27 @@
 
 #include "intan_spi.h"
 #include "intan_spi4_hw.h"
-#include "usart.h"
 #include <stdint.h>
 
 static uint8_t g_intan_spi_ready;
 static Intan_IdleHookFn s_idle_hook;
 static void *s_idle_ctx;
+static volatile uint32_t g_spi_xfer32_count;
+
+void Intan_SpiStats_Reset(void)
+{
+  g_spi_xfer32_count = 0U;
+}
+
+uint32_t Intan_SpiStats_GetXfer32Count(void)
+{
+  return g_spi_xfer32_count;
+}
+
+void Intan_SpiStats_AddXfer32(uint32_t count)
+{
+  g_spi_xfer32_count += count;
+}
 
 void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx)
 {
@@ -107,6 +122,11 @@ static HAL_StatusTypeDef intan_xfer32(uint32_t tx_word, uint32_t *rx_out)
   {
     *rx_out = rx_word;
   }
+
+  if (st == HAL_OK)
+  {
+    Intan_SpiStats_AddXfer32(1U);
+  }
   return st;
 }
 
@@ -153,6 +173,7 @@ static HAL_StatusTypeDef intan_xfer32_repeat_fast(uint32_t tx_word, uint32_t n, 
 
     while ((INTAN_SPI_INSTANCE->SR & SPI_SR_EOT) == 0U) {}
     INTAN_SPI_INSTANCE->CR1 &= ~SPI_CR1_SPE;
+    Intan_SpiStats_AddXfer32(chunk_slots);
     n -= chunk_slots;
   }
 
@@ -231,6 +252,10 @@ static HAL_StatusTypeDef intan_wait_dma_stream_disabled(DMA_Stream_TypeDef *stre
   uint32_t guard = 1000000U;
   while ((stream->CR & DMA_SxCR_EN) != 0U)
   {
+    if (s_idle_hook != NULL)
+    {
+      s_idle_hook(s_idle_ctx);
+    }
     if (--guard == 0U)
     {
       return HAL_TIMEOUT;
@@ -256,6 +281,13 @@ static void intan_dma_timcs_recover(uint32_t old_midi)
   MODIFY_REG(INTAN_SPI_INSTANCE->CFG2, SPI_CFG2_MIDI, old_midi);
 
   intan_cs_gpio_mode();
+}
+
+void Intan_DmaPathRelease(void)
+{
+  uint32_t midi = READ_REG(INTAN_SPI_INSTANCE->CFG2) & SPI_CFG2_MIDI;
+
+  intan_dma_timcs_recover(midi);
 }
 
 static HAL_StatusTypeDef intan_dma_prepare_streams_ex(const uint32_t *tx_ptr, uint32_t chunk_slots, uint8_t tx_minc)
@@ -432,6 +464,7 @@ static HAL_StatusTypeDef intan_xfer32_repeat_dma_timcs(uint32_t tx_word, uint32_
                                SPI_IFCR_MODFC | SPI_IFCR_SUSPC;
 
     last_rx = s_dma_rx_words[chunk_slots - 1U];
+    Intan_SpiStats_AddXfer32(chunk_slots);
     n -= chunk_slots;
   }
 
@@ -538,13 +571,10 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
 
   for (uint32_t i = 0U; i < n; i++)
   {
-    if ((s_idle_hook != NULL) && ((i & 0x0FU) == 0U))
-    {
-      s_idle_hook(s_idle_ctx);
-    }
     samples[i] = intan_u16_from_convert_word(s_dma_rx_words[i + 2U]);
   }
 
+  Intan_SpiStats_AddXfer32(chunk_slots);
   intan_dma_timcs_recover(old_midi);
   return HAL_OK;
 }
@@ -660,6 +690,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsReadRR(uint32_t n, uint8_t n_ch, 
     *phase_io = (uint8_t)((phase + n) % (uint32_t)n_ch);
   }
 
+  Intan_SpiStats_AddXfer32(chunk_slots);
   intan_dma_timcs_recover(old_midi);
   return HAL_OK;
 }
@@ -780,7 +811,6 @@ static HAL_StatusTypeDef intan_xfer32_repeat_timcs(uint32_t tx_word, uint32_t n,
 
 void Intan_SPI_Init(SPI_HandleTypeDef *hspi)
 {
-  UART_DebugMark("[I] Intan_SPI_Init enter\r\n");
   if (hspi == NULL || hspi->Instance != INTAN_SPI_INSTANCE)
   {
     g_intan_spi_ready = 0U;
@@ -790,9 +820,12 @@ void Intan_SPI_Init(SPI_HandleTypeDef *hspi)
 
   __HAL_RCC_GPIOE_CLK_ENABLE();
 
-  UART_DebugMark("[I] Intan CS GPIO init...\r\n");
   intan_cs_gpio_mode();
-  UART_DebugMark("[I] Intan_SPI_Init done\r\n");
+}
+
+uint8_t Intan_SPI_IsReady(void)
+{
+  return g_intan_spi_ready;
 }
 
 /*

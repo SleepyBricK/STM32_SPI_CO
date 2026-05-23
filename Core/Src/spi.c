@@ -20,7 +20,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "spi.h"
-#include "usart.h"
 #include "intan_spi4_hw.h"
 
 /* USER CODE BEGIN 0 */
@@ -62,14 +61,12 @@ void MX_SPI2_Init(void)
   hspi2.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
   hspi2.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
   hspi2.Init.IOSwap = SPI_IO_SWAP_DISABLE;
-  UART_DebugMark("[S] MX_SPI2 MspInit + register init (no HAL_SPI_Init)\r\n");
   hspi2.State = HAL_SPI_STATE_RESET;
   HAL_SPI_MspInit(&hspi2);
   if (Intan_SPI4_HwInit(&hspi2) != HAL_OK)
   {
     Error_Handler();
   }
-  UART_DebugMark("[S] MX_SPI2 Intan_SPI4_HwInit OK\r\n");
   /* USER CODE BEGIN SPI2_Init 2 */
 
   /* USER CODE END SPI2_Init 2 */
@@ -84,9 +81,7 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* spiHandle)
   if(spiHandle->Instance==SPI2)
   {
   /* USER CODE BEGIN SPI2_MspInit 0 */
-    UART_DebugMark("[S] SPI2_MspInit enter\r\n");
     /* HSE 8 MHz: SPI2 kernel = PLL2P = 200 MHz; SCK = 200 MHz / 8 = 25 MHz (лимит RHS2116). */
-    UART_DebugMark("[S] SPI123 HAL_RCCEx_PeriphCLKConfig (PLL2)...\r\n");
     PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SPI123;
     PeriphClkInitStruct.Spi123ClockSelection = RCC_SPI123CLKSOURCE_PLL2;
     PeriphClkInitStruct.PLL2.PLL2M = 2;
@@ -101,10 +96,8 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* spiHandle)
     {
       Error_Handler();
     }
-    UART_DebugMark("[S] SPI123 PeriphCLK OK\r\n");
 
     __HAL_RCC_SPI2_CLK_ENABLE();
-    UART_DebugMark("[S] SPI2 kernel clock enabled\r\n");
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -126,8 +119,6 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* spiHandle)
 
     GPIO_InitStruct.Pin = GPIO_PIN_1;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-    UART_DebugMark("[S] SPI2 GPIO PA9/PB14/PC1 init done\r\n");
-    UART_DebugMark("[S] SPI2_MspInit done\r\n");
 
   /* USER CODE END SPI2_MspInit 0 */
 

@@ -1,4 +1,4 @@
-"""Shared PyUSB helpers for STM32H743 Intan vendor bulk (Linux-friendly)."""
+"""PyUSB helpers for STM32H743 RHS1 vendor bulk (USB HS streaming V2)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ VID = 0x0483
 PID = 0x5741
 EP_OUT = 0x01
 EP_IN = 0x81
+FRAME_SIZE = 4096
+FRAME_MAGIC = 0x52485331
 
 
 def find_device(vid: int = VID, pid: int = PID) -> usb.core.Device:
@@ -22,23 +24,20 @@ def find_device(vid: int = VID, pid: int = PID) -> usb.core.Device:
 
 
 def bus_reset(vid: int = VID, pid: int = PID, settle_s: float = 1.5) -> usb.core.Device:
-    """Reset USB device; clears firmware stuck after interrupted STREAM."""
     dev = find_device(vid, pid)
     try:
         dev.reset()
     except usb.core.USBError:
         pass
     time.sleep(settle_s)
-    dev = find_device(vid, pid)
-    return dev
+    return find_device(vid, pid)
 
 
 def drain_in(dev: usb.core.Device, timeout_ms: int = 50) -> int:
-    """Discard stale IN data from a previous partial transfer."""
     total = 0
     while True:
         try:
-            chunk = bytes(dev.read(EP_IN, 512, timeout=timeout_ms))
+            chunk = bytes(dev.read(EP_IN, FRAME_SIZE, timeout=timeout_ms))
         except usb.core.USBTimeoutError:
             break
         except usb.core.USBError:
@@ -56,11 +55,7 @@ def open_device(
     reset: bool = False,
     drain: bool = True,
 ) -> tuple[usb.core.Device, int]:
-    if reset:
-        dev = bus_reset(vid, pid)
-    else:
-        dev = find_device(vid, pid)
-
+    dev = bus_reset(vid, pid) if reset else find_device(vid, pid)
     dev.set_configuration()
     cfg = dev.get_active_configuration()
     intf = cfg[(0, 0)]
@@ -106,7 +101,7 @@ def read_exact(dev: usb.core.Device, nbytes: int, timeout_ms: int) -> bytes:
     remaining = nbytes
 
     while remaining > 0:
-        req = min(remaining, 16 * 1024)
+        req = min(remaining, FRAME_SIZE)
         data = bytes(dev.read(EP_IN, req, timeout=timeout_ms))
         if not data:
             raise RuntimeError("short USB read")
