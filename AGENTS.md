@@ -30,7 +30,7 @@
 - PLL1 (как WorkingVER): HSE / 4 × 240 / 2 → **SYSCLK = 240 MHz**; AHB = **120 MHz** (`RCC_HCLK_DIV2`).
 - PLL2 (отдельно, для SPI2): HSE / 2 × 100 / 2 → **PLL2P = 200 MHz**.
 
-> Старый вариант VSCALE0 / 480 MHz + LSE в `HAL_RCC_OscConfig` при boot давал «тишину» на UART — **не возвращать без причины**.
+> **`BOARD_SYSCLK_480=ON`**: VOS0 / 480 MHz только для bench SPI; раньше VSCALE0 давал проблемы с UART — не использовать как дефолт.
 
 ### Выводы периферии (из `WeActSTM32H743.ioc` + код)
 
@@ -69,14 +69,21 @@ cmake --build build
 |-------|--------------|------------|
 | `WITH_INTAN_HW` | **OFF** | Intan RHS2116 на SPI2 (`INTAN_HW_PRESENT=1`) |
 | `BOARD_HAS_LSE` | **OFF** | 32.768 kHz на PC14/PC15, RTC через LSE |
+| `BOARD_SYSCLK_480` | **OFF** | Эксперимент: **480 MHz** SYSCLK (VOS0) для SPI bench; SPI kernel без изменений |
 
-Пример с Intan и LSE:
+Пример **480 MHz bench** (отдельный каталог `build480/`):
 
 ```bash
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake \
-  -DWITH_INTAN_HW=ON -DBOARD_HAS_LSE=ON
-cmake --build build
+./tools/build480.sh
+# или:
+cmake -S . -B build480 -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake \
+  -DWITH_INTAN_HW=ON -DBOARD_SYSCLK_480=ON
+cmake --build build480
+STM32_Programmer_CLI ... -w build480/WeActSTM32H743.elf ...
+python3 tools/usb_intan_cmd.py STATS --no-reset   # sysclk_mhz=480
 ```
+
+> Важно: `-DBOARD_SYSCLK_480=ON` нужен **при cmake configure**. Пересборка в старом `build/` без этого флага остаётся на **240 MHz** (`sysclk_mhz=240` в STATS).
 
 - ELF: `build/WeActSTM32H743.elf`
 - Прошивка: `STM32_Programmer_CLI -c port=SWD freq=400 ap=0 reset=HWrst -w build/WeActSTM32H743.elf -v -rst`
@@ -116,7 +123,8 @@ cmake --build build
 - **USB V2**: producer-consumer — `SPI/DMA → frame ring (.dma_buffer) → USB bulk IN`; SPI **не ждёт** USB; при переполнении ring — `usb_overflow_count`, без блокировок в acquisition path.
 - **Проверки host**: `python3 tools/usb_intan_cmd.py PING`; `python3 tools/usb_frame_bench.py -n 50000 --no-reset --runs 5`; длинный: `-n 5000000 --runs 3`. HS: `lsusb -t` → **480M**.
 - **Интеграция SPI (порядок)**: (1) длинный USB-only bench; (2) SPI-only ~713 kS/s; (3) `SPI_STREAM` — TIM+DMA + счётчик в RHS1; (4) `SPI_STREAM_REAL` — реальный RESPONSE.
-- **Host**: `python3 tools/usb_frame_bench.py -n 50000 --spi-stream --no-reset`; реальный SPI: `--spi-stream-real`. Диагностика SPI: `python3 tools/usb_intan_cmd.py "SPI_RATE 50000 0 0" --timeout-ms 60000`; упаковка без USB TX: `SPI_TO_RAM n ch flags`; **STATS** — `spi_xfer32`, `xfer_per_resp_x1000` (1000≈1.0 transfer/response, ~1002 с pipeline +2).
+- **STATS / SPI bench**: `cyc_samp` / `ksps_cyc_x10` — **целевой TIM-slot** (DMA CEN→EOT), не wall-clock. **`wall_cyc` / `wall_ksps_x10`** — фактический DWT over full command (setup + SPI + unpack). При 240 MHz: **713 kS/s ≈ wall_cyc 336**, **562 kS/s ≈ 427**, **495 kS/s ≈ 485**. `sck_khz=25000` — норма.
+- **USB SPI команды**: `SPI_RATE` / `SPI_RATE_RR8` (8ch RR), `SPI_TO_RAM` / `SPI_TO_RAM_RR8`, `SPI_STREAM_RR8` / `SPI_STREAM_RR8_REAL`. Host: `python3 tools/usb_spi_rr8_bench.py -n 50000 --no-reset`.
 
 ## Обновление этого файла
 

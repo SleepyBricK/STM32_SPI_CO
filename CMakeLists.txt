@@ -46,6 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi_diag.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi4_hw.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_app.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_uart_cli.c
@@ -78,11 +79,19 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 option(WITH_INTAN_HW "Intan RHS2116 soldered on SPI2" OFF)
 # User: 32.768 kHz LSE on PC14/PC15. OFF if crystal not populated.
 option(BOARD_HAS_LSE "Board has 32.768 kHz LSE on PC14/PC15" OFF)
+# User: 480 MHz SYSCLK bench (VOS0). Default 240 MHz VSCALE2.
+option(BOARD_SYSCLK_480 "Experimental 480 MHz SYSCLK for SPI bench" OFF)
+if(BOARD_SYSCLK_480)
+    message(STATUS "WeActSTM32H743: SYSCLK 480 MHz (VOS0 overdrive)")
+else()
+    message(STATUS "WeActSTM32H743: SYSCLK 240 MHz (VSCALE2)")
+endif()
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     INTAN_HW_PRESENT=$<IF:$<BOOL:${WITH_INTAN_HW}>,1,0>
     BOARD_HAS_LSE=$<IF:$<BOOL:${BOARD_HAS_LSE}>,1,0>
+    BOARD_SYSCLK_480=$<IF:$<BOOL:${BOARD_SYSCLK_480}>,1,0>
 )
 
 # Remove wrong libob.a library dependency when using cpp files

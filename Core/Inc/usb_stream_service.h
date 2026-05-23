@@ -25,6 +25,7 @@ void UsbStreamService_TxPump(void);
 const UsbStreamStats *UsbStreamService_GetStats(void);
 
 void UsbStreamService_NoteSample(void);
+void UsbStreamService_NoteSamples(uint32_t count);
 void UsbStreamService_NoteFrameProduced(void);
 void UsbStreamService_NoteUsbOverflow(void);
 void UsbStreamService_NoteSpiOverflow(void);

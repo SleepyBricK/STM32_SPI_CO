@@ -5,6 +5,7 @@
 #include "usb_vendor_bulk.h"
 #include "intan_stream.h"
 #include "intan_spi.h"
+#include "intan_spi_diag.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -28,6 +29,8 @@ static uint8_t s_spi_channel;
 static uint8_t s_spi_flags;
 static uint8_t s_spi_counter_mode;
 static uint8_t s_spi_usb_pump;
+static uint8_t s_spi_rr8;
+static uint8_t s_spi_rr_phase;
 
 static uint16_t s_spi_buf[SPI_STREAM_CHUNK_MAX]
     __attribute__((section(".dma_buffer"), aligned(32)));
@@ -42,7 +45,10 @@ static void usb_stream_reset_all(void);
 static void usb_spi_stream_process(void);
 static uint8_t usb_spi_run_one_chunk(void);
 static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags);
+static void usb_cmd_spi_rate_fast(uint32_t n, uint8_t channel, uint8_t flags);
 static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags);
+static void usb_cmd_spi_rate_rr8(uint32_t n, uint8_t flags);
+static void usb_cmd_spi_to_ram_rr8(uint32_t n, uint8_t flags);
 static void usb_stats_reply(void);
 
 static void usb_stream_on_frame_tx_complete(uint32_t len)
@@ -123,6 +129,8 @@ static void usb_stream_reset_all(void)
   s_synth_remaining = 0U;
   s_spi_active = 0U;
   s_spi_remaining = 0U;
+  s_spi_rr8 = 0U;
+  s_spi_rr_phase = 0U;
   s_tx_active = 0U;
   s_tx_frame = NULL;
   IntanStream_Reset();
@@ -131,17 +139,21 @@ static void usb_stream_reset_all(void)
 }
 
 static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uint8_t counter_mode,
-                                 uint8_t usb_pump)
+                                 uint8_t usb_pump, uint8_t rr8)
 {
   usb_stream_reset_all();
   memset(&s_stats, 0, sizeof(s_stats));
   Intan_SpiStats_Reset();
+  Intan_SpiDiag_ResetTiming();
+  Intan_SpiDiag_Init();
 
   s_spi_remaining = n;
   s_spi_channel = channel;
   s_spi_flags = flags;
   s_spi_counter_mode = counter_mode;
   s_spi_usb_pump = usb_pump;
+  s_spi_rr8 = rr8;
+  s_spi_rr_phase = 0U;
   s_spi_active = (n > 0U) ? 1U : 0U;
 
   IntanStream_Begin();
@@ -150,8 +162,6 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
 static uint8_t usb_spi_run_one_chunk(void)
 {
   uint32_t chunk;
-  uint32_t base;
-  uint32_t i;
   HAL_StatusTypeDef st;
 
   if (s_spi_remaining == 0U)
@@ -165,7 +175,15 @@ static uint8_t usb_spi_run_one_chunk(void)
     chunk = SPI_STREAM_CHUNK_MAX;
   }
 
-  st = Intan_ConvertPipelineDmaTimCsRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+  if (s_spi_rr8 != 0U)
+  {
+    st = Intan_ConvertPipelineDmaTimCsReadRR(chunk, INTAN_STREAM_RR8_CHANNELS, s_spi_flags,
+                                             s_spi_buf, &s_spi_rr_phase);
+  }
+  else
+  {
+    st = Intan_ConvertPipelineDmaTimCsRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+  }
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
 
   if (st != HAL_OK)
@@ -177,18 +195,11 @@ static uint8_t usb_spi_run_one_chunk(void)
 
   if (s_spi_counter_mode != 0U)
   {
-    base = IntanStream_PeekNextSample();
-    for (i = 0U; i < chunk; i++)
-    {
-      IntanStream_PushResponse((uint16_t)((base + i) & 0xFFFFU));
-    }
+    IntanStream_PushCounterBlock(IntanStream_PeekNextSample(), chunk);
   }
   else
   {
-    for (i = 0U; i < chunk; i++)
-    {
-      IntanStream_PushResponse(s_spi_buf[i]);
-    }
+    IntanStream_PushBlock(s_spi_buf, chunk);
   }
 
   s_spi_remaining -= chunk;
@@ -248,8 +259,11 @@ static void usb_spi_stream_process(void)
 
 static void usb_stats_reply(void)
 {
-  char stats_line[256];
+  char stats_line[384];
+  IntanSpiDiagSnapshot clk;
   uint32_t xfer_per_resp_x1000 = 0U;
+  uint32_t ksps_from_cyc_x10 = 0U;
+  uint32_t wall_ksps_x10 = 0U;
 
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
   s_stats.responses_pushed = s_stats.samples_produced;
@@ -260,32 +274,52 @@ static void usb_stats_reply(void)
         (s_stats.spi_xfer32_count * 1000U) / s_stats.responses_pushed;
   }
 
+  Intan_SpiDiag_ReadClockConfig(&clk);
+  if (clk.sample_period_avg_cycles > 0U)
+  {
+    ksps_from_cyc_x10 = Intan_SpiDiag_KspsFromCycX10(clk.sample_period_avg_cycles);
+  }
+  if (clk.wall_cyc_per_sample > 0U)
+  {
+    wall_ksps_x10 = Intan_SpiDiag_KspsFromCycX10(clk.wall_cyc_per_sample);
+  }
+
   (void)snprintf(stats_line, sizeof(stats_line),
-                 "samples=%lu responses=%lu frames_out=%lu "
-                 "spi_xfer32=%lu xfer_per_resp_x1000=%lu "
-                 "usb_ovf=%lu spi_ovf=%lu tx_err=%lu",
+                 "samples=%lu frames_out=%lu spi_xfer32=%lu xfer_per_resp_x1000=%lu "
+                 "usb_ovf=%lu spi_ovf=%lu tx_err=%lu "
+                 "sysclk_mhz=%lu spi_khz=%lu sck_khz=%lu pscl=%lu tim_p=%lu "
+                 "cyc_samp=%lu ksps_cyc_x10=%lu wall_cyc=%lu wall_ksps_x10=%lu",
                  (unsigned long)s_stats.samples_produced,
-                 (unsigned long)s_stats.responses_pushed,
                  (unsigned long)s_stats.frames_sent,
                  (unsigned long)s_stats.spi_xfer32_count,
                  (unsigned long)xfer_per_resp_x1000,
                  (unsigned long)s_stats.usb_overflow_count,
                  (unsigned long)s_stats.spi_overflow_count,
-                 (unsigned long)s_stats.usb_tx_errors);
+                 (unsigned long)s_stats.usb_tx_errors,
+                 (unsigned long)(SystemCoreClock / 1000000U),
+                 (unsigned long)(clk.spi_kernel_hz / 1000U),
+                 (unsigned long)(clk.spi_sck_hz_calc / 1000U),
+                 (unsigned long)clk.spi_prescaler_div,
+                 (unsigned long)clk.tim_period_ticks,
+                 (unsigned long)clk.sample_period_avg_cycles,
+                 (unsigned long)ksps_from_cyc_x10,
+                 (unsigned long)clk.wall_cyc_per_sample,
+                 (unsigned long)wall_ksps_x10);
   usb_reply_text(stats_line);
 }
 
 #if (INTAN_HW_PRESENT == 1)
 static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags)
 {
-  uint32_t t0;
+  uint32_t t0_dwt;
+  uint32_t t0_ms;
   uint32_t elapsed_ms;
   uint32_t remaining = n;
   uint32_t total = 0U;
   uint32_t ksps_x10;
   uint32_t xfer_per_x1000;
   HAL_StatusTypeDef st = HAL_OK;
-  char line[192];
+  char line[256];
 
   if (Intan_SPI_IsReady() == 0U)
   {
@@ -294,7 +328,10 @@ static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags)
   }
 
   Intan_SpiStats_Reset();
-  t0 = HAL_GetTick();
+  Intan_SpiDiag_ResetTiming();
+  Intan_SpiDiag_Init();
+  t0_ms = HAL_GetTick();
+  t0_dwt = DWT->CYCCNT;
 
   while ((remaining > 0U) && (st == HAL_OK))
   {
@@ -310,7 +347,8 @@ static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags)
     remaining -= chunk;
   }
 
-  elapsed_ms = HAL_GetTick() - t0;
+  Intan_SpiDiag_RecordWall(t0_dwt, DWT->CYCCNT, total);
+  elapsed_ms = HAL_GetTick() - t0_ms;
   if (elapsed_ms == 0U)
   {
     elapsed_ms = 1U;
@@ -320,25 +358,125 @@ static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags)
   xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
   ksps_x10 = (total * 10000U) / elapsed_ms;
 
-  (void)snprintf(line, sizeof(line),
-                 "spi_rate samples=%lu elapsed_ms=%lu ksps_x10=%lu "
-                 "spi_xfer32=%lu xfer_per_resp_x1000=%lu st=%lu",
-                 (unsigned long)total,
-                 (unsigned long)elapsed_ms,
-                 (unsigned long)ksps_x10,
-                 (unsigned long)s_stats.spi_xfer32_count,
-                 (unsigned long)xfer_per_x1000,
-                 (unsigned long)st);
+  {
+    IntanSpiDiagSnapshot clk;
+    uint32_t ksps_cyc_x10 = 0U;
+    uint32_t wall_ksps_x10 = 0U;
+
+    Intan_SpiDiag_ReadClockConfig(&clk);
+    if (clk.sample_period_avg_cycles > 0U)
+    {
+      ksps_cyc_x10 = Intan_SpiDiag_KspsFromCycX10(clk.sample_period_avg_cycles);
+    }
+    if (clk.wall_cyc_per_sample > 0U)
+    {
+      wall_ksps_x10 = Intan_SpiDiag_KspsFromCycX10(clk.wall_cyc_per_sample);
+    }
+
+    (void)snprintf(line, sizeof(line),
+                   "spi_rate samples=%lu elapsed_ms=%lu ksps_x10=%lu "
+                   "spi_xfer32=%lu xfer_per_resp_x1000=%lu "
+                   "sck_khz=%lu cyc_samp=%lu ksps_cyc_x10=%lu "
+                   "wall_cyc=%lu wall_ksps_x10=%lu st=%lu",
+                   (unsigned long)total,
+                   (unsigned long)elapsed_ms,
+                   (unsigned long)ksps_x10,
+                   (unsigned long)s_stats.spi_xfer32_count,
+                   (unsigned long)xfer_per_x1000,
+                   (unsigned long)(clk.spi_sck_hz_calc / 1000U),
+                   (unsigned long)clk.sample_period_avg_cycles,
+                   (unsigned long)ksps_cyc_x10,
+                   (unsigned long)clk.wall_cyc_per_sample,
+                   (unsigned long)wall_ksps_x10,
+                   (unsigned long)st);
+  }
   usb_reply_text(line);
   Intan_DmaPathRelease();
 }
 
+static void usb_cmd_spi_rate_fast(uint32_t n, uint8_t channel, uint8_t flags)
+{
+  uint32_t t0_dwt;
+  uint32_t t0_ms;
+  uint32_t elapsed_ms;
+  uint32_t remaining = n;
+  uint32_t total = 0U;
+  uint32_t ksps_x10;
+  uint32_t xfer_per_x1000;
+  HAL_StatusTypeDef st = HAL_OK;
+  char line[256];
+
+  if (Intan_SPI_IsReady() == 0U || n == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  Intan_SpiStats_Reset();
+  Intan_SpiDiag_ResetTiming();
+  Intan_SpiDiag_Init();
+  t0_ms = HAL_GetTick();
+  t0_dwt = DWT->CYCCNT;
+
+  while ((remaining > 0U) && (st == HAL_OK))
+  {
+    uint32_t chunk = remaining;
+
+    if (chunk > SPI_STREAM_CHUNK_MAX)
+    {
+      chunk = SPI_STREAM_CHUNK_MAX;
+    }
+
+    st = Intan_ConvertPipelineRead(chunk, channel, flags, s_spi_buf);
+    total += chunk;
+    remaining -= chunk;
+  }
+
+  Intan_SpiDiag_RecordWall(t0_dwt, DWT->CYCCNT, total);
+  elapsed_ms = HAL_GetTick() - t0_ms;
+  if (elapsed_ms == 0U)
+  {
+    elapsed_ms = 1U;
+  }
+
+  s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
+  xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
+  ksps_x10 = (total * 10000U) / elapsed_ms;
+
+  {
+    IntanSpiDiagSnapshot clk;
+    uint32_t wall_ksps_x10 = 0U;
+
+    Intan_SpiDiag_ReadClockConfig(&clk);
+    if (clk.wall_cyc_per_sample > 0U)
+    {
+      wall_ksps_x10 = Intan_SpiDiag_KspsFromCycX10(clk.wall_cyc_per_sample);
+    }
+
+    (void)snprintf(line, sizeof(line),
+                   "spi_rate_fast samples=%lu elapsed_ms=%lu ksps_x10=%lu "
+                   "spi_xfer32=%lu xfer_per_resp_x1000=%lu "
+                   "sck_khz=%lu wall_cyc=%lu wall_ksps_x10=%lu st=%lu",
+                   (unsigned long)total,
+                   (unsigned long)elapsed_ms,
+                   (unsigned long)ksps_x10,
+                   (unsigned long)s_stats.spi_xfer32_count,
+                   (unsigned long)xfer_per_x1000,
+                   (unsigned long)(clk.spi_sck_hz_calc / 1000U),
+                   (unsigned long)clk.wall_cyc_per_sample,
+                   (unsigned long)wall_ksps_x10,
+                   (unsigned long)st);
+  }
+  usb_reply_text(line);
+}
+
 static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags)
 {
-  uint32_t t0;
+  uint32_t t0_dwt;
+  uint32_t t0_ms;
   uint32_t elapsed_ms;
   uint32_t ksps_x10;
-  char line[192];
+  char line[256];
 
   if (Intan_SPI_IsReady() == 0U)
   {
@@ -349,6 +487,8 @@ static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags)
   usb_stream_reset_all();
   memset(&s_stats, 0, sizeof(s_stats));
   Intan_SpiStats_Reset();
+  Intan_SpiDiag_ResetTiming();
+  Intan_SpiDiag_Init();
   IntanStream_Begin();
 
   s_spi_remaining = n;
@@ -357,7 +497,8 @@ static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags)
   s_spi_counter_mode = 1U;
   s_spi_usb_pump = 0U;
   s_spi_active = 1U;
-  t0 = HAL_GetTick();
+  t0_ms = HAL_GetTick();
+  t0_dwt = DWT->CYCCNT;
 
   while (s_spi_active != 0U)
   {
@@ -369,7 +510,8 @@ static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags)
     }
   }
 
-  elapsed_ms = HAL_GetTick() - t0;
+  Intan_SpiDiag_RecordWall(t0_dwt, DWT->CYCCNT, s_stats.samples_produced);
+  elapsed_ms = HAL_GetTick() - t0_ms;
   if (elapsed_ms == 0U)
   {
     elapsed_ms = 1U;
@@ -379,18 +521,287 @@ static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags)
   s_stats.responses_pushed = s_stats.samples_produced;
   ksps_x10 = (s_stats.samples_produced * 10000U) / elapsed_ms;
 
-  (void)snprintf(line, sizeof(line),
-                 "spi_to_ram samples=%lu elapsed_ms=%lu ksps_x10=%lu "
-                 "spi_xfer32=%lu xfer_per_resp_x1000=%lu frames_prod=%lu",
-                 (unsigned long)s_stats.samples_produced,
-                 (unsigned long)elapsed_ms,
-                 (unsigned long)ksps_x10,
-                 (unsigned long)s_stats.spi_xfer32_count,
-                 (unsigned long)((s_stats.samples_produced > 0U) ?
-                                     ((s_stats.spi_xfer32_count * 1000U) /
-                                      s_stats.samples_produced) :
-                                     0U),
-                 (unsigned long)s_stats.frames_produced);
+  {
+    IntanSpiDiagSnapshot clk;
+    uint32_t wall_ksps_x10 = 0U;
+
+    Intan_SpiDiag_ReadClockConfig(&clk);
+    if (clk.wall_cyc_per_sample > 0U)
+    {
+      wall_ksps_x10 = Intan_SpiDiag_KspsFromCycX10(clk.wall_cyc_per_sample);
+    }
+
+    (void)snprintf(line, sizeof(line),
+                   "spi_to_ram samples=%lu elapsed_ms=%lu ksps_x10=%lu "
+                   "spi_xfer32=%lu xfer_per_resp_x1000=%lu frames_prod=%lu "
+                   "wall_cyc=%lu wall_ksps_x10=%lu",
+                   (unsigned long)s_stats.samples_produced,
+                   (unsigned long)elapsed_ms,
+                   (unsigned long)ksps_x10,
+                   (unsigned long)s_stats.spi_xfer32_count,
+                   (unsigned long)((s_stats.samples_produced > 0U) ?
+                                       ((s_stats.spi_xfer32_count * 1000U) /
+                                        s_stats.samples_produced) :
+                                       0U),
+                   (unsigned long)s_stats.frames_produced,
+                   (unsigned long)clk.wall_cyc_per_sample,
+                   (unsigned long)wall_ksps_x10);
+  }
+  usb_reply_text(line);
+  Intan_DmaPathRelease();
+}
+
+static void usb_cmd_spi_to_ram_fast(uint32_t n, uint8_t channel, uint8_t flags)
+{
+  uint32_t t0_dwt;
+  uint32_t t0_ms;
+  uint32_t elapsed_ms;
+  uint32_t remaining = n;
+  uint32_t total = 0U;
+  uint32_t ksps_x10;
+  uint32_t xfer_per_x1000;
+  HAL_StatusTypeDef st = HAL_OK;
+  char line[256];
+
+  if (Intan_SPI_IsReady() == 0U || n == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  Intan_SpiStats_Reset();
+  Intan_SpiDiag_ResetTiming();
+  Intan_SpiDiag_Init();
+  t0_ms = HAL_GetTick();
+  t0_dwt = DWT->CYCCNT;
+
+  while ((remaining > 0U) && (st == HAL_OK))
+  {
+    uint32_t chunk = remaining;
+
+    if (chunk > SPI_STREAM_CHUNK_MAX)
+    {
+      chunk = SPI_STREAM_CHUNK_MAX;
+    }
+
+    st = Intan_ConvertPipelineRead(chunk, channel, flags, s_spi_buf);
+    total += chunk;
+    remaining -= chunk;
+  }
+
+  Intan_SpiDiag_RecordWall(t0_dwt, DWT->CYCCNT, total);
+  elapsed_ms = HAL_GetTick() - t0_ms;
+  if (elapsed_ms == 0U)
+  {
+    elapsed_ms = 1U;
+  }
+
+  s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
+  xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
+  ksps_x10 = (total * 10000U) / elapsed_ms;
+
+  {
+    IntanSpiDiagSnapshot clk;
+    uint32_t wall_ksps_x10 = 0U;
+
+    Intan_SpiDiag_ReadClockConfig(&clk);
+    if (clk.wall_cyc_per_sample > 0U)
+    {
+      wall_ksps_x10 = Intan_SpiDiag_KspsFromCycX10(clk.wall_cyc_per_sample);
+    }
+
+    (void)snprintf(line, sizeof(line),
+                   "spi_to_ram_fast samples=%lu elapsed_ms=%lu ksps_x10=%lu "
+                   "spi_xfer32=%lu xfer_per_resp_x1000=%lu "
+                   "wall_cyc=%lu wall_ksps_x10=%lu st=%lu",
+                   (unsigned long)total,
+                   (unsigned long)elapsed_ms,
+                   (unsigned long)ksps_x10,
+                   (unsigned long)s_stats.spi_xfer32_count,
+                   (unsigned long)xfer_per_x1000,
+                   (unsigned long)clk.wall_cyc_per_sample,
+                   (unsigned long)wall_ksps_x10,
+                   (unsigned long)st);
+  }
+  usb_reply_text(line);
+}
+
+static void usb_cmd_spi_rate_rr8(uint32_t n, uint8_t flags)
+{
+  uint32_t t0_dwt;
+  uint32_t t0_ms;
+  uint32_t elapsed_ms;
+  uint32_t remaining = n;
+  uint32_t total = 0U;
+  uint32_t ksps_x10;
+  uint32_t ksps_per_ch_x10;
+  uint32_t xfer_per_x1000;
+  uint8_t phase = 0U;
+  HAL_StatusTypeDef st = HAL_OK;
+  char line[288];
+
+  if (Intan_SPI_IsReady() == 0U || n == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  Intan_SpiStats_Reset();
+  Intan_SpiDiag_ResetTiming();
+  Intan_SpiDiag_Init();
+  t0_ms = HAL_GetTick();
+  t0_dwt = DWT->CYCCNT;
+
+  while ((remaining > 0U) && (st == HAL_OK))
+  {
+    uint32_t chunk = remaining;
+
+    if (chunk > SPI_STREAM_CHUNK_MAX)
+    {
+      chunk = SPI_STREAM_CHUNK_MAX;
+    }
+
+    st = Intan_ConvertPipelineDmaTimCsReadRR(chunk, INTAN_STREAM_RR8_CHANNELS, flags, s_spi_buf,
+                                             &phase);
+    total += chunk;
+    remaining -= chunk;
+  }
+
+  Intan_SpiDiag_RecordWall(t0_dwt, DWT->CYCCNT, total);
+  elapsed_ms = HAL_GetTick() - t0_ms;
+  if (elapsed_ms == 0U)
+  {
+    elapsed_ms = 1U;
+  }
+
+  s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
+  xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
+  ksps_x10 = (total * 10000U) / elapsed_ms;
+  ksps_per_ch_x10 = ksps_x10 / INTAN_STREAM_RR8_CHANNELS;
+
+  {
+    IntanSpiDiagSnapshot clk;
+    uint32_t wall_ksps_x10 = 0U;
+    uint32_t wall_per_ch_x10 = 0U;
+
+    Intan_SpiDiag_ReadClockConfig(&clk);
+    if (clk.wall_cyc_per_sample > 0U)
+    {
+      wall_ksps_x10 = Intan_SpiDiag_KspsFromCycX10(clk.wall_cyc_per_sample);
+      wall_per_ch_x10 = wall_ksps_x10 / INTAN_STREAM_RR8_CHANNELS;
+    }
+
+    (void)snprintf(line, sizeof(line),
+                   "spi_rate_rr8 n_ch=%u samples=%lu elapsed_ms=%lu ksps_x10=%lu "
+                   "ksps_per_ch_x10=%lu spi_xfer32=%lu xfer_per_resp_x1000=%lu "
+                   "sck_khz=%lu wall_cyc=%lu wall_ksps_x10=%lu wall_per_ch_x10=%lu "
+                   "phase_end=%u st=%lu",
+                   (unsigned)INTAN_STREAM_RR8_CHANNELS,
+                   (unsigned long)total,
+                   (unsigned long)elapsed_ms,
+                   (unsigned long)ksps_x10,
+                   (unsigned long)ksps_per_ch_x10,
+                   (unsigned long)s_stats.spi_xfer32_count,
+                   (unsigned long)xfer_per_x1000,
+                   (unsigned long)(clk.spi_sck_hz_calc / 1000U),
+                   (unsigned long)clk.wall_cyc_per_sample,
+                   (unsigned long)wall_ksps_x10,
+                   (unsigned long)wall_per_ch_x10,
+                   (unsigned)phase,
+                   (unsigned long)st);
+  }
+  usb_reply_text(line);
+  Intan_DmaPathRelease();
+}
+
+static void usb_cmd_spi_to_ram_rr8(uint32_t n, uint8_t flags)
+{
+  uint32_t t0_dwt;
+  uint32_t t0_ms;
+  uint32_t elapsed_ms;
+  uint32_t ksps_x10;
+  uint32_t ksps_per_ch_x10;
+  char line[288];
+
+  if (Intan_SPI_IsReady() == 0U || n == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  usb_stream_reset_all();
+  memset(&s_stats, 0, sizeof(s_stats));
+  Intan_SpiStats_Reset();
+  Intan_SpiDiag_ResetTiming();
+  Intan_SpiDiag_Init();
+  IntanStream_Begin();
+
+  s_spi_remaining = n;
+  s_spi_channel = 0U;
+  s_spi_flags = flags;
+  s_spi_counter_mode = 1U;
+  s_spi_usb_pump = 0U;
+  s_spi_rr8 = 1U;
+  s_spi_rr_phase = 0U;
+  s_spi_active = 1U;
+  t0_ms = HAL_GetTick();
+  t0_dwt = DWT->CYCCNT;
+
+  while (s_spi_active != 0U)
+  {
+    if (usb_spi_run_one_chunk() == 0U)
+    {
+      s_spi_active = 0U;
+      IntanStream_End();
+      break;
+    }
+  }
+
+  Intan_SpiDiag_RecordWall(t0_dwt, DWT->CYCCNT, s_stats.samples_produced);
+  elapsed_ms = HAL_GetTick() - t0_ms;
+  if (elapsed_ms == 0U)
+  {
+    elapsed_ms = 1U;
+  }
+
+  s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
+  s_stats.responses_pushed = s_stats.samples_produced;
+  ksps_x10 = (s_stats.samples_produced * 10000U) / elapsed_ms;
+  ksps_per_ch_x10 = ksps_x10 / INTAN_STREAM_RR8_CHANNELS;
+
+  {
+    IntanSpiDiagSnapshot clk;
+    uint32_t wall_ksps_x10 = 0U;
+    uint32_t wall_per_ch_x10 = 0U;
+
+    Intan_SpiDiag_ReadClockConfig(&clk);
+    if (clk.wall_cyc_per_sample > 0U)
+    {
+      wall_ksps_x10 = Intan_SpiDiag_KspsFromCycX10(clk.wall_cyc_per_sample);
+      wall_per_ch_x10 = wall_ksps_x10 / INTAN_STREAM_RR8_CHANNELS;
+    }
+
+    (void)snprintf(line, sizeof(line),
+                   "spi_to_ram_rr8 n_ch=%u samples=%lu elapsed_ms=%lu ksps_x10=%lu "
+                   "ksps_per_ch_x10=%lu spi_xfer32=%lu xfer_per_resp_x1000=%lu "
+                   "frames_prod=%lu wall_cyc=%lu wall_ksps_x10=%lu wall_per_ch_x10=%lu "
+                   "phase_end=%u",
+                   (unsigned)INTAN_STREAM_RR8_CHANNELS,
+                   (unsigned long)s_stats.samples_produced,
+                   (unsigned long)elapsed_ms,
+                   (unsigned long)ksps_x10,
+                   (unsigned long)ksps_per_ch_x10,
+                   (unsigned long)s_stats.spi_xfer32_count,
+                   (unsigned long)((s_stats.samples_produced > 0U) ?
+                                       ((s_stats.spi_xfer32_count * 1000U) /
+                                        s_stats.samples_produced) :
+                                       0U),
+                   (unsigned long)s_stats.frames_produced,
+                   (unsigned long)clk.wall_cyc_per_sample,
+                   (unsigned long)wall_ksps_x10,
+                   (unsigned long)wall_per_ch_x10,
+                   (unsigned)s_spi_rr_phase);
+  }
   usb_reply_text(line);
   Intan_DmaPathRelease();
 }
@@ -399,13 +810,19 @@ static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags)
 void UsbStreamService_Init(void)
 {
   memset(&s_stats, 0, sizeof(s_stats));
+  Intan_SpiDiag_Init();
   usb_stream_reset_all();
   USBD_VENDOR_BULK_SetTxCompleteCallback(usb_stream_on_frame_tx_complete);
 }
 
 void UsbStreamService_NoteSample(void)
 {
-  s_stats.samples_produced++;
+  UsbStreamService_NoteSamples(1U);
+}
+
+void UsbStreamService_NoteSamples(uint32_t count)
+{
+  s_stats.samples_produced += count;
   s_stats.responses_pushed = s_stats.samples_produced;
 }
 
@@ -483,7 +900,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
-      usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 1U, 1U);
+      usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 1U, 1U, 0U);
       usb_reply_text("OK");
 #endif
       break;
@@ -492,7 +909,25 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
-      usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U);
+      usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U, 0U);
+      usb_reply_text("OK");
+#endif
+      break;
+
+    case USB_CMD_SPI_STREAM_RR8:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_spi_stream_start(cmd.arg0, 0U, (uint8_t)cmd.arg1, 1U, 1U, 1U);
+      usb_reply_text("OK");
+#endif
+      break;
+
+    case USB_CMD_SPI_STREAM_RR8_REAL:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_spi_stream_start(cmd.arg0, 0U, (uint8_t)cmd.arg1, 0U, 1U, 1U);
       usb_reply_text("OK");
 #endif
       break;
@@ -505,11 +940,43 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #endif
       break;
 
+    case USB_CMD_SPI_TO_RAM_FAST:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_spi_to_ram_fast(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2);
+#endif
+      break;
+
     case USB_CMD_SPI_RATE:
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
       usb_cmd_spi_rate(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2);
+#endif
+      break;
+
+    case USB_CMD_SPI_RATE_FAST:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_spi_rate_fast(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2);
+#endif
+      break;
+
+    case USB_CMD_SPI_RATE_RR8:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_spi_rate_rr8(cmd.arg0, (uint8_t)cmd.arg1);
+#endif
+      break;
+
+    case USB_CMD_SPI_TO_RAM_RR8:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_spi_to_ram_rr8(cmd.arg0, (uint8_t)cmd.arg1);
 #endif
       break;
 

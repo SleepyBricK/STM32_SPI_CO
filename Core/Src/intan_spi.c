@@ -5,6 +5,7 @@
 
 #include "intan_spi.h"
 #include "intan_spi4_hw.h"
+#include "intan_spi_diag.h"
 #include <stdint.h>
 
 static uint8_t g_intan_spi_ready;
@@ -498,6 +499,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
     return HAL_ERROR;
   }
 
+  Intan_SpiDiag_Init();
   __HAL_RCC_DMA1_CLK_ENABLE();
   intan_cs_tim1_ch2_mode();
 
@@ -556,17 +558,22 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
   TIM1->CNT = 0U;
   TIM1->SR = 0U;
   TIM1->CCER |= TIM_CCER_CC2E;
-  TIM1->CR1 |= TIM_CR1_CEN;
-  __NOP();
-  __NOP();
-  INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
-
-  if (intan_wait_reg_flag_guard(&INTAN_SPI_INSTANCE->SR, SPI_SR_EOT) != HAL_OK ||
-      intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream0_done) != HAL_OK ||
-      intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream1_done) != HAL_OK)
   {
-    intan_dma_timcs_recover(old_midi);
-    return HAL_TIMEOUT;
+    uint32_t cyc_start = DWT->CYCCNT;
+    TIM1->CR1 |= TIM_CR1_CEN;
+    __NOP();
+    __NOP();
+    INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
+
+    if (intan_wait_reg_flag_guard(&INTAN_SPI_INSTANCE->SR, SPI_SR_EOT) != HAL_OK ||
+        intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream0_done) != HAL_OK ||
+        intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream1_done) != HAL_OK)
+    {
+      intan_dma_timcs_recover(old_midi);
+      return HAL_TIMEOUT;
+    }
+
+    Intan_SpiDiag_RecordBlock(cyc_start, DWT->CYCCNT, n, chunk_slots, period_ticks);
   }
 
   for (uint32_t i = 0U; i < n; i++)
@@ -1007,6 +1014,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineRead(uint32_t n, uint8_t channel, uint8_t
   INTAN_SPI_INSTANCE->IFCR = SPI_IFCR_EOTC | SPI_IFCR_TXTFC | SPI_IFCR_UDRC | SPI_IFCR_OVRC |
                              SPI_IFCR_MODFC | SPI_IFCR_SUSPC;
 
+  Intan_SpiStats_AddXfer32(slots);
   return HAL_OK;
 }
 

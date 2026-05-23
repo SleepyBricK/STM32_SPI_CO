@@ -3,6 +3,7 @@
 #include "usb_stream_ring.h"
 #include "usb_stream_service.h"
 #include <stddef.h>
+#include <string.h>
 
 static UsbStreamFrame *s_cur;
 static uint32_t s_cur_pos;
@@ -55,6 +56,58 @@ static void intan_stream_finalize_frame(void)
   s_cur_pos = 0U;
 }
 
+static void intan_stream_append_samples(const uint16_t *src, uint32_t count, uint32_t counter_base)
+{
+  uint32_t off = 0U;
+
+  while (off < count)
+  {
+    uint32_t room;
+    uint32_t n;
+
+    if (s_cur == NULL)
+    {
+      intan_stream_open_frame();
+      if (s_cur == NULL)
+      {
+        UsbStreamService_NoteUsbOverflow();
+        return;
+      }
+    }
+
+    room = USB_STREAM_FRAME_RESPONSES - s_cur_pos;
+    n = count - off;
+    if (n > room)
+    {
+      n = room;
+    }
+
+    if (src != NULL)
+    {
+      memcpy(&s_cur->response[s_cur_pos], &src[off], n * sizeof(uint16_t));
+    }
+    else
+    {
+      uint32_t i;
+      for (i = 0U; i < n; i++)
+      {
+        s_cur->response[s_cur_pos + i] = (uint16_t)((counter_base + off + i) & 0xFFFFU);
+      }
+    }
+
+    s_cur_pos += n;
+    s_next_sample += n;
+    off += n;
+
+    if (s_cur_pos >= USB_STREAM_FRAME_RESPONSES)
+    {
+      intan_stream_finalize_frame();
+    }
+  }
+
+  UsbStreamService_NoteSamples(count);
+}
+
 void IntanStream_Reset(void)
 {
   intan_stream_finalize_frame();
@@ -85,24 +138,27 @@ void IntanStream_PushResponse(uint16_t response)
     return;
   }
 
-  if (s_cur == NULL)
+  intan_stream_append_samples(&response, 1U, 0U);
+}
+
+void IntanStream_PushCounterBlock(uint32_t base, uint32_t count)
+{
+  if (s_active == 0U || count == 0U)
   {
-    intan_stream_open_frame();
-    if (s_cur == NULL)
-    {
-      return;
-    }
+    return;
   }
 
-  s_cur->response[s_cur_pos] = response;
-  s_cur_pos++;
-  s_next_sample++;
-  UsbStreamService_NoteSample();
+  intan_stream_append_samples(NULL, count, base);
+}
 
-  if (s_cur_pos >= USB_STREAM_FRAME_RESPONSES)
+void IntanStream_PushBlock(const uint16_t *src, uint32_t count)
+{
+  if (s_active == 0U || src == NULL || count == 0U)
   {
-    intan_stream_finalize_frame();
+    return;
   }
+
+  intan_stream_append_samples(src, count, 0U);
 }
 
 uint32_t IntanStream_PeekNextSample(void)

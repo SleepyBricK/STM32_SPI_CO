@@ -11,6 +11,8 @@ void IntanStream_Reset(void);
 void IntanStream_Begin(void);
 void IntanStream_End(void);
 void IntanStream_PushResponse(uint16_t response);
+void IntanStream_PushCounterBlock(uint32_t base, uint32_t count);
+void IntanStream_PushBlock(const uint16_t *src, uint32_t count);
 uint32_t IntanStream_PeekNextSample(void);
 uint8_t IntanStream_IsActive(void);
 

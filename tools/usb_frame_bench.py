@@ -101,10 +101,16 @@ def run_once(
     *,
     spi_stream: bool = False,
     spi_real: bool = False,
+    spi_rr8: bool = False,
+    spi_rr8_real: bool = False,
     channel: int = 0,
     flags: int = 0,
 ) -> tuple[int, float, int]:
-    if spi_real:
+    if spi_rr8_real:
+        cmd = f"SPI_STREAM_RR8_REAL {samples} {flags}"
+    elif spi_rr8:
+        cmd = f"SPI_STREAM_RR8 {samples} {flags}"
+    elif spi_real:
         cmd = f"SPI_STREAM_REAL {samples} {channel} {flags}"
     elif spi_stream:
         cmd = f"SPI_STREAM {samples} {channel} {flags}"
@@ -120,13 +126,13 @@ def run_once(
 
     for _ in range(frames_needed):
         payload = bytes(dev.read(EP_IN, FRAME_SIZE, timeout=timeout_ms))
-        if spi_real:
+        if spi_real or spi_rr8_real:
             errors += validate_frame_header(payload, next_seq)
         else:
             errors += validate_frame(payload, next_seq, next_first)
         _seq, first_sc, sample_count, _spi, _usb, _v = parse_frame(payload)
         next_seq += 1
-        if not spi_real:
+        if not spi_real and not spi_rr8_real:
             next_first = (first_sc + sample_count) & 0xFFFFFFFF
 
     elapsed = time.perf_counter() - t0
@@ -155,12 +161,26 @@ def main() -> int:
         action="store_true",
         help="SPI_STREAM_REAL: TIM+DMA SPI, real CONVERT RESPONSE (step 4)",
     )
+    parser.add_argument(
+        "--spi-stream-rr8",
+        action="store_true",
+        help="SPI_STREAM_RR8: 8ch round-robin, counter payload",
+    )
+    parser.add_argument(
+        "--spi-stream-rr8-real",
+        action="store_true",
+        help="SPI_STREAM_RR8_REAL: 8ch round-robin, real RESPONSE",
+    )
     parser.add_argument("--channel", type=int, default=0)
     parser.add_argument("--flags", type=lambda x: int(x, 0), default=0)
     args = parser.parse_args()
 
     if args.samples <= 0 or args.runs <= 0:
         print("samples and runs must be > 0", file=sys.stderr)
+        return 2
+
+    if sum(bool(x) for x in (args.spi_stream, args.spi_stream_real, args.spi_stream_rr8, args.spi_stream_rr8_real)) > 1:
+        print("choose one stream mode only", file=sys.stderr)
         return 2
 
     try:
@@ -174,6 +194,8 @@ def main() -> int:
                 args.timeout_ms,
                 spi_stream=args.spi_stream,
                 spi_real=args.spi_stream_real,
+                spi_rr8=args.spi_stream_rr8,
+                spi_rr8_real=args.spi_stream_rr8_real,
                 channel=args.channel,
                 flags=args.flags,
             )
