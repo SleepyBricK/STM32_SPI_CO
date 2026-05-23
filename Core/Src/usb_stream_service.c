@@ -6,6 +6,7 @@
 #include "intan_stream.h"
 #include "intan_spi.h"
 #include "intan_spi_diag.h"
+#include "intan_app.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -49,6 +50,15 @@ static void usb_cmd_spi_rate_fast(uint32_t n, uint8_t channel, uint8_t flags);
 static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags);
 static void usb_cmd_spi_rate_rr8(uint32_t n, uint8_t flags);
 static void usb_cmd_spi_to_ram_rr8(uint32_t n, uint8_t flags);
+static void usb_intan_stop_stream(void);
+static void usb_cmd_id(void);
+static void usb_cmd_read(uint32_t reg);
+static void usb_cmd_write(uint32_t reg, uint32_t value, uint32_t u, uint32_t m);
+static void usb_cmd_init_record(uint32_t ksps);
+static void usb_cmd_init_stim(void);
+static void usb_cmd_clear_adc(void);
+static void usb_cmd_clear_comp(void);
+static void usb_cmd_convert(uint32_t channel, uint32_t flags);
 static void usb_stats_reply(void);
 
 static void usb_stream_on_frame_tx_complete(uint32_t len)
@@ -805,6 +815,198 @@ static void usb_cmd_spi_to_ram_rr8(uint32_t n, uint8_t flags)
   usb_reply_text(line);
   Intan_DmaPathRelease();
 }
+
+static void usb_intan_stop_stream(void)
+{
+  usb_stream_reset_all();
+}
+
+static void usb_cmd_id(void)
+{
+  uint16_t val = 0U;
+  uint32_t raw32 = 0U;
+  char line[96];
+
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_ReadReg_WithRaw(255U, &val, &raw32) != HAL_OK)
+  {
+    usb_reply_text("ERR spi");
+    return;
+  }
+
+  (void)snprintf(line, sizeof(line), "OK ID chip=0x%04X raw32=0x%08lX", (unsigned int)val,
+                 (unsigned long)raw32);
+  usb_reply_text(line);
+}
+
+static void usb_cmd_read(uint32_t reg)
+{
+  uint16_t val = 0U;
+  char line[64];
+
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  if (reg > 255U)
+  {
+    usb_reply_text("ERR reg");
+    return;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_ReadReg((uint8_t)reg, &val) != HAL_OK)
+  {
+    usb_reply_text("ERR spi");
+    return;
+  }
+
+  (void)snprintf(line, sizeof(line), "OK READ reg=%lu value=0x%04X", (unsigned long)reg,
+                 (unsigned int)val);
+  usb_reply_text(line);
+}
+
+static void usb_cmd_write(uint32_t reg, uint32_t value, uint32_t u, uint32_t m)
+{
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  if (reg > 255U || value > 0xFFFFU)
+  {
+    usb_reply_text("ERR range");
+    return;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_WriteReg((uint8_t)reg, (uint16_t)value, (uint8_t)u, (uint8_t)m) != HAL_OK)
+  {
+    usb_reply_text("ERR spi");
+    return;
+  }
+
+  usb_reply_text("OK WRITE");
+}
+
+static void usb_cmd_init_record(uint32_t ksps)
+{
+  uint16_t target = (uint16_t)ksps;
+  char line[48];
+
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  if (target == 0U)
+  {
+    target = 480U;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_App_InitRecord(target) != HAL_OK)
+  {
+    usb_reply_text("ERR init_record");
+    return;
+  }
+
+  (void)snprintf(line, sizeof(line), "OK INIT_RECORD %u", (unsigned)target);
+  usb_reply_text(line);
+}
+
+static void usb_cmd_init_stim(void)
+{
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_App_InitStim() != HAL_OK)
+  {
+    usb_reply_text("ERR init_stim");
+    return;
+  }
+
+  usb_reply_text("OK INIT_STIM");
+}
+
+static void usb_cmd_clear_adc(void)
+{
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_App_ClearAdc() != HAL_OK)
+  {
+    usb_reply_text("ERR clear_adc");
+    return;
+  }
+
+  usb_reply_text("OK CLEAR_ADC");
+}
+
+static void usb_cmd_clear_comp(void)
+{
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_App_ClearCompliance() != HAL_OK)
+  {
+    usb_reply_text("ERR clear_comp");
+    return;
+  }
+
+  usb_reply_text("OK CLEAR_COMP");
+}
+
+static void usb_cmd_convert(uint32_t channel, uint32_t flags)
+{
+  uint16_t value = 0U;
+  char line[80];
+
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+
+  if (channel > 63U)
+  {
+    usb_reply_text("ERR ch");
+    return;
+  }
+
+  usb_intan_stop_stream();
+  if (Intan_Convert((uint8_t)channel, (uint8_t)flags, &value) != HAL_OK)
+  {
+    usb_reply_text("ERR spi");
+    return;
+  }
+
+  (void)snprintf(line, sizeof(line), "OK CONVERT ch=%lu flags=0x%02lX value=0x%04X",
+                 (unsigned long)channel, (unsigned long)(flags & 0xFFU), (unsigned int)value);
+  usb_reply_text(line);
+}
 #endif
 
 void UsbStreamService_Init(void)
@@ -977,6 +1179,70 @@ void UsbVendorBulk_ProcessOutCommands(void)
       usb_reply_text("ERR no intan hw");
 #else
       usb_cmd_spi_to_ram_rr8(cmd.arg0, (uint8_t)cmd.arg1);
+#endif
+      break;
+
+    case USB_CMD_ID:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_id();
+#endif
+      break;
+
+    case USB_CMD_READ:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_read(cmd.arg0);
+#endif
+      break;
+
+    case USB_CMD_WRITE:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_write(cmd.arg0, cmd.arg1, cmd.arg2, cmd.arg3);
+#endif
+      break;
+
+    case USB_CMD_INIT_RECORD:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_init_record(cmd.arg0);
+#endif
+      break;
+
+    case USB_CMD_INIT_STIM:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_init_stim();
+#endif
+      break;
+
+    case USB_CMD_CLEAR_ADC:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_clear_adc();
+#endif
+      break;
+
+    case USB_CMD_CLEAR_COMP:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_clear_comp();
+#endif
+      break;
+
+    case USB_CMD_CONVERT:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_convert(cmd.arg0, cmd.arg1);
 #endif
       break;
 

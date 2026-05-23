@@ -26,7 +26,7 @@ static int streq_ci(const char *a, const char *b)
 
 UsbCommand UsbCommands_ParseLine(const char *line)
 {
-  UsbCommand cmd = {USB_CMD_NONE, 0U};
+  UsbCommand cmd = {USB_CMD_NONE, 0U, 0U, 0U, 0U};
   char buf[128];
   char *ctx = NULL;
   char *tok;
@@ -79,6 +79,78 @@ UsbCommand UsbCommands_ParseLine(const char *line)
     tok = strtok_r(NULL, " \t", &ctx);
     cmd.id = USB_CMD_SYNTH_STREAM;
     cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "INIT_RECORD"))
+  {
+    cmd.id = USB_CMD_INIT_RECORD;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "INIT_STIM"))
+  {
+    cmd.id = USB_CMD_INIT_STIM;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "CLEAR_ADC"))
+  {
+    cmd.id = USB_CMD_CLEAR_ADC;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "CLEAR_COMP"))
+  {
+    cmd.id = USB_CMD_CLEAR_COMP;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "CONVERT"))
+  {
+    cmd.id = USB_CMD_CONVERT;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    if (tok != NULL)
+    {
+      cmd.arg1 = (uint32_t)strtoul(tok, NULL, 0);
+      tok = strtok_r(NULL, " \t", &ctx);
+      if (tok != NULL)
+      {
+        cmd.arg1 |= ((uint32_t)strtoul(tok, NULL, 0) != 0U) ? 2U : 0U;
+      }
+    }
+    return cmd;
+  }
+
+  if (streq_ci(tok, "READ"))
+  {
+    cmd.id = USB_CMD_READ;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "WRITE"))
+  {
+    cmd.id = USB_CMD_WRITE;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg3 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "ID"))
+  {
+    cmd.id = USB_CMD_ID;
     return cmd;
   }
 

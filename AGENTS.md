@@ -124,7 +124,8 @@ python3 tools/usb_intan_cmd.py STATS --no-reset   # sysclk_mhz=480
 - **Проверки host**: `python3 tools/usb_intan_cmd.py PING`; `python3 tools/usb_frame_bench.py -n 50000 --no-reset --runs 5`; длинный: `-n 5000000 --runs 3`. HS: `lsusb -t` → **480M**.
 - **Интеграция SPI (порядок)**: (1) длинный USB-only bench; (2) SPI-only ~713 kS/s; (3) `SPI_STREAM` — TIM+DMA + счётчик в RHS1; (4) `SPI_STREAM_REAL` — реальный RESPONSE.
 - **STATS / SPI bench**: `cyc_samp` / `ksps_cyc_x10` — **целевой TIM-slot** (DMA CEN→EOT), не wall-clock. **`wall_cyc` / `wall_ksps_x10`** — фактический DWT over full command (setup + SPI + unpack). При 240 MHz: **713 kS/s ≈ wall_cyc 336**, **562 kS/s ≈ 427**, **495 kS/s ≈ 485**. `sck_khz=25000` — норма.
-- **USB SPI команды**: `SPI_RATE` / `SPI_RATE_RR8` (8ch RR), `SPI_TO_RAM` / `SPI_TO_RAM_RR8`, `SPI_STREAM_RR8` / `SPI_STREAM_RR8_REAL`. Host: `python3 tools/usb_spi_rr8_bench.py -n 50000 --no-reset`.
+- **USB SPI команды**: stream/bench — `SPI_STREAM_RR8_REAL`, `SPI_RATE_RR8`, … Host: `python3 tools/usb_spi_rr8_bench.py`.
+- **USB Intan (V1 текст, EP OUT/IN как PING)**: `ID`, `READ reg`, `WRITE reg val [u m]`, `INIT_RECORD [ksps]`, `INIT_STIM`, `CLEAR_ADC`, `CLEAR_COMP`, `CONVERT ch [flags]`. Перед ними — `usb_stream_reset_all()` (как STOP). Ответы: `OK ID chip=…`, `OK READ reg=…`, `ERR …`. Stimulator (`msu-neuro-terminal-linux`) — тот же формат, что UART CLI V1.
 
 ## Обновление этого файла
 

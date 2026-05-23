@@ -21,6 +21,14 @@ typedef enum {
   USB_CMD_SPI_RATE,
   USB_CMD_SPI_RATE_FAST,
   USB_CMD_SPI_RATE_RR8,
+  USB_CMD_ID,
+  USB_CMD_READ,
+  USB_CMD_WRITE,
+  USB_CMD_INIT_RECORD,
+  USB_CMD_INIT_STIM,
+  USB_CMD_CLEAR_ADC,
+  USB_CMD_CLEAR_COMP,
+  USB_CMD_CONVERT,
   USB_CMD_STOP,
   USB_CMD_STATS,
   USB_CMD_UNKNOWN
@@ -31,6 +39,7 @@ typedef struct {
   uint32_t arg0;
   uint32_t arg1;
   uint32_t arg2;
+  uint32_t arg3;
 } UsbCommand;
 
 UsbCommand UsbCommands_ParseLine(const char *line);
