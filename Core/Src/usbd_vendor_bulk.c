@@ -1,13 +1,8 @@
 #include "usbd_vendor_bulk.h"
 #include "usbd_ctlreq.h"
-#include "stm32h7xx.h"
 
 #define VENDOR_BULK_CONFIG_DESC_SIZE     32U
 #define VENDOR_BULK_INTERFACE            0U
-
-#ifndef USB_PCD_DMA_ENABLE
-#define USB_PCD_DMA_ENABLE               1U
-#endif
 
 static uint8_t USBD_VENDOR_BULK_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
 static uint8_t USBD_VENDOR_BULK_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
@@ -89,89 +84,82 @@ typedef struct
   uint16_t len;
   uint8_t zc;
   __ALIGN_BEGIN uint8_t stash[VENDOR_BULK_HS_MAX_PACKET] __ALIGN_END;
-} VendorBulkTxItem;
+} VendorBulkTxPacket;
 
-static __ALIGN_BEGIN VendorBulkTxItem VendorBulkTxQ[VENDOR_BULK_TX_QUEUE_DEPTH] __ALIGN_END;
-static volatile uint8_t VendorBulkTxQHead;
-static volatile uint8_t VendorBulkTxQTail;
-static volatile uint8_t VendorBulkTxQCount;
-static volatile uint8_t VendorBulkTxHwBusy;
+static __ALIGN_BEGIN VendorBulkTxPacket VendorBulkTxActive __ALIGN_END;
+static __ALIGN_BEGIN VendorBulkTxPacket VendorBulkTxQueued __ALIGN_END;
+
+static volatile uint8_t VendorBulkTxInFlight;
+static volatile uint8_t VendorBulkTxHasQueued;
 static volatile uint8_t VendorBulkRxPending;
 static volatile uint16_t VendorBulkPendingRxLen;
 static USBD_HandleTypeDef *VendorBulkDevice;
 static uint8_t VendorBulkAltSetting;
 
-static void vendor_bulk_dcache_clean(const uint8_t *ptr, uint32_t len)
+static uint8_t vendor_bulk_tx_start_packet(const VendorBulkTxPacket *pkt)
 {
-#if (USB_PCD_DMA_ENABLE == 1U)
-  if ((len > 0U) && (ptr != NULL))
-  {
-    uint32_t start = (uint32_t)ptr & ~31U;
-    uint32_t end = ((uint32_t)ptr + len + 31U) & ~31U;
-    SCB_CleanDCache_by_Addr((uint32_t *)start, end - start);
-  }
-#else
-  (void)ptr;
-  (void)len;
-#endif
-}
+  const uint8_t *tx_ptr = (pkt->zc != 0U) ? pkt->ptr : pkt->stash;
 
-static uint8_t vendor_bulk_tx_launch(const VendorBulkTxItem *item)
-{
-  const uint8_t *tx_ptr = (item->zc != 0U) ? item->ptr : item->stash;
-
-  vendor_bulk_dcache_clean(tx_ptr, item->len);
-  VendorBulkTxHwBusy = 1U;
-  if (USBD_LL_Transmit(VendorBulkDevice, VENDOR_BULK_IN_EP, (uint8_t *)tx_ptr, item->len) != USBD_OK)
+  VendorBulkTxInFlight = 1U;
+  if (USBD_LL_Transmit(VendorBulkDevice, VENDOR_BULK_IN_EP, (uint8_t *)tx_ptr, pkt->len) != USBD_OK)
   {
-    VendorBulkTxHwBusy = 0U;
+    VendorBulkTxInFlight = 0U;
     return (uint8_t)USBD_FAIL;
   }
 
   return (uint8_t)USBD_OK;
 }
 
-static void vendor_bulk_tx_kick(void)
+static void vendor_bulk_tx_store_packet(VendorBulkTxPacket *dst, const uint8_t *buf, uint16_t len, uint8_t zc)
 {
-  if ((VendorBulkTxHwBusy != 0U) || (VendorBulkTxQCount == 0U))
+  dst->len = len;
+  dst->zc = zc;
+  if (zc != 0U)
   {
+    dst->ptr = buf;
     return;
   }
 
-  (void)vendor_bulk_tx_launch(&VendorBulkTxQ[VendorBulkTxQHead]);
+  USBD_memcpy(dst->stash, buf, len);
+  dst->ptr = dst->stash;
 }
 
-static void vendor_bulk_tx_complete(void)
+static void vendor_bulk_tx_kick_queued(void)
 {
-  VendorBulkTxHwBusy = 0U;
-  if (VendorBulkTxQCount > 0U)
+  if ((VendorBulkTxHasQueued != 0U) && (VendorBulkTxInFlight == 0U))
   {
-    VendorBulkTxQHead = (uint8_t)((VendorBulkTxQHead + 1U) % VENDOR_BULK_TX_QUEUE_DEPTH);
-    VendorBulkTxQCount--;
+    VendorBulkTxActive = VendorBulkTxQueued;
+    VendorBulkTxHasQueued = 0U;
+    (void)vendor_bulk_tx_start_packet(&VendorBulkTxActive);
   }
-  vendor_bulk_tx_kick();
-}
-
-static uint8_t vendor_bulk_tx_enqueue(VendorBulkTxItem *item)
-{
-  if (VendorBulkTxQCount >= VENDOR_BULK_TX_QUEUE_DEPTH)
-  {
-    return (uint8_t)USBD_BUSY;
-  }
-
-  VendorBulkTxQ[VendorBulkTxQTail] = *item;
-  VendorBulkTxQTail = (uint8_t)((VendorBulkTxQTail + 1U) % VENDOR_BULK_TX_QUEUE_DEPTH);
-  VendorBulkTxQCount++;
-  vendor_bulk_tx_kick();
-  return (uint8_t)USBD_OK;
 }
 
 static void vendor_bulk_tx_reset(void)
 {
-  VendorBulkTxQHead = 0U;
-  VendorBulkTxQTail = 0U;
-  VendorBulkTxQCount = 0U;
-  VendorBulkTxHwBusy = 0U;
+  VendorBulkTxInFlight = 0U;
+  VendorBulkTxHasQueued = 0U;
+  VendorBulkTxActive.len = 0U;
+  VendorBulkTxActive.zc = 0U;
+  VendorBulkTxQueued.len = 0U;
+  VendorBulkTxQueued.zc = 0U;
+}
+
+static uint8_t vendor_bulk_tx_submit(const uint8_t *buf, uint16_t len, uint8_t zc)
+{
+  if (VendorBulkTxInFlight == 0U)
+  {
+    vendor_bulk_tx_store_packet(&VendorBulkTxActive, buf, len, zc);
+    return vendor_bulk_tx_start_packet(&VendorBulkTxActive);
+  }
+
+  if (VendorBulkTxHasQueued == 0U)
+  {
+    vendor_bulk_tx_store_packet(&VendorBulkTxQueued, buf, len, zc);
+    VendorBulkTxHasQueued = 1U;
+    return (uint8_t)USBD_OK;
+  }
+
+  return (uint8_t)USBD_BUSY;
 }
 
 static uint8_t USBD_VENDOR_BULK_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
@@ -232,7 +220,8 @@ static uint8_t USBD_VENDOR_BULK_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
   (void)pdev;
   if ((epnum & 0x7FU) == (VENDOR_BULK_IN_EP & 0x7FU))
   {
-    vendor_bulk_tx_complete();
+    VendorBulkTxInFlight = 0U;
+    vendor_bulk_tx_kick_queued();
   }
   return (uint8_t)USBD_OK;
 }
@@ -260,50 +249,39 @@ static uint8_t USBD_VENDOR_BULK_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
 
 uint8_t USBD_VENDOR_BULK_Transmit(uint8_t *buf, uint16_t len)
 {
-  VendorBulkTxItem item;
-
   if ((VendorBulkDevice == NULL) || (VendorBulkDevice->dev_state != USBD_STATE_CONFIGURED) ||
       (buf == NULL) || (len == 0U) || (len > VENDOR_BULK_MAX_PACKET))
   {
     return (uint8_t)USBD_FAIL;
   }
 
-  USBD_memcpy(item.stash, buf, len);
-  item.ptr = item.stash;
-  item.len = len;
-  item.zc = 0U;
-  return vendor_bulk_tx_enqueue(&item);
+  return vendor_bulk_tx_submit(buf, len, 0U);
 }
 
 uint8_t USBD_VENDOR_BULK_TransmitZc(const uint8_t *buf, uint16_t len)
 {
-  VendorBulkTxItem item;
-
   if ((VendorBulkDevice == NULL) || (VendorBulkDevice->dev_state != USBD_STATE_CONFIGURED) ||
       (buf == NULL) || (len == 0U) || (len > VENDOR_BULK_MAX_PACKET))
   {
     return (uint8_t)USBD_FAIL;
   }
 
-  item.ptr = buf;
-  item.len = len;
-  item.zc = 1U;
-  return vendor_bulk_tx_enqueue(&item);
+  return vendor_bulk_tx_submit(buf, len, 1U);
 }
 
 uint8_t USBD_VENDOR_BULK_TxReady(void)
 {
   return (VendorBulkDevice != NULL) &&
          (VendorBulkDevice->dev_state == USBD_STATE_CONFIGURED) &&
-         (VendorBulkTxQCount < VENDOR_BULK_TX_QUEUE_DEPTH);
+         ((VendorBulkTxInFlight == 0U) || (VendorBulkTxHasQueued == 0U));
 }
 
 uint8_t USBD_VENDOR_BULK_TxIdle(void)
 {
   return (VendorBulkDevice != NULL) &&
          (VendorBulkDevice->dev_state == USBD_STATE_CONFIGURED) &&
-         (VendorBulkTxQCount == 0U) &&
-         (VendorBulkTxHwBusy == 0U);
+         (VendorBulkTxInFlight == 0U) &&
+         (VendorBulkTxHasQueued == 0U);
 }
 
 uint8_t USBD_VENDOR_BULK_PollRx(uint8_t *buf, uint16_t max_len, uint16_t *len_out)

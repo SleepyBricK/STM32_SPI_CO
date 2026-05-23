@@ -11,7 +11,6 @@ extern "C" {
 #define VENDOR_BULK_OUT_EP               0x01U
 #define VENDOR_BULK_HS_MAX_PACKET        512U
 #define VENDOR_BULK_FS_MAX_PACKET        64U
-#define VENDOR_BULK_TX_QUEUE_DEPTH       3U
 
 #if (USB_DEBUG_FORCE_FULL_SPEED == 1U)
 #define VENDOR_BULK_MAX_PACKET           VENDOR_BULK_FS_MAX_PACKET

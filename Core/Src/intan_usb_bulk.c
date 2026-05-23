@@ -9,9 +9,10 @@
 #define USB_CMD_MAX   VENDOR_BULK_HS_MAX_PACKET
 #define USB_REPLY_MAX VENDOR_BULK_HS_MAX_PACKET
 #define USB_STREAM_BULK_PACKET_SAMPLES (VENDOR_BULK_HS_MAX_PACKET / 2U)
-#define USB_STREAM_DMA_SAMPLES         8190U
+#define USB_STREAM_DMA_SAMPLES         4096U
 #define USB_STREAM_TX_TIMEOUT_MS       5000U
 #define USB_STREAM_PINGPONG_BUFS       2U
+#define USB_STREAM_RR8_CHANNELS        INTAN_STREAM_RR8_CHANNELS
 
 static uint8_t s_rx[USB_CMD_MAX];
 static char s_reply[USB_REPLY_MAX];
@@ -267,6 +268,65 @@ static HAL_StatusTypeDef stream_convert_samples(uint32_t n, uint8_t channel, uin
   return stream_drain_usb();
 }
 
+static HAL_StatusTypeDef stream_convert_samples_rr8(uint32_t n, uint8_t flags)
+{
+  uint32_t acquired = 0U;
+  uint8_t fill_idx = 0U;
+  uint8_t rr_phase = 0U;
+  uint32_t block_samples;
+  HAL_StatusTypeDef st;
+
+  stream_usb_reset_state();
+  Intan_SetIdleHook(stream_usb_idle_hook, NULL);
+
+  block_samples = n;
+  if (block_samples > USB_STREAM_DMA_SAMPLES)
+  {
+    block_samples = USB_STREAM_DMA_SAMPLES;
+  }
+
+  st = Intan_ConvertPipelineDmaTimCsReadRR(block_samples, USB_STREAM_RR8_CHANNELS, flags,
+                                           s_stream_buf[0], &rr_phase);
+  if (st != HAL_OK)
+  {
+    Intan_SetIdleHook(NULL, NULL);
+    return st;
+  }
+
+  acquired += block_samples;
+  stream_usb_queue_send(s_stream_buf[0], block_samples);
+  fill_idx = 1U;
+
+  while ((acquired < n) || (s_stream_out.active != 0U) || (s_stream_pending.valid != 0U))
+  {
+    stream_usb_pump();
+
+    if (acquired < n)
+    {
+      block_samples = n - acquired;
+      if (block_samples > USB_STREAM_DMA_SAMPLES)
+      {
+        block_samples = USB_STREAM_DMA_SAMPLES;
+      }
+
+      st = Intan_ConvertPipelineDmaTimCsReadRR(block_samples, USB_STREAM_RR8_CHANNELS, flags,
+                                               s_stream_buf[fill_idx], &rr_phase);
+      if (st != HAL_OK)
+      {
+        Intan_SetIdleHook(NULL, NULL);
+        return st;
+      }
+
+      acquired += block_samples;
+      stream_usb_queue_send(s_stream_buf[fill_idx], block_samples);
+      fill_idx ^= 1U;
+    }
+  }
+
+  Intan_SetIdleHook(NULL, NULL);
+  return stream_drain_usb();
+}
+
 static int parse_bench_n_ch(char **ctx, unsigned long *out_n, uint8_t *out_ch)
 {
   char a[24];
@@ -330,7 +390,7 @@ static void dispatch_usb_command(char *line)
               "INIT_RECORD [ksps] INIT_STIM CLEAR_ADC CLEAR_COMP "
               "CONVERT ch [flags] "
               "BENCH n [ch] BENCH_FAST n [ch] BENCH_DMA n [ch] BENCH_TIMCS n [ch] [target_ksps] "
-              "STREAM n [ch] [flags]");
+              "STREAM n [ch] [flags] STREAM8 n [flags]");
     return;
   }
 
@@ -664,6 +724,40 @@ static void dispatch_usb_command(char *line)
     if (stream_convert_samples((uint32_t)u0, channel, flags) != HAL_OK)
     {
       set_reply("ERR stream");
+    }
+    return;
+  }
+
+  if (strcmp(cmd, "STREAM8") == 0)
+  {
+    uint8_t flags = 0U;
+
+    if (next_token(&ctx, a, sizeof(a)) == 0)
+    {
+      set_reply("ERR args");
+      return;
+    }
+
+    u0 = strtoul(a, NULL, 0);
+    if (u0 == 0UL)
+    {
+      set_reply("ERR n");
+      return;
+    }
+    if (next_token(&ctx, b, sizeof(b)) != 0)
+    {
+      u1 = strtoul(b, NULL, 0);
+      if (u1 > 255U)
+      {
+        set_reply("ERR flags");
+        return;
+      }
+      flags = (uint8_t)u1;
+    }
+
+    if (stream_convert_samples_rr8((uint32_t)u0, flags) != HAL_OK)
+    {
+      set_reply("ERR stream8");
     }
     return;
   }

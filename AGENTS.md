@@ -45,7 +45,7 @@
 
 - **CS**: **PE11**, активный низкий.
 - Протокол: три CS-транзакции на READ/WRITE/CONVERT; упаковка `(b0<<24)|(b1<<16)|(b2<<8)|b3`.
-- **`BENCH_DMA` / `STREAM`**: SPI2 DMA + TIM1_CH2, ping-pong **2×8190** samples (`.dma_buffer`), `TransmitZc` + **TX queue 3**, USB PCD **DMA** + D-Cache clean, EP1 FIFO **0x180**.
+- **`STREAM` / `STREAM8`**: ping-pong **2×4096**, `TransmitZc`, очередь **2**; `STREAM8` — interleaved CONVERT ch **0–7** (~total/8 ksps на канал).
 
 Сборка **без запаянного Intan** (по умолчанию): **`INTAN_HW_PRESENT=0`** — пропуск `MX_SPI2_Init` и bringup; USB `PING`/`ECHO`/`HELP`, UART `PING`/`HELP`; команды Intan → `ERR no intan hw`.
 
@@ -62,7 +62,7 @@
 - Init: `USB_DEVICE_Init()` → `DevDisconnect` / 50 ms / `DevConnect`; после полного init — **`USB_DEVICE_FinalizeAttach()`** (late reconnect).
 - Main loop: `Intan_USB_Bulk_Process()` + **`USB_DEVICE_PollEvents()`** (счётчики reset/connect, смена `dev_state` без UART в IRQ).
 - Команды обрабатываются в **main loop**, не в USB IRQ. OUT → очередь → `dispatch_usb_command` → ответ Bulk IN.
-- Текстовые USB-команды (при `INTAN_HW_PRESENT=1`): `PING`, `ECHO`, `ID`, `READ`, `READRAW`, `WRITE r hex [u m]`, `INIT_RECORD [ksps]`, `INIT_STIM`, `CLEAR_ADC`, `CLEAR_COMP`, `CONVERT`, **`BENCH` / `BENCH_FAST` / `BENCH_DMA` / `BENCH_TIMCS n [ch] [target_ksps]`** (замер ksps по SPI, текстовый ответ), `STREAM n [ch] [flags]`. `STREAM` → только бинарный IN (16-bit LE).
+- Текстовые USB-команды (при `INTAN_HW_PRESENT=1`): … **`BENCH` / `BENCH_FAST` / `BENCH_DMA` / `BENCH_TIMCS n [ch] [target_ksps]`** (замер ksps по SPI, текстовый ответ), `STREAM n [ch] [flags]`, **`STREAM8 n [flags]`** (8 ch round-robin 0–7). `STREAM`/`STREAM8` → только бинарный IN (16-bit LE).
 - Host: `tools/usb_intan_cmd.py`, `tools/usb_spi_bench.py` (SPI ksps без bulk samples), `tools/usb_stream_bench.py`, `tools/usb_bulk_loopback.py` (echo через `ECHO`). Orange Pi Stimulator: `Stimulator_2.0_orangepizero2w/services/server/intan_usb_transport.py`.
 
 ### Проверка на Mac / Linux
