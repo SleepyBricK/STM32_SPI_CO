@@ -112,7 +112,7 @@ USBD_StatusTypeDef USBD_LL_Init(USBD_HandleTypeDef *pdev)
 #else
     hpcd_USB_OTG_HS.Init.speed = PCD_SPEED_HIGH;
 #endif
-    hpcd_USB_OTG_HS.Init.dma_enable = DISABLE;
+    hpcd_USB_OTG_HS.Init.dma_enable = ENABLE;
     hpcd_USB_OTG_HS.Init.phy_itface = PCD_PHY_ULPI;
     hpcd_USB_OTG_HS.Init.Sof_enable = DISABLE;
     hpcd_USB_OTG_HS.Init.low_power_enable = DISABLE;
@@ -129,9 +129,9 @@ USBD_StatusTypeDef USBD_LL_Init(USBD_HandleTypeDef *pdev)
     }
     UART_DebugMark("[USB] HAL_PCD_Init HS OK\r\n");
 
-    HAL_PCDEx_SetRxFiFo(&hpcd_USB_OTG_HS, 0x200);
+    HAL_PCDEx_SetRxFiFo(&hpcd_USB_OTG_HS, 0x180);
     HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS, 0, 0x40);
-    HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS, 1, 0x100);
+    HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS, 1, 0x180);
   }
 
   return USBD_OK;

@@ -36,7 +36,7 @@
 - **SPI2**: PA9 SCK, PB14 MISO, PC1 MOSI; ядро SPI1/2/3 от **PLL2P = 200 MHz**, **SCK ≈ 25 MHz**, кадр RHS2116 **32 бита**. Init только при **`INTAN_HW_PRESENT=1`**.
 - **USART1**: PB6 TX, PB7 RX — **115200** 8N1.
 - **USB3300 / USB OTG HS ULPI**: PC0 STP, PC2_C DIR, PC3_C NXT, PA3 D0, PA5 CLK, PB0 D1, PB1 D2, PB10–PB13 D3–D6, PB5 D7. Init: `Core/Src/usb3300_ulpi_hw.c` — **10 ms XTAL**, **PLL3 48 MHz**, `DisableUSBReg` + `USB33RDY`, GPIO ULPI, analog switch PC2/PC3.
-- **USB 2.0 High Speed device**: ST USB Device Core + HAL PCD, ULPI PHY, `vbus_sensing_enable = DISABLE`, класс **vendor-specific bulk**: VID:PID **`0483:5741`**, Bulk OUT **`0x01`**, Bulk IN **`0x81`**, HS MPS **512** bytes. **`USBD_VENDOR_BULK_Transmit()` — только ≤512 B за вызов** (не слать 8192 B одним вызовом).
+- **USB 2.0 High Speed device**: … **`Transmit()`** copy для text, **`TransmitZc()`** zero-copy для STREAM; очередь **3** слота; **`TxIdle()`**; PCD **DMA** + cache clean; EP1 TX FIFO **0x180**.
 - **Отладка**: PA13 SWDIO, PA14 SWCLK. ST-Link **≠** USB3300: для USB-тестов кабель на **USB3300 → хост**.
 
 ### Intan RHS2116 (не из Cube — задано в коде)
@@ -45,7 +45,7 @@
 
 - **CS**: **PE11**, активный низкий.
 - Протокол: три CS-транзакции на READ/WRITE/CONVERT; упаковка `(b0<<24)|(b1<<16)|(b2<<8)|b3`.
-- **`BENCH_DMA` / `STREAM`**: SPI2 DMA + CS `TIM1_CH2`, буферы в `.dma_buffer` (`RAM_D2`).
+- **`BENCH_DMA` / `STREAM`**: SPI2 DMA + TIM1_CH2, ping-pong **2×8190** samples (`.dma_buffer`), `TransmitZc` + **TX queue 3**, USB PCD **DMA** + D-Cache clean, EP1 FIFO **0x180**.
 
 Сборка **без запаянного Intan** (по умолчанию): **`INTAN_HW_PRESENT=0`** — пропуск `MX_SPI2_Init` и bringup; USB `PING`/`ECHO`/`HELP`, UART `PING`/`HELP`; команды Intan → `ERR no intan hw`.
 
@@ -62,7 +62,8 @@
 - Init: `USB_DEVICE_Init()` → `DevDisconnect` / 50 ms / `DevConnect`; после полного init — **`USB_DEVICE_FinalizeAttach()`** (late reconnect).
 - Main loop: `Intan_USB_Bulk_Process()` + **`USB_DEVICE_PollEvents()`** (счётчики reset/connect, смена `dev_state` без UART в IRQ).
 - Команды обрабатываются в **main loop**, не в USB IRQ. OUT → очередь → `dispatch_usb_command` → ответ Bulk IN.
-- Host: `tools/usb_intan_cmd.py`, `tools/usb_stream_bench.py`, `tools/usb_bulk_loopback.py` (echo через `ECHO`).
+- Текстовые USB-команды (при `INTAN_HW_PRESENT=1`): `PING`, `ECHO`, `ID`, `READ`, `READRAW`, `WRITE r hex [u m]`, `INIT_RECORD [ksps]`, `INIT_STIM`, `CLEAR_ADC`, `CLEAR_COMP`, `CONVERT`, **`BENCH` / `BENCH_FAST` / `BENCH_DMA` / `BENCH_TIMCS n [ch] [target_ksps]`** (замер ksps по SPI, текстовый ответ), `STREAM n [ch] [flags]`. `STREAM` → только бинарный IN (16-bit LE).
+- Host: `tools/usb_intan_cmd.py`, `tools/usb_spi_bench.py` (SPI ksps без bulk samples), `tools/usb_stream_bench.py`, `tools/usb_bulk_loopback.py` (echo через `ECHO`). Orange Pi Stimulator: `Stimulator_2.0_orangepizero2w/services/server/intan_usb_transport.py`.
 
 ### Проверка на Mac / Linux
 

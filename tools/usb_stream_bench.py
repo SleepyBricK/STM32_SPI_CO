@@ -6,42 +6,7 @@ import struct
 import sys
 import time
 
-import usb.core
-import usb.util
-
-
-VID = 0x0483
-PID = 0x5741
-EP_OUT = 0x01
-EP_IN = 0x81
-
-
-def open_device(vid: int, pid: int):
-    dev = usb.core.find(idVendor=vid, idProduct=pid)
-    if dev is None:
-        raise RuntimeError(f"device {vid:04x}:{pid:04x} not found")
-
-    dev.set_configuration()
-    cfg = dev.get_active_configuration()
-    intf = cfg[(0, 0)]
-    if sys.platform.startswith("linux") and dev.is_kernel_driver_active(intf.bInterfaceNumber):
-        dev.detach_kernel_driver(intf.bInterfaceNumber)
-    return dev
-
-
-def read_exact(dev, nbytes: int, timeout_ms: int) -> bytes:
-    chunks = []
-    remaining = nbytes
-
-    while remaining > 0:
-        req = min(remaining, 16 * 1024)
-        data = bytes(dev.read(EP_IN, req, timeout=timeout_ms))
-        if not data:
-            raise RuntimeError("short USB read")
-        chunks.append(data)
-        remaining -= len(data)
-
-    return b"".join(chunks)
+from usb_intan_lib import PID, VID, close_device, open_device, read_exact
 
 
 def main() -> int:
@@ -51,8 +16,14 @@ def main() -> int:
     parser.add_argument("--flags", type=lambda x: int(x, 0), default=0)
     parser.add_argument("--vid", type=lambda x: int(x, 0), default=VID)
     parser.add_argument("--pid", type=lambda x: int(x, 0), default=PID)
-    parser.add_argument("--timeout-ms", type=int, default=5000)
+    parser.add_argument("--timeout-ms", type=int, default=20000)
     parser.add_argument("--dump-first", type=int, default=8)
+    parser.add_argument(
+        "--reset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="USB bus reset before STREAM (default: on)",
+    )
     args = parser.parse_args()
 
     if args.samples <= 0:
@@ -60,10 +31,10 @@ def main() -> int:
         return 2
 
     try:
-        dev = open_device(args.vid, args.pid)
+        dev, ifn = open_device(args.vid, args.pid, reset=args.reset)
         cmd = f"STREAM {args.samples} {args.channel} {args.flags}\n".encode("ascii")
         t0 = time.perf_counter()
-        dev.write(EP_OUT, cmd, timeout=args.timeout_ms)
+        dev.write(0x01, cmd, timeout=args.timeout_ms)
         payload = read_exact(dev, args.samples * 2, args.timeout_ms)
         elapsed = time.perf_counter() - t0
 
@@ -77,9 +48,13 @@ def main() -> int:
             print(f"pyusb speed={dev.speed}")
         except Exception:
             pass
-        usb.util.dispose_resources(dev)
+        close_device(dev, ifn)
     except Exception as exc:
         print(f"ERR {exc}", file=sys.stderr)
+        print(
+            "hint: прервённый STREAM блокирует МК — переподключите USB или запустите с --reset",
+            file=sys.stderr,
+        )
         return 1
 
     return 0

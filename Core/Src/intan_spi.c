@@ -9,6 +9,14 @@
 #include <stdint.h>
 
 static uint8_t g_intan_spi_ready;
+static Intan_IdleHookFn s_idle_hook;
+static void *s_idle_ctx;
+
+void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx)
+{
+  s_idle_hook = fn;
+  s_idle_ctx = ctx;
+}
 
 #define INTAN_SPI_INSTANCE SPI2
 #define INTAN_DMA_CHUNK_SLOTS 8192U
@@ -205,6 +213,10 @@ static HAL_StatusTypeDef intan_wait_reg_flag_guard(__IO uint32_t *reg, uint32_t 
   uint32_t guard = 10000000U;
   while ((*reg & flag) == 0U)
   {
+    if (s_idle_hook != NULL)
+    {
+      s_idle_hook(s_idle_ctx);
+    }
     if (--guard == 0U)
     {
       return HAL_TIMEOUT;
@@ -491,6 +503,10 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
 
   for (uint32_t i = 0U; i < n; i++)
   {
+    if ((s_idle_hook != NULL) && ((i & 0x0FU) == 0U))
+    {
+      s_idle_hook(s_idle_ctx);
+    }
     samples[i] = intan_u16_from_convert_word(s_dma_rx_words[i + 2U]);
   }
 

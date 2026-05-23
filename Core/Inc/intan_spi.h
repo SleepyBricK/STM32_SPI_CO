@@ -52,6 +52,10 @@ typedef struct {
 
 void Intan_SPI_Init(SPI_HandleTypeDef *hspi);
 
+/** Вызывается из busy-wait SPI/DMA (например USB pump при ping-pong STREAM). NULL = off. */
+typedef void (*Intan_IdleHookFn)(void *ctx);
+void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx);
+
 /**
  * Минимальная последовательность после power-up (даташит / msu-neuro changelog):
  * CLEAR ADC, R38=0xFFFF (power bug DC), очистка битов «weak» drive в R1 (маска 0x9000).

@@ -79,6 +79,7 @@ option(BOARD_HAS_LSE "Board has 32.768 kHz LSE on PC14/PC15" OFF)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     INTAN_HW_PRESENT=$<IF:$<BOOL:${WITH_INTAN_HW}>,1,0>
     BOARD_HAS_LSE=$<IF:$<BOOL:${BOARD_HAS_LSE}>,1,0>
+    USB_PCD_DMA_ENABLE=1
 )
 
 # Remove wrong libob.a library dependency when using cpp files

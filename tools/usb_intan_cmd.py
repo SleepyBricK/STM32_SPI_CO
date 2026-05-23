@@ -4,29 +4,7 @@
 import argparse
 import sys
 
-import usb.core
-import usb.util
-
-
-VID = 0x0483
-PID = 0x5741
-EP_OUT = 0x01
-EP_IN = 0x81
-
-
-def open_device(vid: int, pid: int):
-    dev = usb.core.find(idVendor=vid, idProduct=pid)
-    if dev is None:
-        raise RuntimeError(f"device {vid:04x}:{pid:04x} not found")
-
-    dev.set_configuration()
-    cfg = dev.get_active_configuration()
-    intf = cfg[(0, 0)]
-
-    if sys.platform.startswith("linux") and dev.is_kernel_driver_active(intf.bInterfaceNumber):
-        dev.detach_kernel_driver(intf.bInterfaceNumber)
-
-    return dev
+from usb_intan_lib import PID, VID, close_device, open_device, run_text_command
 
 
 def main() -> int:
@@ -34,22 +12,35 @@ def main() -> int:
     parser.add_argument("command", nargs="*", default=["ID"], help="USB command, e.g. ID, READ 255, CONVERT 0")
     parser.add_argument("--vid", type=lambda x: int(x, 0), default=VID)
     parser.add_argument("--pid", type=lambda x: int(x, 0), default=PID)
-    parser.add_argument("--timeout-ms", type=int, default=1000)
+    parser.add_argument("--timeout-ms", type=int, default=5000)
+    parser.add_argument(
+        "--reset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="USB bus reset before command (default: on; fixes timeout after STREAM)",
+    )
+    parser.add_argument("--no-drain", action="store_true", help="Do not drain IN endpoint before command")
     args = parser.parse_args()
 
-    command = " ".join(args.command).strip()
-    if not command:
-        command = "ID"
+    command = " ".join(args.command).strip() or "ID"
 
     try:
-        dev = open_device(args.vid, args.pid)
-        payload = (command + "\n").encode("ascii")
-        dev.write(EP_OUT, payload, timeout=args.timeout_ms)
-        data = bytes(dev.read(EP_IN, 512, timeout=args.timeout_ms))
-        print(data.rstrip(b"\0").decode("ascii", errors="replace").rstrip())
-        usb.util.dispose_resources(dev)
+        dev, ifn = open_device(args.vid, args.pid, reset=args.reset)
+        reply = run_text_command(
+            dev,
+            command,
+            timeout_ms=args.timeout_ms,
+            drain_before=not args.no_drain,
+        )
+        print(reply)
+        close_device(dev, ifn)
     except Exception as exc:
         print(f"ERR {exc}", file=sys.stderr)
+        if "timed out" in str(exc).lower() or "timeout" in str(exc).lower():
+            print(
+                "hint: переподключите USB3300 или повторите с --reset (по умолчанию включён)",
+                file=sys.stderr,
+            )
         return 1
 
     return 0
