@@ -49,6 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi_diag.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi4_hw.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_app.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/intan_pattern.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_uart_cli.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_stream.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usb_stream_frame.c

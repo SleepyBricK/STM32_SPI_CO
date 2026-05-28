@@ -154,6 +154,94 @@ UsbCommand UsbCommands_ParseLine(const char *line)
     return cmd;
   }
 
+  if (streq_ci(tok, "PATTERN_CLEAR"))
+  {
+    cmd.id = USB_CMD_PATTERN_CLEAR;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_RAW"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_RAW;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_WRITE"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_WRITE;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg3 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_READ"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_READ;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_CONVERT"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_CONVERT;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_CLEAR_ADC"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_CLEAR_ADC;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_CLEAR_COMP"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_CLEAR_COMP;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_DELAY_CYC"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_DELAY_CYC;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_ADD_DELAY_US"))
+  {
+    cmd.id = USB_CMD_PATTERN_ADD_DELAY_US;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_STATUS"))
+  {
+    cmd.id = USB_CMD_PATTERN_STATUS;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "PATTERN_RUN"))
+  {
+    cmd.id = USB_CMD_PATTERN_RUN;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 1U;
+    return cmd;
+  }
+
   if (streq_ci(tok, "SPI_STREAM_RR8_REAL"))
   {
     cmd.id = USB_CMD_SPI_STREAM_RR8_REAL;

@@ -351,13 +351,13 @@ static void intan_fill_rr_tx_words(uint32_t n, uint8_t n_ch, uint8_t flags, uint
 {
   uint32_t i;
 
-  for (i = 0U; i < 2U; i++)
+  for (i = 0U; i < n; i++)
   {
     s_dma_tx_words[i] = intan_convert_cmd_word((uint8_t)((phase + i) % n_ch), flags);
   }
-  for (i = 0U; i < n; i++)
+  for (i = 0U; i < 2U; i++)
   {
-    s_dma_tx_words[i + 2U] = intan_convert_cmd_word((uint8_t)((phase + i) % n_ch), flags);
+    s_dma_tx_words[n + i] = intan_convert_cmd_word((uint8_t)((phase + n + i) % n_ch), flags);
   }
 }
 
@@ -881,6 +881,11 @@ HAL_StatusTypeDef Intan_ReadReg(uint8_t reg_addr, uint16_t *value)
 HAL_StatusTypeDef Intan_ReadReg_WithRaw(uint8_t reg_addr, uint16_t *value, uint32_t *raw32_out)
 {
   return intan_read_reg_impl(reg_addr, value, raw32_out);
+}
+
+HAL_StatusTypeDef Intan_Xfer32Word(uint32_t tx_word, uint32_t *rx_out)
+{
+  return intan_xfer32(tx_word, rx_out);
 }
 
 HAL_StatusTypeDef Intan_WriteReg(uint8_t reg_addr, uint16_t value, uint8_t u_flag, uint8_t m_flag)

@@ -82,6 +82,8 @@ HAL_StatusTypeDef Intan_ConvertPipelineTimCs(uint32_t n, uint8_t channel, uint8_
                                              uint32_t target_ksps, uint16_t *last_value);
 HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCs(uint32_t n, uint8_t channel, uint8_t flags,
                                                 uint16_t *last_value);
+/** Один 32-битный SPI слот RHS2116 с текущими CS/timing. Для локального pattern executor. */
+HAL_StatusTypeDef Intan_Xfer32Word(uint32_t tx_word, uint32_t *rx_out);
 HAL_StatusTypeDef Intan_RawCmd(const uint8_t cmd4[4]);
 /** READ 255 с M=1 — сброс compliance monitor (как clear_compliance_monitor в Python). */
 HAL_StatusTypeDef Intan_ClearComplianceMonitor(void);
