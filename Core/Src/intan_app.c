@@ -239,6 +239,42 @@ HAL_StatusTypeDef Intan_App_InitStim(void)
   }
   delay_post();
 
+  st = Intan_WriteReg(46U, 0x0000U, 1U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  delay_post();
+  st = Intan_WriteReg(48U, 0x0000U, 1U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  delay_post();
+
+  for (uint8_t ch = 0U; ch < 16U; ch++)
+  {
+    st = Intan_WriteReg((uint8_t)(64U + ch), 0x8000U, 0U, 0U);
+    if (st != HAL_OK)
+    {
+      return st;
+    }
+    delay_post();
+    st = Intan_WriteReg((uint8_t)(96U + ch), 0x8000U, 0U, 0U);
+    if (st != HAL_OK)
+    {
+      return st;
+    }
+    delay_post();
+  }
+
+  st = Intan_WriteReg(42U, 0x0000U, 1U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  delay_post();
+
   st = Intan_WriteReg(32U, 0xAAAAU, 0U, 0U);
   if (st != HAL_OK)
   {
