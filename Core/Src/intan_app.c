@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define INTAN_APP_FAST_ADC_KSPS 610U
+
 static void delay_post(void)
 {
   HAL_Delay(1);
@@ -98,6 +100,7 @@ HAL_StatusTypeDef Intan_App_InitStim(void)
 {
   HAL_StatusTypeDef st;
   uint16_t dummy;
+  uint16_t r0 = adc_reg0_from_ksps(INTAN_APP_FAST_ADC_KSPS);
 
   st = Intan_ReadReg(255U, &dummy);
   if (st != HAL_OK)
@@ -133,7 +136,7 @@ HAL_StatusTypeDef Intan_App_InitStim(void)
   }
   delay_post();
 
-  st = Intan_WriteReg(0U, 0x00C5U, 0U, 0U);
+  st = Intan_WriteReg(0U, r0, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
@@ -145,7 +148,7 @@ HAL_StatusTypeDef Intan_App_InitStim(void)
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(2U, 0x0040U, 0U, 0U);
+  st = Intan_WriteReg(2U, 0x0000U, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
@@ -188,13 +191,13 @@ HAL_StatusTypeDef Intan_App_InitStim(void)
   }
   delay_post();
 
-  st = Intan_WriteReg(10U, 0x0000U, 1U, 0U);
+  st = Intan_WriteReg(10U, 0x0000U, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(12U, 0xFFFFU, 1U, 0U);
+  st = Intan_WriteReg(12U, 0xFFFFU, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
@@ -226,26 +229,26 @@ HAL_StatusTypeDef Intan_App_InitStim(void)
   }
   delay_post();
 
-  st = Intan_WriteReg(42U, 0x0000U, 1U, 0U);
+  st = Intan_WriteReg(42U, 0x0000U, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(44U, 0x0000U, 1U, 0U);
+  st = Intan_WriteReg(44U, 0x0000U, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
 
-  st = Intan_WriteReg(46U, 0x0000U, 1U, 0U);
+  st = Intan_WriteReg(46U, 0x0000U, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(48U, 0x0000U, 1U, 0U);
+  st = Intan_WriteReg(48U, 0x0000U, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
@@ -385,20 +388,20 @@ HAL_StatusTypeDef Intan_App_InitRecord(uint16_t adc_ksps)
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(9U, 0xFFFFU, 0U, 0U);
+  st = Intan_WriteReg(10U, 0x0000U, 0U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  delay_post();
+  st = Intan_WriteReg(12U, 0xFFFFU, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
 
-  st = Intan_WriteReg(10U, 0x0000U, 1U, 0U);
-  if (st != HAL_OK)
-  {
-    return st;
-  }
-  delay_post();
-  st = Intan_WriteReg(12U, 0xFFFFU, 1U, 0U);
+  st = Intan_WriteReg(42U, 0x0000U, 1U, 0U);
   if (st != HAL_OK)
   {
     return st;

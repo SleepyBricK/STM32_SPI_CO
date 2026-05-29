@@ -382,8 +382,9 @@ static HAL_StatusTypeDef intan_xfer32_repeat_dma_timcs(uint32_t tx_word, uint32_
   intan_cs_tim1_ch2_mode();
 
   /*
-   * 32 SCK bits + 3 SCK cycles idle = 35 cycles: 25 MHz / 35 ~= 714.3 ksps.
    * TIM1 поднимает CS на idle-окне между 32-битными DMA-словами.
+   * Фактический поток на плате зависит от SYSCLK и обычно получается ниже
+   * теоретического лимита таймера/SCK.
    */
   tim_clk = intan_tim1_clock_hz();
   spi_sck_hz = 25000000U;
@@ -1148,6 +1149,18 @@ static const uint8_t intan_sine64[64] = {
     1, 1, 3, 8, 14, 21, 29, 38, 47, 58, 69, 80, 92, 104, 116, 128,
 };
 
+static HAL_StatusTypeDef intan_zcheck_safe_state(void)
+{
+  HAL_StatusTypeDef st;
+
+  st = Intan_WriteReg(2U, 0x0000U, 0U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  return Intan_WriteReg(3U, 0x0080U, 0U, 0U);
+}
+
 HAL_StatusTypeDef Intan_MeasureImpedance(IntanImpedanceArg *arg)
 {
   uint8_t channel;
@@ -1218,17 +1231,17 @@ HAL_StatusTypeDef Intan_MeasureImpedance(IntanImpedanceArg *arg)
     st = Intan_WriteReg(3U, (uint16_t)(dac_val & 0xFFU), 0U, 0U);
     if (st != HAL_OK)
     {
-      (void)Intan_WriteReg(2U, (uint16_t)(reg2 & 0xFFFEU), 0U, 0U);
+      (void)intan_zcheck_safe_state();
       return st;
     }
     st = Intan_Convert(channel, 0U, &adc_val);
     if (st != HAL_OK)
     {
-      (void)Intan_WriteReg(2U, (uint16_t)(reg2 & 0xFFFEU), 0U, 0U);
+      (void)intan_zcheck_safe_state();
       return st;
     }
     arg->samples[i] = adc_val;
   }
 
-  return Intan_WriteReg(2U, (uint16_t)(reg2 & 0xFFFEU), 0U, 0U);
+  return intan_zcheck_safe_state();
 }

@@ -143,7 +143,9 @@ SPI_TO_RAM_FAST <samples> <channel> <flags>
 SPI_TO_RAM_RR8 <samples> <flags>
 ```
 
-`SPI_STREAM_REAL` и `SPI_STREAM_RR8_REAL` перед стартом автоматически переводят RHS2116 в recording mode через `Intan_App_InitRecord(714)`.
+`SPI_STREAM_REAL` и `SPI_STREAM_RR8_REAL` перед стартом автоматически переводят RHS2116 в recording mode через `Intan_App_InitRecord(610)`. Это выбирает fast ADC bias-профиль для текущего реального диапазона потока ~562-610 kS/s.
+
+`SPI_STREAM_REAL` не принимает `channel=63`: auto-increment `CONVERT(63)` имеет неоднозначный стартовый канал для host metadata. Для многоканального real stream используйте `SPI_STREAM_RR8_REAL`.
 
 `SPI_STREAM_RR8_REAL` пишет в поток каналы `0..7` round-robin. Канал для `response[i]` восстанавливается как:
 
@@ -162,7 +164,7 @@ sysclk_mhz=... spi_khz=... sck_khz=... pscl=... tim_p=...
 cyc_samp=... ksps_cyc_x10=... wall_cyc=... wall_ksps_x10=...
 ```
 
-`ksps_*_x10` означает `kSamples/s * 10`. Например `7143` = `714.3 kS/s`.
+`ksps_*_x10` означает `kSamples/s * 10`. Например `6100` = `610.0 kS/s`.
 
 ## Host-утилиты
 
@@ -213,4 +215,4 @@ tools/                           PyUSB host helpers and benchmarks
 - `WITH_INTAN_HW=OFF` оставляет USB/UART команды доступными, но реальные Intan-команды вернут `ERR no intan hw`.
 - USB stream buffers и SPI DMA buffers лежат в `.dma_buffer` в D2 SRAM (`0x30000000`) и отмечены MPU как non-cacheable.
 - `response[]` содержит сырые 16-битные значения RHS2116, не микровольты.
-- Для real stream сначала используйте `ID`/`INIT_RECORD` при ручной отладке; stream-команды `*_REAL` уже делают `INIT_RECORD(714)` автоматически.
+- Для real stream сначала используйте `ID`/`INIT_RECORD` при ручной отладке; stream-команды `*_REAL` уже делают `INIT_RECORD(610)` автоматически.

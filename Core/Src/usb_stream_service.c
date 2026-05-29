@@ -15,7 +15,7 @@
 #define USB_REPLY_MAX         256U
 #define SPI_STREAM_CHUNK_MAX  (INTAN_DMA_CHUNK_SLOTS - 2U)
 #define SPI_CHUNKS_PER_TICK   8U
-#define INTAN_RECORD_STREAM_ADC_KSPS 714U
+#define INTAN_RECORD_STREAM_ADC_KSPS 610U
 
 static UsbStreamStats s_stats;
 static uint8_t s_cmd_rx[USB_CMD_RX_MAX];
@@ -201,6 +201,7 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
   }
   else if (channel == 63U)
   {
+    first_channel = 0U;
     channel_count = 16U;
   }
 
@@ -1197,7 +1198,11 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
-      if (usb_prepare_real_record_stream() != HAL_OK)
+      if (cmd.arg1 == 63U)
+      {
+        usb_reply_text("ERR real stream ch63 unsupported");
+      }
+      else if (usb_prepare_real_record_stream() != HAL_OK)
       {
         usb_reply_text("ERR init_record");
       }
