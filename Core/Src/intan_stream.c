@@ -11,6 +11,8 @@ static uint32_t s_frame_seq;
 static uint32_t s_next_sample;
 static uint32_t s_hdr_spi_ovf;
 static uint32_t s_hdr_usb_ovf;
+static uint16_t s_frame_flags;
+static uint32_t s_stream_meta;
 static uint8_t s_active;
 
 static void intan_stream_open_frame(void)
@@ -25,6 +27,8 @@ static void intan_stream_open_frame(void)
   s_hdr_spi_ovf = UsbStreamService_GetSpiOverflowCount();
   s_hdr_usb_ovf = UsbStreamService_GetUsbOverflowCount();
   UsbStreamFrame_InitHeader(s_cur, s_frame_seq, s_next_sample, s_hdr_spi_ovf, s_hdr_usb_ovf);
+  s_cur->flags = s_frame_flags;
+  s_cur->reserved = s_stream_meta;
   s_frame_seq++;
   s_cur_pos = 0U;
 }
@@ -113,15 +117,24 @@ void IntanStream_Reset(void)
   intan_stream_finalize_frame();
   s_frame_seq = 0U;
   s_next_sample = 0U;
+  s_frame_flags = 0U;
+  s_stream_meta = 0U;
   s_active = 0U;
 }
 
 void IntanStream_Begin(void)
 {
+  IntanStream_BeginWithMeta(0U, 0U);
+}
+
+void IntanStream_BeginWithMeta(uint16_t frame_flags, uint32_t stream_meta)
+{
   s_cur = NULL;
   s_cur_pos = 0U;
   s_frame_seq = 0U;
   s_next_sample = 0U;
+  s_frame_flags = frame_flags;
+  s_stream_meta = stream_meta;
   s_active = 1U;
 }
 

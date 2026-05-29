@@ -13,6 +13,18 @@ extern "C" {
 #define USB_STREAM_HEADER_SIZE           32U
 #define USB_STREAM_FRAME_RESPONSES       2032U
 
+#define USB_STREAM_FLAG_COUNTER          0x0001U
+#define USB_STREAM_FLAG_REAL_ADC         0x0002U
+#define USB_STREAM_FLAG_RR               0x0004U
+
+#define USB_STREAM_META(first_channel, channel_count, convert_flags) \
+  ((((uint32_t)(first_channel) & 0xFFU) << 0) | \
+   (((uint32_t)(channel_count) & 0xFFU) << 8) | \
+   (((uint32_t)(convert_flags) & 0xFFU) << 16))
+#define USB_STREAM_META_FIRST_CHANNEL(meta)  ((uint8_t)(((uint32_t)(meta) >> 0) & 0xFFU))
+#define USB_STREAM_META_CHANNEL_COUNT(meta)  ((uint8_t)(((uint32_t)(meta) >> 8) & 0xFFU))
+#define USB_STREAM_META_CONVERT_FLAGS(meta)  ((uint8_t)(((uint32_t)(meta) >> 16) & 0xFFU))
+
 #pragma pack(push, 1)
 typedef struct __attribute__((aligned(32))) {
   uint32_t magic;

@@ -15,6 +15,7 @@
 #define USB_REPLY_MAX         256U
 #define SPI_STREAM_CHUNK_MAX  (INTAN_DMA_CHUNK_SLOTS - 2U)
 #define SPI_CHUNKS_PER_TICK   8U
+#define INTAN_RECORD_STREAM_ADC_KSPS 714U
 
 static UsbStreamStats s_stats;
 static uint8_t s_cmd_rx[USB_CMD_RX_MAX];
@@ -63,6 +64,17 @@ static void usb_cmd_convert(uint32_t channel, uint32_t flags);
 static void usb_cmd_pattern_status(void);
 static void usb_cmd_pattern_run(uint32_t repeat);
 static void usb_stats_reply(void);
+static uint32_t usb_stream_rate_ksps_x10(uint32_t samples, uint32_t elapsed_ms);
+
+static uint32_t usb_stream_rate_ksps_x10(uint32_t samples, uint32_t elapsed_ms)
+{
+  if (elapsed_ms == 0U)
+  {
+    return 0U;
+  }
+
+  return (uint32_t)(((uint64_t)samples * 10ULL) / (uint64_t)elapsed_ms);
+}
 
 static void usb_stream_on_frame_tx_complete(uint32_t len)
 {
@@ -154,6 +166,10 @@ static void usb_stream_reset_all(void)
 static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uint8_t counter_mode,
                                  uint8_t usb_pump, uint8_t rr8)
 {
+  uint16_t frame_flags = 0U;
+  uint8_t first_channel = channel;
+  uint8_t channel_count = 1U;
+
   usb_stream_reset_all();
   memset(&s_stats, 0, sizeof(s_stats));
   Intan_SpiStats_Reset();
@@ -169,7 +185,26 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
   s_spi_rr_phase = 0U;
   s_spi_active = (n > 0U) ? 1U : 0U;
 
-  IntanStream_Begin();
+  if (counter_mode != 0U)
+  {
+    frame_flags |= USB_STREAM_FLAG_COUNTER;
+  }
+  else
+  {
+    frame_flags |= USB_STREAM_FLAG_REAL_ADC;
+  }
+  if (rr8 != 0U)
+  {
+    frame_flags |= USB_STREAM_FLAG_RR;
+    first_channel = 0U;
+    channel_count = INTAN_STREAM_RR8_CHANNELS;
+  }
+  else if (channel == 63U)
+  {
+    channel_count = 16U;
+  }
+
+  IntanStream_BeginWithMeta(frame_flags, USB_STREAM_META(first_channel, channel_count, flags));
 }
 
 static uint8_t usb_spi_run_one_chunk(void)
@@ -322,6 +357,17 @@ static void usb_stats_reply(void)
 }
 
 #if (INTAN_HW_PRESENT == 1)
+static HAL_StatusTypeDef usb_prepare_real_record_stream(void)
+{
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    return HAL_ERROR;
+  }
+
+  usb_intan_stop_stream();
+  return Intan_App_InitRecord(INTAN_RECORD_STREAM_ADC_KSPS);
+}
+
 static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags)
 {
   uint32_t t0_dwt;
@@ -369,7 +415,7 @@ static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags)
 
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
   xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
-  ksps_x10 = (total * 10000U) / elapsed_ms;
+  ksps_x10 = usb_stream_rate_ksps_x10(total, elapsed_ms);
 
   {
     IntanSpiDiagSnapshot clk;
@@ -454,7 +500,7 @@ static void usb_cmd_spi_rate_fast(uint32_t n, uint8_t channel, uint8_t flags)
 
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
   xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
-  ksps_x10 = (total * 10000U) / elapsed_ms;
+  ksps_x10 = usb_stream_rate_ksps_x10(total, elapsed_ms);
 
   {
     IntanSpiDiagSnapshot clk;
@@ -532,7 +578,7 @@ static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags)
 
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
   s_stats.responses_pushed = s_stats.samples_produced;
-  ksps_x10 = (s_stats.samples_produced * 10000U) / elapsed_ms;
+  ksps_x10 = usb_stream_rate_ksps_x10(s_stats.samples_produced, elapsed_ms);
 
   {
     IntanSpiDiagSnapshot clk;
@@ -611,7 +657,7 @@ static void usb_cmd_spi_to_ram_fast(uint32_t n, uint8_t channel, uint8_t flags)
 
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
   xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
-  ksps_x10 = (total * 10000U) / elapsed_ms;
+  ksps_x10 = usb_stream_rate_ksps_x10(total, elapsed_ms);
 
   {
     IntanSpiDiagSnapshot clk;
@@ -689,7 +735,7 @@ static void usb_cmd_spi_rate_rr8(uint32_t n, uint8_t flags)
 
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
   xfer_per_x1000 = (total > 0U) ? ((s_stats.spi_xfer32_count * 1000U) / total) : 0U;
-  ksps_x10 = (total * 10000U) / elapsed_ms;
+  ksps_x10 = usb_stream_rate_ksps_x10(total, elapsed_ms);
   ksps_per_ch_x10 = ksps_x10 / INTAN_STREAM_RR8_CHANNELS;
 
   {
@@ -779,7 +825,7 @@ static void usb_cmd_spi_to_ram_rr8(uint32_t n, uint8_t flags)
 
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
   s_stats.responses_pushed = s_stats.samples_produced;
-  ksps_x10 = (s_stats.samples_produced * 10000U) / elapsed_ms;
+  ksps_x10 = usb_stream_rate_ksps_x10(s_stats.samples_produced, elapsed_ms);
   ksps_per_ch_x10 = ksps_x10 / INTAN_STREAM_RR8_CHANNELS;
 
   {
@@ -1151,8 +1197,15 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
-      usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U, 0U);
-      usb_reply_text("OK");
+      if (usb_prepare_real_record_stream() != HAL_OK)
+      {
+        usb_reply_text("ERR init_record");
+      }
+      else
+      {
+        usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U, 0U);
+        usb_reply_text("OK");
+      }
 #endif
       break;
 
@@ -1169,8 +1222,15 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
-      usb_spi_stream_start(cmd.arg0, 0U, (uint8_t)cmd.arg1, 0U, 1U, 1U);
-      usb_reply_text("OK");
+      if (usb_prepare_real_record_stream() != HAL_OK)
+      {
+        usb_reply_text("ERR init_record");
+      }
+      else
+      {
+        usb_spi_stream_start(cmd.arg0, 0U, (uint8_t)cmd.arg1, 0U, 1U, 1U);
+        usb_reply_text("OK");
+      }
 #endif
       break;
 

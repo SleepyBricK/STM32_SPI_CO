@@ -9,6 +9,7 @@ extern "C" {
 
 void IntanStream_Reset(void);
 void IntanStream_Begin(void);
+void IntanStream_BeginWithMeta(uint16_t frame_flags, uint32_t stream_meta);
 void IntanStream_End(void);
 void IntanStream_PushResponse(uint16_t response);
 void IntanStream_PushCounterBlock(uint32_t base, uint32_t count);

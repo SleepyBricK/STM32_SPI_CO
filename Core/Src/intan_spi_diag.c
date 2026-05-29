@@ -97,12 +97,16 @@ void Intan_SpiDiag_RecordWall(uint32_t cyc_start, uint32_t cyc_end, uint32_t sam
 
 uint32_t Intan_SpiDiag_KspsFromCycX10(uint32_t cyc_per_sample)
 {
+  uint64_t denom;
+
   if (cyc_per_sample == 0U)
   {
     return 0U;
   }
 
-  return (SystemCoreClock * 10U) / cyc_per_sample;
+  /* Return kSamples/s * 10: SystemCoreClock / cycles gives samples/s. */
+  denom = (uint64_t)cyc_per_sample * 1000ULL;
+  return (uint32_t)(((uint64_t)SystemCoreClock * 10ULL) / denom);
 }
 
 void Intan_SpiDiag_RecordBlock(uint32_t cyc_start, uint32_t cyc_end, uint32_t samples,
