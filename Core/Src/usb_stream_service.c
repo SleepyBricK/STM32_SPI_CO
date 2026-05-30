@@ -237,7 +237,12 @@ static uint8_t usb_spi_run_one_chunk(void)
   }
   if (s_spi_rr8 != 0U)
   {
-    if (s_spi_safe_polling != SPI_REAL_PATH_DMA_TIMCS)
+    if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
+    {
+      st = Intan_ConvertPipelineDmaTimSlotReadRR(chunk, INTAN_STREAM_RR8_CHANNELS, s_spi_flags,
+                                                 s_spi_buf, &s_spi_rr_phase);
+    }
+    else if (s_spi_safe_polling != SPI_REAL_PATH_DMA_TIMCS)
     {
       st = Intan_ConvertPipelineSafeReadRR(chunk, INTAN_STREAM_RR8_CHANNELS, s_spi_flags,
                                            s_spi_buf, &s_spi_rr_phase);
@@ -1369,6 +1374,23 @@ void UsbVendorBulk_ProcessOutCommands(void)
       else
       {
         usb_spi_stream_start(cmd.arg0, 0U, (uint8_t)cmd.arg1, 0U, 1U, 1U);
+        usb_reply_text("OK");
+      }
+#endif
+      break;
+
+    case USB_CMD_SPI_STREAM_RR8_REAL_SLOT:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      if (usb_prepare_real_record_stream(0U, (uint8_t)cmd.arg1, 1U) != HAL_OK)
+      {
+        usb_reply_text("ERR init_record");
+      }
+      else
+      {
+        usb_spi_stream_start(cmd.arg0, 0U, (uint8_t)cmd.arg1, 0U, 1U, 1U);
+        s_spi_safe_polling = SPI_REAL_PATH_DMA_TIMSLOT;
         usb_reply_text("OK");
       }
 #endif

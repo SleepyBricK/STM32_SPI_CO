@@ -83,6 +83,8 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotRead(uint32_t n, uint8_t channe
 /** Round-robin CONVERT: channel (phase+i) % n_ch; *phase_io updated for next block. */
 HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsReadRR(uint32_t n, uint8_t n_ch, uint8_t flags,
                                                       uint16_t *samples, uint8_t *phase_io);
+HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotReadRR(uint32_t n, uint8_t n_ch, uint8_t flags,
+                                                        uint16_t *samples, uint8_t *phase_io);
 /** Conservative round-robin polling path; *phase_io updated for next block. */
 HAL_StatusTypeDef Intan_ConvertPipelineSafeReadRR(uint32_t n, uint8_t n_ch, uint8_t flags,
                                                   uint16_t *samples, uint8_t *phase_io);
