@@ -133,6 +133,9 @@ Streaming / bench:
 ```text
 SPI_STREAM <samples> <channel> <flags>
 SPI_STREAM_REAL <samples> <channel> <flags>
+SPI_STREAM_REAL_FAST <samples> <channel> <flags>
+SPI_STREAM_REAL_SLOT <samples> <channel> <flags>
+SPI_STREAM_REAL_LEGACY <samples> <channel> <flags>
 SPI_STREAM_RR8 <samples> <flags>
 SPI_STREAM_RR8_REAL <samples> <flags>
 SPI_RATE <samples> <channel> <flags>
@@ -143,7 +146,7 @@ SPI_TO_RAM_FAST <samples> <channel> <flags>
 SPI_TO_RAM_RR8 <samples> <flags>
 ```
 
-`SPI_STREAM_REAL` и `SPI_STREAM_RR8_REAL` перед стартом автоматически переводят RHS2116 в recording mode через `Intan_App_InitRecord(610)`. Это выбирает fast ADC bias-профиль для текущего реального диапазона потока ~562-610 kS/s.
+`SPI_STREAM_REAL` и `SPI_STREAM_RR8_REAL` перед стартом автоматически переводят RHS2116 в recording mode через `Intan_App_InitRecord(610)` и выполняют одноразовый `CONVERT` с `H=1` для сброса DSP HPF. Одноканальный `SPI_STREAM_REAL` использует slot-DMA path: `TIM1_CH2` формирует CS на PE11, а `TIM1_UP` запускает TX DMA в `SPI2->TXDR`; RX остаётся на `SPI2_RX` DMA. `SPI_STREAM_REAL_SLOT` явно выбирает тот же path, `SPI_STREAM_REAL_FAST` оставлен для регистрового polling, `SPI_STREAM_REAL_LEGACY` — для старого свободно бегущего TIM+DMA CS path.
 
 `SPI_STREAM_REAL` не принимает `channel=63`: auto-increment `CONVERT(63)` имеет неоднозначный стартовый канал для host metadata. Для многоканального real stream используйте `SPI_STREAM_RR8_REAL`.
 

@@ -14,8 +14,13 @@
 #define USB_CMD_RX_MAX        256U
 #define USB_REPLY_MAX         256U
 #define SPI_STREAM_CHUNK_MAX  (INTAN_DMA_CHUNK_SLOTS - 2U)
+#define SPI_STREAM_SAFE_CHUNK_MAX  128U
 #define SPI_CHUNKS_PER_TICK   8U
 #define INTAN_RECORD_STREAM_ADC_KSPS 610U
+#define SPI_REAL_PATH_DMA_TIMCS       0U
+#define SPI_REAL_PATH_SAFE_POLLING    1U
+#define SPI_REAL_PATH_FAST_POLLING    2U
+#define SPI_REAL_PATH_DMA_TIMSLOT     3U
 
 static UsbStreamStats s_stats;
 static uint8_t s_cmd_rx[USB_CMD_RX_MAX];
@@ -34,6 +39,7 @@ static uint8_t s_spi_counter_mode;
 static uint8_t s_spi_usb_pump;
 static uint8_t s_spi_rr8;
 static uint8_t s_spi_rr_phase;
+static uint8_t s_spi_safe_polling;
 
 static uint16_t s_spi_buf[SPI_STREAM_CHUNK_MAX]
     __attribute__((section(".dma_buffer"), aligned(32)));
@@ -156,6 +162,7 @@ static void usb_stream_reset_all(void)
   s_spi_remaining = 0U;
   s_spi_rr8 = 0U;
   s_spi_rr_phase = 0U;
+  s_spi_safe_polling = SPI_REAL_PATH_DMA_TIMCS;
   s_tx_active = 0U;
   s_tx_frame = NULL;
   IntanStream_Reset();
@@ -183,6 +190,7 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
   s_spi_usb_pump = usb_pump;
   s_spi_rr8 = rr8;
   s_spi_rr_phase = 0U;
+  s_spi_safe_polling = (counter_mode == 0U) ? SPI_REAL_PATH_DMA_TIMSLOT : SPI_REAL_PATH_DMA_TIMCS;
   s_spi_active = (n > 0U) ? 1U : 0U;
 
   if (counter_mode != 0U)
@@ -223,15 +231,41 @@ static uint8_t usb_spi_run_one_chunk(void)
   {
     chunk = SPI_STREAM_CHUNK_MAX;
   }
-
+  if ((s_spi_safe_polling == SPI_REAL_PATH_SAFE_POLLING) && (chunk > SPI_STREAM_SAFE_CHUNK_MAX))
+  {
+    chunk = SPI_STREAM_SAFE_CHUNK_MAX;
+  }
   if (s_spi_rr8 != 0U)
   {
-    st = Intan_ConvertPipelineDmaTimCsReadRR(chunk, INTAN_STREAM_RR8_CHANNELS, s_spi_flags,
-                                             s_spi_buf, &s_spi_rr_phase);
+    if (s_spi_safe_polling != SPI_REAL_PATH_DMA_TIMCS)
+    {
+      st = Intan_ConvertPipelineSafeReadRR(chunk, INTAN_STREAM_RR8_CHANNELS, s_spi_flags,
+                                           s_spi_buf, &s_spi_rr_phase);
+    }
+    else
+    {
+      st = Intan_ConvertPipelineDmaTimCsReadRR(chunk, INTAN_STREAM_RR8_CHANNELS, s_spi_flags,
+                                               s_spi_buf, &s_spi_rr_phase);
+    }
   }
   else
   {
-    st = Intan_ConvertPipelineDmaTimCsRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+    if (s_spi_safe_polling == SPI_REAL_PATH_SAFE_POLLING)
+    {
+      st = Intan_ConvertPipelineSafeRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+    }
+    else if (s_spi_safe_polling == SPI_REAL_PATH_FAST_POLLING)
+    {
+      st = Intan_ConvertPipelineRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+    }
+    else if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
+    {
+      st = Intan_ConvertPipelineDmaTimSlotRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+    }
+    else
+    {
+      st = Intan_ConvertPipelineDmaTimCsRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+    }
   }
   s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
 
@@ -358,15 +392,53 @@ static void usb_stats_reply(void)
 }
 
 #if (INTAN_HW_PRESENT == 1)
-static HAL_StatusTypeDef usb_prepare_real_record_stream(void)
+static HAL_StatusTypeDef usb_reset_record_hpf(uint8_t channel, uint8_t flags, uint8_t rr8)
 {
+  HAL_StatusTypeDef st;
+  uint16_t dummy;
+  uint8_t reset_flags = (uint8_t)(flags | 1U);
+
+  if (rr8 != 0U)
+  {
+    for (uint8_t ch = 0U; ch < INTAN_STREAM_RR8_CHANNELS; ch++)
+    {
+      st = Intan_Convert(ch, reset_flags, &dummy);
+      if (st != HAL_OK)
+      {
+        return st;
+      }
+    }
+  }
+  else
+  {
+    st = Intan_Convert(channel, reset_flags, &dummy);
+    if (st != HAL_OK)
+    {
+      return st;
+    }
+  }
+
+  HAL_Delay(1U);
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef usb_prepare_real_record_stream(uint8_t channel, uint8_t flags, uint8_t rr8)
+{
+  HAL_StatusTypeDef st;
+
   if (Intan_SPI_IsReady() == 0U)
   {
     return HAL_ERROR;
   }
 
   usb_intan_stop_stream();
-  return Intan_App_InitRecord(INTAN_RECORD_STREAM_ADC_KSPS);
+  st = Intan_App_InitRecord(INTAN_RECORD_STREAM_ADC_KSPS);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+
+  return usb_reset_record_hpf(channel, flags, rr8);
 }
 
 static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags)
@@ -1202,13 +1274,76 @@ void UsbVendorBulk_ProcessOutCommands(void)
       {
         usb_reply_text("ERR real stream ch63 unsupported");
       }
-      else if (usb_prepare_real_record_stream() != HAL_OK)
+      else if (usb_prepare_real_record_stream((uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U) != HAL_OK)
       {
         usb_reply_text("ERR init_record");
       }
       else
       {
         usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U, 0U);
+        usb_reply_text("OK");
+      }
+#endif
+      break;
+
+    case USB_CMD_SPI_STREAM_REAL_FAST:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      if (cmd.arg1 == 63U)
+      {
+        usb_reply_text("ERR real stream ch63 unsupported");
+      }
+      else if (usb_prepare_real_record_stream((uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U) != HAL_OK)
+      {
+        usb_reply_text("ERR init_record");
+      }
+      else
+      {
+        usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U, 0U);
+        s_spi_safe_polling = SPI_REAL_PATH_FAST_POLLING; /* Diagnostic: register polling, no TIM+DMA CS. */
+        usb_reply_text("OK");
+      }
+#endif
+      break;
+
+    case USB_CMD_SPI_STREAM_REAL_LEGACY:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      if (cmd.arg1 == 63U)
+      {
+        usb_reply_text("ERR real stream ch63 unsupported");
+      }
+      else if (usb_prepare_real_record_stream((uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U) != HAL_OK)
+      {
+        usb_reply_text("ERR init_record");
+      }
+      else
+      {
+        usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U, 0U);
+        s_spi_safe_polling = SPI_REAL_PATH_DMA_TIMCS; /* Diagnostic: old free-running TIM+DMA CS path. */
+        usb_reply_text("OK");
+      }
+#endif
+      break;
+
+    case USB_CMD_SPI_STREAM_REAL_SLOT:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      if (cmd.arg1 == 63U)
+      {
+        usb_reply_text("ERR real stream ch63 unsupported");
+      }
+      else if (usb_prepare_real_record_stream((uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U) != HAL_OK)
+      {
+        usb_reply_text("ERR init_record");
+      }
+      else
+      {
+        usb_spi_stream_start(cmd.arg0, (uint8_t)cmd.arg1, (uint8_t)cmd.arg2, 0U, 1U, 0U);
+        s_spi_safe_polling = SPI_REAL_PATH_DMA_TIMSLOT;
         usb_reply_text("OK");
       }
 #endif
@@ -1227,7 +1362,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
-      if (usb_prepare_real_record_stream() != HAL_OK)
+      if (usb_prepare_real_record_stream(0U, (uint8_t)cmd.arg1, 1U) != HAL_OK)
       {
         usb_reply_text("ERR init_record");
       }
