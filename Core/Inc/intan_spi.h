@@ -76,6 +76,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineRead(uint32_t n, uint8_t channel, uint8_t
 HAL_StatusTypeDef Intan_ConvertPipelineSafeRead(uint32_t n, uint8_t channel, uint8_t flags,
                                                 uint16_t *samples);
 #define INTAN_STREAM_RR8_CHANNELS      8U
+#define INTAN_STREAM_RR16_CHANNELS     16U
 
 HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel, uint8_t flags, uint16_t *samples);
 HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotRead(uint32_t n, uint8_t channel, uint8_t flags,
@@ -85,6 +86,9 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsReadRR(uint32_t n, uint8_t n_ch, 
                                                       uint16_t *samples, uint8_t *phase_io);
 HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotReadRR(uint32_t n, uint8_t n_ch, uint8_t flags,
                                                         uint16_t *samples, uint8_t *phase_io);
+HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotReadRange(uint32_t n, uint8_t first_ch, uint8_t n_ch,
+                                                           uint8_t flags, uint16_t *samples,
+                                                           uint8_t *phase_io);
 /** Conservative round-robin polling path; *phase_io updated for next block. */
 HAL_StatusTypeDef Intan_ConvertPipelineSafeReadRR(uint32_t n, uint8_t n_ch, uint8_t flags,
                                                   uint16_t *samples, uint8_t *phase_io);

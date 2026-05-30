@@ -262,6 +262,44 @@ UsbCommand UsbCommands_ParseLine(const char *line)
     return cmd;
   }
 
+  if (streq_ci(tok, "SPI_STREAM_RR16_REAL"))
+  {
+    cmd.id = USB_CMD_SPI_STREAM_RR16_REAL;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_STREAM_RANGE_REAL"))
+  {
+    cmd.id = USB_CMD_SPI_STREAM_RANGE_REAL;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg3 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_STREAM_RANGE_REAL_SLOT"))
+  {
+    cmd.id = USB_CMD_SPI_STREAM_RANGE_REAL_SLOT;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg3 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
   if (streq_ci(tok, "SPI_STREAM_RR8"))
   {
     cmd.id = USB_CMD_SPI_STREAM_RR8;
