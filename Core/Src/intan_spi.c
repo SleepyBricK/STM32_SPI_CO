@@ -1764,138 +1764,79 @@ static HAL_StatusTypeDef intan_impedance_run_dma_slots(const IntanImpedanceTimed
                                                        IntanImpedanceTimedResult *result,
                                                        uint32_t sample_count, uint32_t sample_slot_hz)
 {
-  const uint32_t dma_stream0_done = DMA_LISR_TCIF0;
-  const uint32_t dma_stream1_done = DMA_LISR_TCIF1;
-  const uint32_t max_samples_per_chunk = (INTAN_DMA_CHUNK_SLOTS - 2U) / 2U;
-  uint32_t tim_clk = intan_tim1_clock_hz();
+  uint32_t frame_count = (sample_count * 2U) + 2U;
   uint32_t frame_hz = sample_slot_hz * 2U;
-  uint32_t period_ticks;
-  uint32_t high_ticks;
-  uint32_t low_ticks;
-  uint32_t old_midi;
-  uint32_t produced = 0U;
-  uint32_t total_start = 0U;
-  uint32_t total_end = 0U;
+  uint32_t frame_period_cycles;
+  uint32_t next_frame;
+  uint32_t total_start;
+  uint32_t total_end;
 
-  if (frame_hz == 0U || max_samples_per_chunk == 0U)
+  if (frame_hz == 0U || frame_count < 2U)
   {
     return HAL_ERROR;
   }
 
-  period_ticks = (uint32_t)(((uint64_t)tim_clk + (frame_hz / 2U)) / frame_hz);
-  high_ticks = (uint32_t)(((uint64_t)tim_clk * INTAN_DMA_TIMSLOT_HIGH_NS + 999999999ULL) / 1000000000ULL);
-  if (high_ticks < 2U)
-  {
-    high_ticks = 2U;
-  }
-  if (period_ticks <= high_ticks + 4U)
+  frame_period_cycles = (uint32_t)(((uint64_t)SystemCoreClock + (frame_hz / 2U)) / frame_hz);
+  if (frame_period_cycles == 0U)
   {
     return HAL_ERROR;
   }
-  low_ticks = period_ticks - high_ticks;
   result->actual_freq_millihz =
-      (uint32_t)(((uint64_t)tim_clk * 1000ULL) /
-                 ((uint64_t)period_ticks * 2ULL * (uint64_t)arg->samples_per_period));
+      (uint32_t)(((uint64_t)SystemCoreClock * 1000ULL) /
+                 ((uint64_t)frame_period_cycles * 2ULL * (uint64_t)arg->samples_per_period));
 
   Intan_SpiDiag_Init();
-  __HAL_RCC_DMA1_CLK_ENABLE();
-  intan_cs_tim1_ch2_mode();
 
-  old_midi = INTAN_SPI_INSTANCE->CFG2 & SPI_CFG2_MIDI;
-
-  while (produced < sample_count)
+  total_start = DWT->CYCCNT;
+  next_frame = total_start;
+  for (uint32_t frame = 0U; frame < frame_count; frame++)
   {
-    uint32_t chunk_samples = sample_count - produced;
-    uint32_t chunk_slots;
-    uint32_t cyc_start;
+    uint32_t tx_word = 0U;
+    uint32_t rx_word = 0U;
+    uint32_t now;
 
-    if (chunk_samples > max_samples_per_chunk)
+    if (frame < (sample_count * 2U))
     {
-      chunk_samples = max_samples_per_chunk;
-    }
-    chunk_slots = (chunk_samples * 2U) + 2U;
-
-    for (uint32_t j = 0U; j < chunk_samples; j++)
-    {
-      uint32_t sample_index = produced + j;
-      uint32_t basis_idx = ((sample_index % arg->samples_per_period) * 64U) /
-                           (uint32_t)arg->samples_per_period;
-      uint8_t dac_val = intan_sine64[basis_idx];
-
-      s_dma_tx_words[2U * j] = intan_pack_be4(0x80U, 3U, 0x00U, dac_val);
-      s_dma_tx_words[(2U * j) + 1U] = intan_convert_cmd_word(arg->channel, 0U);
-    }
-    s_dma_tx_words[2U * chunk_samples] = 0U;
-    s_dma_tx_words[(2U * chunk_samples) + 1U] = 0U;
-
-    TIM1->CR1 = 0U;
-    TIM1->CR2 = 0U;
-    TIM1->SMCR = 0U;
-    TIM1->DIER = 0U;
-    TIM1->PSC = 0U;
-    TIM1->ARR = period_ticks - 1U;
-    TIM1->CCR2 = low_ticks;
-    TIM1->CCMR1 &= ~(TIM_CCMR1_OC2M | TIM_CCMR1_CC2S);
-    TIM1->CCMR1 |= (6U << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
-    TIM1->CCER &= ~TIM_CCER_CC2E;
-    TIM1->CCER |= TIM_CCER_CC2P;
-    TIM1->BDTR |= TIM_BDTR_MOE;
-    TIM1->EGR = TIM_EGR_UG;
-    TIM1->SR = 0U;
-
-    if (intan_dma_prepare_streams_ex(s_dma_tx_words, chunk_slots, 1U, DMA_REQUEST_TIM1_UP) != HAL_OK)
-    {
-      intan_dma_timcs_recover(old_midi);
-      return HAL_TIMEOUT;
+      uint32_t sample_index = frame / 2U;
+      if ((frame & 1U) == 0U)
+      {
+        uint32_t basis_idx = ((sample_index % arg->samples_per_period) * 64U) /
+                             (uint32_t)arg->samples_per_period;
+        uint8_t dac_val = intan_sine64[basis_idx];
+        tx_word = intan_pack_be4(0x80U, 3U, 0x00U, dac_val);
+      }
+      else
+      {
+        tx_word = intan_convert_cmd_word(arg->channel, 0U);
+      }
     }
 
-    INTAN_SPI_INSTANCE->CFG2 &= ~SPI_CFG2_COMM;
-    MODIFY_REG(INTAN_SPI_INSTANCE->CFG2, SPI_CFG2_MIDI, INTAN_DMA_TIMCS_SPI_MIDI);
-    INTAN_SPI_INSTANCE->IER = 0U;
-    INTAN_SPI_INSTANCE->IFCR = SPI_IFCR_EOTC | SPI_IFCR_TXTFC | SPI_IFCR_UDRC | SPI_IFCR_OVRC |
-                               SPI_IFCR_MODFC | SPI_IFCR_SUSPC;
-    INTAN_SPI_INSTANCE->CR2 = chunk_slots;
-    INTAN_SPI_INSTANCE->CFG1 &= ~SPI_CFG1_TXDMAEN;
-    INTAN_SPI_INSTANCE->CFG1 |= SPI_CFG1_RXDMAEN;
-
-    DMA1_Stream0->CR |= DMA_SxCR_EN;
-    DMA1_Stream1->CR |= DMA_SxCR_EN;
-
-    INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_SPE;
-    INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
-
-    cyc_start = DWT->CYCCNT;
-    if (produced == 0U)
+    while ((int32_t)(DWT->CYCCNT - next_frame) < 0) {}
+    now = DWT->CYCCNT;
+    if ((uint32_t)(now - next_frame) > frame_period_cycles)
     {
-      total_start = cyc_start;
+      result->overruns++;
     }
-    TIM1->CNT = 0U;
-    TIM1->SR = 0U;
-    TIM1->CCER |= TIM_CCER_CC2E;
-    TIM1->DIER = TIM_DIER_UDE;
-    TIM1->CR1 |= TIM_CR1_CEN;
-
-    if (intan_wait_reg_flag_guard(&INTAN_SPI_INSTANCE->SR, SPI_SR_EOT) != HAL_OK ||
-        intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream0_done) != HAL_OK ||
-        intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream1_done) != HAL_OK)
+    if (intan_xfer32(tx_word, &rx_word) != HAL_OK)
     {
-      intan_dma_timcs_recover(old_midi);
-      return HAL_TIMEOUT;
-    }
-    total_end = DWT->CYCCNT;
-    Intan_SpiDiag_RecordBlock(cyc_start, total_end, chunk_samples, chunk_slots, period_ticks);
-
-    for (uint32_t j = 0U; j < chunk_samples; j++)
-    {
-      uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[(2U * j) + 3U]);
-      intan_impedance_accumulate(result, adc, produced + j, arg->samples_per_period);
+      result->spi_errors++;
+      total_end = DWT->CYCCNT;
+      result->elapsed_cycles = total_end - total_start;
+      return HAL_ERROR;
     }
 
-    Intan_SpiStats_AddXfer32(chunk_slots);
-    intan_dma_timcs_recover(old_midi);
-    produced += chunk_samples;
+    if (frame >= 3U && ((frame & 1U) != 0U))
+    {
+      uint32_t sample_index = (frame - 3U) / 2U;
+      uint16_t adc = intan_u16_from_convert_word(rx_word);
+      intan_impedance_accumulate(result, adc, sample_index, arg->samples_per_period);
+    }
+
+    next_frame += frame_period_cycles;
   }
 
+  total_end = DWT->CYCCNT;
+  Intan_SpiDiag_RecordBlock(total_start, total_end, sample_count, frame_count, frame_period_cycles);
   result->elapsed_cycles = total_end - total_start;
   return HAL_OK;
 }
