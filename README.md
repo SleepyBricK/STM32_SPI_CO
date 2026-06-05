@@ -128,6 +128,24 @@ CLEAR_COMP
 CONVERT <channel> [flags]
 ```
 
+Pattern executor:
+
+```text
+PATTERN_CLEAR
+PATTERN_ADD_RAW <word>
+PATTERN_ADD_WRITE <reg> <value> [u] [m]
+PATTERN_ADD_READ <reg>
+PATTERN_ADD_CONVERT <channel> [flags]
+PATTERN_ADD_CLEAR_ADC
+PATTERN_ADD_CLEAR_COMP
+PATTERN_ADD_DELAY_CYC <cycles>
+PATTERN_ADD_DELAY_US <us>
+PATTERN_STATUS
+PATTERN_RUN <repeat>
+```
+
+Подробный гайд по stim-паттернам, raw-словам и диагностике: `intan_stim_pattern_guide.md`.
+
 Streaming / bench:
 
 ```text
@@ -148,6 +166,7 @@ SPI_RATE_RR8 <samples> <flags>
 SPI_TO_RAM <samples> <channel> <flags>
 SPI_TO_RAM_FAST <samples> <channel> <flags>
 SPI_TO_RAM_RR8 <samples> <flags>
+IMPEDANCE_MEASURE <channel> <scale_bits> <freq_hz> <samples_per_period> <periods> <flags>
 ```
 
 `SPI_STREAM_REAL`, `SPI_STREAM_RR8_REAL`, `SPI_STREAM_RR16_REAL` и `SPI_STREAM_RANGE_REAL` перед стартом автоматически переводят RHS2116 в recording mode через `Intan_App_InitRecord(610)` и выполняют одноразовый `CONVERT` с `H=1` для сброса DSP HPF. Одноканальный, 8/16-канальный и range real stream используют slot-DMA path: `TIM1_CH2` формирует CS на PE11, а `TIM1_UP` запускает TX DMA в `SPI2->TXDR`; RX остаётся на `SPI2_RX` DMA. `*_SLOT` явно выбирает тот же path, `SPI_STREAM_REAL_FAST` оставлен для регистрового polling, `SPI_STREAM_REAL_LEGACY` — для старого свободно бегущего TIM+DMA CS path.
@@ -159,6 +178,10 @@ SPI_TO_RAM_RR8 <samples> <flags>
 ```text
 channel = first_channel + (i % channel_count)
 ```
+
+`IMPEDANCE_MEASURE` выполняет Zcheck на STM32 без USB round-trip на каждый sample: сохраняет регистры RHS2116, переводит Zcheck в safe state, затем использует TIM1/DMA slot path. На один measurement sample идут два SPI frame-слота (`WRITE Reg3` из `INTAN_SINE64`, затем `CONVERT(channel)`), ответ ADC берётся из двухслотового RHS2116 pipeline и накапливается в `sin_accum`/`cos_accum`. `scale_bits`: `0`, `1`, `3`; `flags`: bit0 `phase_safe`, bit1 `restore_regs`. Ответ: `OK IMPEDANCE ... actual_freq_millihz=... sample_count=... sin_accum=... cos_accum=... averages=1 p0_sin=... p0_cos=...`; при активном stream возвращается `ERR busy`.
+
+`PATTERN_RUN` выполняет generic pattern послотово: каждый SPI-слот идёт через `Intan_Xfer32Word()` как отдельная транзакция (`CS↓ word CS↑` и закрытие SPI transfer), `PATTERN_ADD_DELAY_*` — через DWT busy-wait. Для стимуляции это подтверждённо рабочий путь; попытки ускорять generic pattern группировкой SPI-слотов ломали видимый стим-сигнал. Для сложных стим-протоколов с гарантированным таймингом фаз лучше добавлять специализированные команды уровня `STIM_PULSE`, а не собирать всё из generic pattern.
 
 ## Статистика
 

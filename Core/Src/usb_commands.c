@@ -242,6 +242,31 @@ UsbCommand UsbCommands_ParseLine(const char *line)
     return cmd;
   }
 
+  if (streq_ci(tok, "IMPEDANCE_MEASURE"))
+  {
+    cmd.id = USB_CMD_IMPEDANCE_MEASURE;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg3 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    /*
+     * periods and flags do not fit the generic 4-arg command. Pack them into
+     * arg3: low 16 bits = samples_per_period, next 12 bits = periods,
+     * top 4 bits = flags.
+     */
+    {
+      uint32_t spp = cmd.arg3 & 0xFFFFU;
+      uint32_t periods = (tok = strtok_r(NULL, " \t", &ctx)) != NULL ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+      uint32_t flags = (tok = strtok_r(NULL, " \t", &ctx)) != NULL ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+      cmd.arg3 = (spp & 0xFFFFU) | ((periods & 0x0FFFU) << 16) | ((flags & 0x0FU) << 28);
+    }
+    return cmd;
+  }
+
   if (streq_ci(tok, "SPI_STREAM_RR8_REAL"))
   {
     cmd.id = USB_CMD_SPI_STREAM_RR8_REAL;

@@ -51,6 +51,29 @@ typedef struct {
   uint16_t samples[INTAN_IMPEDANCE_MAX_SAMPLES];
 } IntanImpedanceArg;
 
+typedef struct {
+  uint8_t channel;
+  uint8_t scale_bits;
+  uint16_t freq_hz;
+  uint16_t samples_per_period;
+  uint16_t periods;
+  uint8_t flags;
+} IntanImpedanceTimedArg;
+
+typedef struct {
+  int64_t sin_accum;
+  int64_t cos_accum;
+  int64_t adc_sum;
+  uint32_t sample_count;
+  uint32_t actual_freq_millihz;
+  uint32_t elapsed_cycles;
+  uint32_t overruns;
+  uint32_t spi_errors;
+  uint16_t adc_min;
+  uint16_t adc_max;
+  uint32_t clipped;
+} IntanImpedanceTimedResult;
+
 void Intan_SPI_Init(SPI_HandleTypeDef *hspi);
 uint8_t Intan_SPI_IsReady(void);
 
@@ -102,6 +125,8 @@ HAL_StatusTypeDef Intan_RawCmd(const uint8_t cmd4[4]);
 /** READ 255 с M=1 — сброс compliance monitor (как clear_compliance_monitor в Python). */
 HAL_StatusTypeDef Intan_ClearComplianceMonitor(void);
 HAL_StatusTypeDef Intan_MeasureImpedance(IntanImpedanceArg *arg);
+HAL_StatusTypeDef Intan_MeasureImpedanceTimed(const IntanImpedanceTimedArg *arg,
+                                              IntanImpedanceTimedResult *result);
 /** Останов TIM+DMA+SPI (CS в GPIO) — между STREAM и текстовыми SPI-командами. */
 void Intan_DmaPathRelease(void);
 

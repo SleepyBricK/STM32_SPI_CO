@@ -12,7 +12,7 @@
 #include <string.h>
 
 #define USB_CMD_RX_MAX        256U
-#define USB_REPLY_MAX         256U
+#define USB_REPLY_MAX         512U
 #define SPI_STREAM_CHUNK_MAX  (INTAN_DMA_CHUNK_SLOTS - 2U)
 #define SPI_STREAM_SAFE_CHUNK_MAX  128U
 #define SPI_CHUNKS_PER_TICK   8U
@@ -153,6 +153,80 @@ static void usb_reply_text(const char *text)
   }
 
   (void)USBD_VENDOR_BULK_Transmit((uint8_t *)s_reply, (uint16_t)n);
+}
+
+static size_t usb_append_str(char *dst, size_t cap, size_t pos, const char *src)
+{
+  if (dst == NULL || src == NULL || cap == 0U || pos >= cap)
+  {
+    return pos;
+  }
+  while (*src != '\0' && (pos + 1U) < cap)
+  {
+    dst[pos++] = *src++;
+  }
+  dst[pos] = '\0';
+  return pos;
+}
+
+static size_t usb_append_u32(char *dst, size_t cap, size_t pos, uint32_t value)
+{
+  char tmp[11];
+  unsigned int i = 0U;
+
+  if (value == 0U)
+  {
+    return usb_append_str(dst, cap, pos, "0");
+  }
+  while (value != 0U && i < sizeof(tmp))
+  {
+    tmp[i++] = (char)('0' + (value % 10U));
+    value /= 10U;
+  }
+  while (i > 0U && (pos + 1U) < cap)
+  {
+    dst[pos++] = tmp[--i];
+  }
+  if (dst != NULL && cap != 0U && pos < cap)
+  {
+    dst[pos] = '\0';
+  }
+  return pos;
+}
+
+static size_t usb_append_i64(char *dst, size_t cap, size_t pos, int64_t value)
+{
+  char tmp[20];
+  uint64_t mag;
+  unsigned int i = 0U;
+
+  if (value < 0)
+  {
+    pos = usb_append_str(dst, cap, pos, "-");
+    mag = (uint64_t)(-(value + 1)) + 1ULL;
+  }
+  else
+  {
+    mag = (uint64_t)value;
+  }
+  if (mag == 0ULL)
+  {
+    return usb_append_str(dst, cap, pos, "0");
+  }
+  while (mag != 0ULL && i < sizeof(tmp))
+  {
+    tmp[i++] = (char)('0' + (mag % 10ULL));
+    mag /= 10ULL;
+  }
+  while (i > 0U && (pos + 1U) < cap)
+  {
+    dst[pos++] = tmp[--i];
+  }
+  if (dst != NULL && cap != 0U && pos < cap)
+  {
+    dst[pos] = '\0';
+  }
+  return pos;
 }
 
 static void usb_stream_reset_all(void)
@@ -1143,6 +1217,95 @@ static void usb_cmd_convert(uint32_t channel, uint32_t flags)
   usb_reply_text(line);
 }
 
+static void usb_cmd_impedance_measure(uint32_t channel, uint32_t scale_bits, uint32_t freq_hz, uint32_t packed)
+{
+  IntanImpedanceTimedArg arg;
+  IntanImpedanceTimedResult res;
+  uint32_t samples_per_period = packed & 0xFFFFU;
+  uint32_t periods = (packed >> 16) & 0x0FFFU;
+  uint32_t flags = (packed >> 28) & 0x0FU;
+  uint32_t adc_mean_x1000;
+  char line[USB_REPLY_MAX];
+  size_t pos = 0U;
+
+  if (Intan_SPI_IsReady() == 0U)
+  {
+    usb_reply_text("ERR spi not ready");
+    return;
+  }
+  if (s_spi_active != 0U || s_synth_active != 0U)
+  {
+    usb_reply_text("ERR busy");
+    return;
+  }
+  if (channel > 15U || (scale_bits != 0U && scale_bits != 1U && scale_bits != 3U) ||
+      freq_hz < 10U || freq_hz > 10000U ||
+      samples_per_period < 4U || samples_per_period > 128U ||
+      periods == 0U || periods > 1000U)
+  {
+    usb_reply_text("ERR range");
+    return;
+  }
+
+  Intan_DmaPathRelease();
+  arg.channel = (uint8_t)channel;
+  arg.scale_bits = (uint8_t)scale_bits;
+  arg.freq_hz = (uint16_t)freq_hz;
+  arg.samples_per_period = (uint16_t)samples_per_period;
+  arg.periods = (uint16_t)periods;
+  arg.flags = (uint8_t)flags;
+
+  if (Intan_MeasureImpedanceTimed(&arg, &res) != HAL_OK)
+  {
+    (void)snprintf(line, sizeof(line), "ERR impedance spi_errors=%lu overruns=%lu samples=%lu",
+                   (unsigned long)res.spi_errors, (unsigned long)res.overruns,
+                   (unsigned long)res.sample_count);
+    usb_reply_text(line);
+    return;
+  }
+
+  adc_mean_x1000 =
+      (res.sample_count != 0U) ? (uint32_t)((res.adc_sum * 1000LL) / (int64_t)res.sample_count) : 0U;
+
+  pos = usb_append_str(line, sizeof(line), pos, "OK IMPEDANCE channel=");
+  pos = usb_append_u32(line, sizeof(line), pos, channel);
+  pos = usb_append_str(line, sizeof(line), pos, " scale=");
+  pos = usb_append_u32(line, sizeof(line), pos, scale_bits);
+  pos = usb_append_str(line, sizeof(line), pos, " freq_hz=");
+  pos = usb_append_u32(line, sizeof(line), pos, freq_hz);
+  pos = usb_append_str(line, sizeof(line), pos, " actual_freq_millihz=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.actual_freq_millihz);
+  pos = usb_append_str(line, sizeof(line), pos, " samples_per_period=");
+  pos = usb_append_u32(line, sizeof(line), pos, samples_per_period);
+  pos = usb_append_str(line, sizeof(line), pos, " periods=");
+  pos = usb_append_u32(line, sizeof(line), pos, periods);
+  pos = usb_append_str(line, sizeof(line), pos, " sample_count=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.sample_count);
+  pos = usb_append_str(line, sizeof(line), pos, " sin_accum=");
+  pos = usb_append_i64(line, sizeof(line), pos, res.sin_accum);
+  pos = usb_append_str(line, sizeof(line), pos, " cos_accum=");
+  pos = usb_append_i64(line, sizeof(line), pos, res.cos_accum);
+  pos = usb_append_str(line, sizeof(line), pos, " adc_min=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.adc_min);
+  pos = usb_append_str(line, sizeof(line), pos, " adc_max=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.adc_max);
+  pos = usb_append_str(line, sizeof(line), pos, " adc_mean_x1000=");
+  pos = usb_append_u32(line, sizeof(line), pos, adc_mean_x1000);
+  pos = usb_append_str(line, sizeof(line), pos, " clipped=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.clipped);
+  pos = usb_append_str(line, sizeof(line), pos, " overruns=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.overruns);
+  pos = usb_append_str(line, sizeof(line), pos, " spi_errors=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.spi_errors);
+  pos = usb_append_str(line, sizeof(line), pos, " elapsed_cycles=");
+  pos = usb_append_u32(line, sizeof(line), pos, res.elapsed_cycles);
+  pos = usb_append_str(line, sizeof(line), pos, " averages=1 p0_sin=");
+  pos = usb_append_i64(line, sizeof(line), pos, res.sin_accum);
+  pos = usb_append_str(line, sizeof(line), pos, " p0_cos=");
+  (void)usb_append_i64(line, sizeof(line), pos, res.cos_accum);
+  usb_reply_text(line);
+}
+
 static void usb_cmd_pattern_status(void)
 {
   IntanPatternStatus ps;
@@ -1554,6 +1717,14 @@ void UsbVendorBulk_ProcessOutCommands(void)
       usb_reply_text("ERR no intan hw");
 #else
       usb_cmd_convert(cmd.arg0, cmd.arg1);
+#endif
+      break;
+
+    case USB_CMD_IMPEDANCE_MEASURE:
+#if (INTAN_HW_PRESENT == 0)
+      usb_reply_text("ERR no intan hw");
+#else
+      usb_cmd_impedance_measure(cmd.arg0, cmd.arg1, cmd.arg2, cmd.arg3);
 #endif
       break;
 
