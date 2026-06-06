@@ -250,6 +250,8 @@ HAL_StatusTypeDef Intan_Pattern_Run(uint32_t repeat_count)
     return HAL_ERROR;
   }
 
+  Intan_DmaPathRelease();
+
   s_status.running = 1U;
   s_status.last_error = 0U;
   dwt_enable();

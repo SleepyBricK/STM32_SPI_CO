@@ -1556,6 +1556,7 @@ static void usb_cmd_pattern_status(void)
   IntanPatternStatus ps;
   char line[128];
 
+  usb_intan_stop_stream();
   Intan_Pattern_GetStatus(&ps);
   (void)snprintf(line, sizeof(line),
                  "OK PATTERN_STATUS loaded=%u running=%u slots=%lu spi=%lu delays=%lu err=%u",
@@ -1568,6 +1569,8 @@ static void usb_cmd_pattern_run(uint32_t repeat)
 {
   HAL_StatusTypeDef st;
 
+  usb_intan_stop_stream();
+
   if (Intan_SPI_IsReady() == 0U)
   {
     usb_reply_text("ERR spi not ready");
@@ -1576,11 +1579,6 @@ static void usb_cmd_pattern_run(uint32_t repeat)
   if (repeat == 0U || repeat > 10000U)
   {
     usb_reply_text("ERR repeat");
-    return;
-  }
-  if (s_spi_active != 0U || s_synth_active != 0U)
-  {
-    usb_reply_text("ERR busy");
     return;
   }
 
@@ -1978,6 +1976,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       Intan_Pattern_Clear();
       usb_reply_text("OK PATTERN_CLEAR");
 #endif
@@ -1987,6 +1986,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       usb_reply_text((Intan_Pattern_AddRawWord(cmd.arg0) == HAL_OK) ? "OK PATTERN_ADD_RAW" : "ERR pattern_add");
 #endif
       break;
@@ -1995,6 +1995,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       if (cmd.arg0 > 255U || cmd.arg1 > 0xFFFFU)
       {
         usb_reply_text("ERR range");
@@ -2013,6 +2014,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       if (cmd.arg0 > 255U)
       {
         usb_reply_text("ERR reg");
@@ -2029,6 +2031,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       if (cmd.arg0 > 63U || cmd.arg1 > 255U)
       {
         usb_reply_text("ERR range");
@@ -2046,6 +2049,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       usb_reply_text((Intan_Pattern_AddClearAdc() == HAL_OK) ? "OK PATTERN_ADD_CLEAR_ADC" : "ERR pattern_add");
 #endif
       break;
@@ -2054,6 +2058,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       usb_reply_text((Intan_Pattern_AddClearCompliance() == HAL_OK) ? "OK PATTERN_ADD_CLEAR_COMP"
                                                                     : "ERR pattern_add");
 #endif
@@ -2063,6 +2068,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       usb_reply_text((Intan_Pattern_AddDelayCycles(cmd.arg0) == HAL_OK) ? "OK PATTERN_ADD_DELAY_CYC"
                                                                         : "ERR pattern_add");
 #endif
@@ -2072,6 +2078,7 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
+      usb_intan_stop_stream();
       usb_reply_text((Intan_Pattern_AddDelayUs(cmd.arg0) == HAL_OK) ? "OK PATTERN_ADD_DELAY_US"
                                                                     : "ERR pattern_add");
 #endif
