@@ -1743,12 +1743,33 @@ static HAL_StatusTypeDef intan_restore_impedance_regs(const uint16_t regs[9])
   return Intan_WriteReg(48U, regs[8], 0U, 0U);
 }
 
+static void intan_impedance_period_sums(uint16_t samples_per_period, int32_t *period_sum_s,
+                                        int32_t *period_sum_c)
+{
+  int32_t sum_s = 0;
+  int32_t sum_c = 0;
+
+  for (uint32_t phase_idx = 0U; phase_idx < (uint32_t)samples_per_period; phase_idx++)
+  {
+    uint32_t basis_idx = (phase_idx * 64U) / (uint32_t)samples_per_period;
+
+    sum_s += (int32_t)intan_sine64[basis_idx] - 128;
+    sum_c += (int32_t)intan_sine64[(basis_idx + 16U) & 63U] - 128;
+  }
+
+  *period_sum_s = sum_s;
+  *period_sum_c = sum_c;
+}
+
 static void intan_impedance_accumulate(IntanImpedanceTimedResult *result, uint16_t adc,
-                                       uint32_t sample_index, uint16_t samples_per_period)
+                                       uint32_t sample_index, uint16_t samples_per_period,
+                                       int32_t period_sum_s, int32_t period_sum_c)
 {
   uint32_t basis_idx = ((sample_index % samples_per_period) * 64U) / (uint32_t)samples_per_period;
-  int32_t sin_basis = (int32_t)intan_sine64[basis_idx] - 128;
-  int32_t cos_basis = (int32_t)intan_sine64[(basis_idx + 16U) & 63U] - 128;
+  int32_t sin_raw = (int32_t)intan_sine64[basis_idx] - 128;
+  int32_t cos_raw = (int32_t)intan_sine64[(basis_idx + 16U) & 63U] - 128;
+  int32_t sin_basis = (sin_raw * (int32_t)samples_per_period) - period_sum_s;
+  int32_t cos_basis = (cos_raw * (int32_t)samples_per_period) - period_sum_c;
   int32_t centered = (int32_t)adc - 32768;
 
   if (adc < result->adc_min) { result->adc_min = adc; }
@@ -1760,84 +1781,106 @@ static void intan_impedance_accumulate(IntanImpedanceTimedResult *result, uint16
   result->sample_count++;
 }
 
-static HAL_StatusTypeDef intan_impedance_run_dma_slots(const IntanImpedanceTimedArg *arg,
-                                                       IntanImpedanceTimedResult *result,
-                                                       uint32_t sample_count, uint32_t sample_slot_hz)
+static HAL_StatusTypeDef intan_impedance_prepare_loop(uint8_t channel)
 {
-  uint32_t frame_count = (sample_count * 2U) + 2U;
-  uint32_t frame_hz = sample_slot_hz * 2U;
-  uint32_t frame_period_cycles;
-  uint32_t next_frame;
+  uint16_t dummy = 0U;
+  HAL_StatusTypeDef st;
+  uint32_t i;
+
+  st = Intan_Convert(channel, 1U, &dummy);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+
+  for (i = 0U; i < 3U; i++)
+  {
+    st = Intan_WriteReg(3U, 128U, 0U, 0U);
+    if (st != HAL_OK)
+    {
+      return st;
+    }
+    intan_delay_ns(2000U);
+    st = Intan_Convert(channel, 0U, &dummy);
+    if (st != HAL_OK)
+    {
+      return st;
+    }
+  }
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef intan_impedance_run_paced_samples(const IntanImpedanceTimedArg *arg,
+                                                           IntanImpedanceTimedResult *result,
+                                                           uint32_t sample_count, uint32_t sample_hz,
+                                                           int32_t period_sum_s, int32_t period_sum_c)
+{
+  uint32_t sample_period_cycles;
+  uint32_t next_sample;
   uint32_t total_start;
   uint32_t total_end;
+  uint32_t spp = (uint32_t)arg->samples_per_period;
 
-  if (frame_hz == 0U || frame_count < 2U)
+  if (sample_hz == 0U || sample_count == 0U)
   {
     return HAL_ERROR;
   }
 
-  frame_period_cycles = (uint32_t)(((uint64_t)SystemCoreClock + (frame_hz / 2U)) / frame_hz);
-  if (frame_period_cycles == 0U)
+  sample_period_cycles = (uint32_t)(((uint64_t)SystemCoreClock + (sample_hz / 2U)) / sample_hz);
+  if (sample_period_cycles == 0U)
   {
     return HAL_ERROR;
   }
-  result->actual_freq_millihz =
-      (uint32_t)(((uint64_t)SystemCoreClock * 1000ULL) /
-                 ((uint64_t)frame_period_cycles * 2ULL * (uint64_t)arg->samples_per_period));
-
-  Intan_SpiDiag_Init();
 
   total_start = DWT->CYCCNT;
-  next_frame = total_start;
-  for (uint32_t frame = 0U; frame < frame_count; frame++)
+  next_sample = total_start;
+  for (uint32_t sample_index = 0U; sample_index < sample_count; sample_index++)
   {
-    uint32_t tx_word = 0U;
-    uint32_t rx_word = 0U;
-    uint32_t now;
+    uint32_t basis_idx = ((sample_index % spp) * 64U) / spp;
+    uint8_t dac_val = intan_sine64[basis_idx];
+    uint16_t adc_val = 0U;
+    uint32_t convert_done;
+    HAL_StatusTypeDef st;
 
-    if (frame < (sample_count * 2U))
-    {
-      uint32_t sample_index = frame / 2U;
-      if ((frame & 1U) == 0U)
-      {
-        uint32_t basis_idx = ((sample_index % arg->samples_per_period) * 64U) /
-                             (uint32_t)arg->samples_per_period;
-        uint8_t dac_val = intan_sine64[basis_idx];
-        tx_word = intan_pack_be4(0x80U, 3U, 0x00U, dac_val);
-      }
-      else
-      {
-        tx_word = intan_convert_cmd_word(arg->channel, 0U);
-      }
-    }
-
-    while ((int32_t)(DWT->CYCCNT - next_frame) < 0) {}
-    now = DWT->CYCCNT;
-    if ((uint32_t)(now - next_frame) > frame_period_cycles)
+    while ((int32_t)(DWT->CYCCNT - next_sample) < 0) {}
+    if (sample_index > 0U &&
+        (uint32_t)(DWT->CYCCNT - next_sample) > (sample_period_cycles + (sample_period_cycles >> 3)))
     {
       result->overruns++;
     }
-    if (intan_xfer32(tx_word, &rx_word) != HAL_OK)
+
+    st = Intan_WriteReg(3U, (uint16_t)dac_val, 0U, 0U);
+    if (st != HAL_OK)
     {
       result->spi_errors++;
-      total_end = DWT->CYCCNT;
-      result->elapsed_cycles = total_end - total_start;
+      result->elapsed_cycles = DWT->CYCCNT - total_start;
+      return HAL_ERROR;
+    }
+    intan_delay_ns(2000U);
+
+    st = Intan_Convert(arg->channel, 0U, &adc_val);
+    if (st != HAL_OK)
+    {
+      result->spi_errors++;
+      result->elapsed_cycles = DWT->CYCCNT - total_start;
       return HAL_ERROR;
     }
 
-    if (frame >= 3U && ((frame & 1U) != 0U))
-    {
-      uint32_t sample_index = (frame - 3U) / 2U;
-      uint16_t adc = intan_u16_from_convert_word(rx_word);
-      intan_impedance_accumulate(result, adc, sample_index, arg->samples_per_period);
-    }
+    intan_impedance_accumulate(result, adc_val, sample_index, arg->samples_per_period,
+                               period_sum_s, period_sum_c);
 
-    next_frame += frame_period_cycles;
+    convert_done = DWT->CYCCNT;
+    next_sample = convert_done + sample_period_cycles;
   }
 
   total_end = DWT->CYCCNT;
-  Intan_SpiDiag_RecordBlock(total_start, total_end, sample_count, frame_count, frame_period_cycles);
   result->elapsed_cycles = total_end - total_start;
+  if (result->elapsed_cycles != 0U && result->sample_count != 0U)
+  {
+    result->actual_freq_millihz =
+        (uint32_t)(((uint64_t)result->sample_count * (uint64_t)SystemCoreClock * 1000ULL) /
+                   ((uint64_t)result->elapsed_cycles * (uint64_t)spp));
+  }
   return HAL_OK;
 }
 
@@ -1915,8 +1958,15 @@ HAL_StatusTypeDef Intan_MeasureImpedanceTimed(const IntanImpedanceTimedArg *arg,
 
   reg2 = (uint16_t)(((uint16_t)arg->channel << 8) | (1U << 6) |
                     ((uint16_t)arg->scale_bits << 3) | 1U);
-  st = Intan_WriteReg(2U, reg2, 0U, 0U);
+  st = Intan_WriteReg(2U, 0x0040U, 0U, 0U);
   if (st == HAL_OK) { st = Intan_WriteReg(3U, 0x0080U, 0U, 0U); }
+  if (st == HAL_OK) { st = Intan_WriteReg(2U, reg2, 0U, 0U); }
+  if (st == HAL_OK) { st = Intan_WriteReg(3U, 0x0080U, 0U, 0U); }
+  if (st == HAL_OK)
+  {
+    HAL_Delay(20);
+    st = intan_impedance_prepare_loop(arg->channel);
+  }
   if (st != HAL_OK)
   {
     result->spi_errors++;
@@ -1925,9 +1975,16 @@ HAL_StatusTypeDef Intan_MeasureImpedanceTimed(const IntanImpedanceTimedArg *arg,
     return st;
   }
 
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-  st = intan_impedance_run_dma_slots(arg, result, sample_count, slot_hz);
+  {
+    int32_t period_sum_s = 0;
+    int32_t period_sum_c = 0;
+
+    intan_impedance_period_sums(arg->samples_per_period, &period_sum_s, &period_sum_c);
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    st = intan_impedance_run_paced_samples(arg, result, sample_count, slot_hz,
+                                           period_sum_s, period_sum_c);
+  }
   if (st != HAL_OK)
   {
     result->spi_errors++;

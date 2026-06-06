@@ -12,7 +12,7 @@ CS high idle -> CS low -> 32-bit word -> CS high
 
 Это относится и к `WRITE Reg3`, и к `CONVERT(channel)`, и к dummy-словам для pipeline. Нельзя отправлять несколько 32-битных команд одним непрерывным SPI block-transfer без гарантированного подъёма CS между словами.
 
-Текущий `IMPEDANCE_MEASURE` использует консервативный DWT-paced path через `intan_xfer32()`, поэтому CS поднимается между каждым 32-битным словом. Это медленнее прежнего TIM/DMA path, но даёт корректную транзакционную модель RHS2116.
+Текущий `IMPEDANCE_MEASURE` использует надёжный paced path: на каждый sample — полные 3-slot `Intan_WriteReg(3)` и `Intan_Convert(channel)` (как в даташите), DWT-ритм по целевой частоте, 20 ms settle после enable Zcheck, flush pipeline тремя `CONVERT` перед серией. CS поднимается между каждым 32-битным словом внутри этих вызовов.
 
 ## USB-команда
 
@@ -25,7 +25,7 @@ IMPEDANCE_MEASURE <channel> <scale_bits> <freq_hz> <samples_per_period> <periods
 - `channel`: канал RHS2116, `0..15`.
 - `scale_bits`: Zcheck capacitor scale: `0` = `0.1 pF`, `1` = `1 pF`, `3` = `10 pF`.
 - `freq_hz`: частота тестового синуса, обычно `100`, `300` или `1000`.
-- `samples_per_period`: число точек синуса на период. Для `1 kHz` с честным CS сейчас используйте `8`.
+- `samples_per_period`: число точек синуса на период. Для **`1 kHz` используйте `16`** (на STM32 с 3-slot SPI надёжнее, чем `8`).
 - `periods`: число периодов усреднения.
 - `flags`: bit0 `phase_safe`, bit1 `restore_regs`.
 
@@ -33,8 +33,10 @@ IMPEDANCE_MEASURE <channel> <scale_bits> <freq_hz> <samples_per_period> <periods
 
 ```bash
 python3 tools/usb_intan_cmd.py INIT_RECORD 610 --no-reset
-python3 tools/usb_intan_cmd.py "IMPEDANCE_MEASURE 0 1 1000 8 128 3" --no-reset
+python3 tools/usb_intan_cmd.py "IMPEDANCE_MEASURE 0 1 1000 16 128 3" --no-reset
 ```
+
+(`samples_per_period=8` на `1 kHz` даёт заниженный Z из‑за budget SPI; для быстрой проверки допустимо, для калибровки — `16`.)
 
 После измерения проверьте safe-state:
 
@@ -61,14 +63,27 @@ OK READ reg=3 value=0x0080
 - включает Zcheck через `Reg2 = (channel << 8) | (1 << 6) | (scale_bits << 3) | 1`;
 - держит `Reg3 = 0x0080` перед стартом.
 
-Во время измерения на каждый sample идут два отдельных SPI frame:
+Перед стартом серии:
+
+- `WRITE Reg2 0x0040` — включение Zcheck DAC power;
+- `WRITE Reg3 0x0080` — нейтраль;
+- `WRITE Reg2` с каналом/scale/enable;
+- `WRITE Reg3 0x0080`;
+- пауза **20 ms** (стабилизация DAC и переключателей);
+- три `CONVERT(channel)` для flush SPI pipeline.
+
+Во время измерения на каждый sample:
 
 ```text
-WRITE Reg3 = sine_value
-CONVERT channel
+WRITE Reg3 = sine_value   (3 SPI slot через Intan_WriteReg)
+~2 us analog settle
+CONVERT channel           (3 SPI slot, ADC через Intan_Convert)
 ```
 
-Ответ `CONVERT` учитывает двухслотовый pipeline RHS2116. STM32 центрирует ADC-код как `adc - 32768` и накапливает:
+Pacing: интервал отсчитывается от завершения `CONVERT` до следующего `WRITE Reg3`.
+Перед серией: `CONVERT H=1`, затем три прогона `WRITE Reg3` + `CONVERT` для синхронизации pipeline.
+
+Ответ ADC — из `Intan_Convert`, без ручной индексации pipeline. STM32 центрирует ADC-код как `adc - 32768` и накапливает zero-mean basis (orthogonal sin/cos для subsampled INTAN_SINE64):
 
 ```text
 sin_accum += centered_adc * sin_basis
@@ -138,7 +153,7 @@ GUI/server считает амплитуду из `sin_accum/cos_accum` чере
 На текущей плате с резистором `10 kOhm` на канале 0 валидный практический режим:
 
 ```bash
-python3 tools/usb_intan_cmd.py "IMPEDANCE_MEASURE 0 1 1000 8 128 3" --no-reset
+python3 tools/usb_intan_cmd.py "IMPEDANCE_MEASURE 0 1 1000 16 128 3" --no-reset
 ```
 
 Наблюдавшийся результат:
@@ -146,19 +161,21 @@ python3 tools/usb_intan_cmd.py "IMPEDANCE_MEASURE 0 1 1000 8 128 3" --no-reset
 ```text
 scale_bits=1
 freq_hz=1000
-samples_per_period=8
+samples_per_period=16
 periods=128
 overruns=0
 spi_errors=0
 clipped=0
-median impedance ~= 9.4 kOhm
+median impedance ~= 8.5 kOhm
 ```
 
 Это достаточно близко к тестовому резистору `10 kOhm` для первичной проверки тракта. Разброс по отдельным запускам возможен, поэтому для GUI лучше считать median по нескольким измерениям.
 
 ## Ограничения текущей реализации
 
-Для `1 kHz` не используйте `64 samples_per_period` в CS-safe path: это требует `128` отдельных SPI frames на период Zcheck, и текущая реализация не успевает. Признак проблемы:
+Каждый sample — 6 SPI slot (WriteReg + Convert). На высоких частотах и большом `samples_per_period` loop может не успевать; признак — `overruns > 0`. Уменьшите `freq_hz` или `samples_per_period`.
+
+Для `1 kHz` не используйте `64 samples_per_period`: loop не успевает. Признак проблемы:
 
 ```text
 overruns > 0
@@ -185,7 +202,7 @@ python3 tools/usb_intan_cmd.py CLEAR_ADC --no-reset
 3. Выполнить серию измерений:
 
 ```bash
-python3 tools/usb_intan_cmd.py "IMPEDANCE_MEASURE 0 1 1000 8 128 3" --no-reset
+python3 tools/usb_intan_cmd.py "IMPEDANCE_MEASURE 0 1 1000 16 128 3" --no-reset
 ```
 
 4. Проверить, что в каждом ответе:
