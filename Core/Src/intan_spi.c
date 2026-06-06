@@ -44,7 +44,6 @@ void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx)
 /* 32 SCK/frame + CS↑≥tCSOFF между слотами; 42 → ~595 kS/s slot. */
 #define INTAN_DMA_TIMSLOT_PERIOD_SCK_CYCLES 42U
 #define INTAN_DMA_TIMSLOT_HIGH_NS 300U
-#define INTAN_ADC_GLITCH_LSB        1200U
 #define INTAN_POLL_PIPE_DELAY_NOPS 16U
 #define INTAN_IMPEDANCE_CS_OFF_NS  100U
 #define INTAN_IMPEDANCE_CS_SETUP_NS 20U
@@ -112,28 +111,6 @@ static inline uint16_t intan_u16_from_convert_word(uint32_t w)
   return (uint16_t)((w >> 16) & 0xFFFFU);
 }
 
-static uint16_t intan_adc_sanitize(uint16_t adc, uint16_t prev)
-{
-  int32_t delta;
-
-  if (adc == 0U)
-  {
-    return prev;
-  }
-  if (adc >= 0xC000U && adc < 0xD000U)
-  {
-    return prev;
-  }
-
-  delta = (int32_t)adc - (int32_t)prev;
-  if (delta > (int32_t)INTAN_ADC_GLITCH_LSB || delta < -(int32_t)INTAN_ADC_GLITCH_LSB)
-  {
-    return prev;
-  }
-
-  return adc;
-}
-
 static inline uint8_t intan_rr_abs_channel(uint8_t first_ch, uint8_t n_ch, uint8_t phase, uint32_t i)
 {
   return (uint8_t)(first_ch + ((phase + i) % (uint32_t)n_ch));
@@ -144,6 +121,20 @@ static void intan_unpack_set_rr_context(uint8_t first_ch, uint8_t n_ch, uint8_t 
   s_unpack_first_ch = first_ch;
   s_unpack_n_ch = n_ch;
   s_unpack_phase = phase;
+}
+
+static uint16_t intan_adc_sanitize_spike_only(uint16_t adc, uint16_t prev)
+{
+  if (adc == 0U)
+  {
+    return prev;
+  }
+  if (adc >= 0xC000U && adc < 0xD000U)
+  {
+    return prev;
+  }
+
+  return adc;
 }
 
 static void intan_unpack_rr_sanitize_block(uint16_t *samples, uint32_t n, uint32_t rx_offset)
@@ -159,7 +150,7 @@ static void intan_unpack_rr_sanitize_block(uint16_t *samples, uint32_t n, uint32
     uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
     uint16_t prev = s_stream_tail_adc_ch[ch];
 
-    adc = intan_adc_sanitize(adc, prev);
+    adc = intan_adc_sanitize_spike_only(adc, prev);
     samples[i] = adc;
     s_stream_tail_adc_ch[ch] = adc;
   }
