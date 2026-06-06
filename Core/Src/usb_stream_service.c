@@ -326,6 +326,7 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
 
   stream_meta = USB_STREAM_META(first_channel, channel_count, flags, channel_bits);
   Intan_SetDmaStreamContinuous(1U);
+  Intan_SetDmaStreamChannelCount(channel_count);
 
   IntanStream_BeginWithMeta(frame_flags, stream_meta);
 }
@@ -423,7 +424,8 @@ static void usb_spi_push_chunk(uint32_t chunk, uint8_t phase0)
   }
   else if (s_spi_rr_channels > 1U)
   {
-    IntanStream_PushBlockTaggedFromAdc(s_spi_buf, chunk, s_spi_rr_first, s_spi_rr_channels, phase0);
+    IntanStream_PushBlockTaggedFromAdc(s_spi_buf, chunk, s_spi_rr_first, s_spi_rr_channels, phase0,
+                                       Intan_GetLastUnpackRxOffset());
   }
   else
   {

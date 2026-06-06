@@ -173,11 +173,7 @@ IMPEDANCE_MEASURE <channel> <scale_bits> <freq_hz> <samples_per_period> <periods
 
 `SPI_STREAM_REAL` не принимает `channel=63`: auto-increment `CONVERT(63)` имеет неоднозначный стартовый канал для host metadata. Для многоканального real stream используйте `SPI_STREAM_RR8_REAL`.
 
-`SPI_STREAM_RR8_REAL` пишет в поток каналы `0..7`, `SPI_STREAM_RR16_REAL` — `0..15`, `SPI_STREAM_RANGE_REAL` — `first..first+count-1` round-robin. Канал для `response[i]` восстанавливается как:
-
-```text
-channel = first_channel + (i % channel_count)
-```
+`SPI_STREAM_RR8_REAL` пишет в поток каналы `0..7`, `SPI_STREAM_RR16_REAL` — `0..15`, `SPI_STREAM_RANGE_REAL` — `first..first+count-1` round-robin. Канал в CHANNEL_TAG: `Intan_PipelineChannelIndex(phase, i, rx_offset, n_ch)` — для multi-channel stream unpack всегда `rx_offset=2`, для одноканального continuous primed sub-chunk — `rx_offset=0`. Host может также восстанавливать как `first_channel + (i % channel_count)` при корректных тегах.
 
 `IMPEDANCE_MEASURE` выполняет Zcheck на STM32 без USB round-trip на каждый sample: сохраняет регистры RHS2116, переводит Zcheck в safe state, затем использует DWT-paced CS-safe path через `Intan_Xfer32Word()`. На один measurement sample идут два отдельных SPI frame (`WRITE Reg3` из `INTAN_SINE64`, затем `CONVERT(channel)`), между каждым 32-битным словом CS обязательно поднимается. Ответ ADC берётся из двухслотового RHS2116 pipeline и накапливается в `sin_accum`/`cos_accum`. `scale_bits`: `0`, `1`, `3`; `flags`: bit0 `phase_safe`, bit1 `restore_regs`. Ответ: `OK IMPEDANCE ... actual_freq_millihz=... sample_count=... sin_accum=... cos_accum=... averages=1 p0_sin=... p0_cos=...`; при активном stream возвращается `ERR busy`. Подробно: [`intan_impedance_guide.md`](intan_impedance_guide.md).
 

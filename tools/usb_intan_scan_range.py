@@ -137,9 +137,15 @@ def main() -> int:
                             print(
                                 f"ERR tag idx={idx} ch={ch} want={want_ch} adc=0x{adc:04X}"
                             )
+                    if ch < args.first or ch >= args.first + args.count:
+                        tag_errors += 1
+                        if tag_errors <= 10:
+                            print(f"ERR tag idx={idx} ch={ch} out of range")
+                    else:
+                        buckets[ch - args.first].append(adc)
                 else:
                     adc = struct.unpack_from("<H", payload, 32 + i * 2)[0]
-                buckets[idx % args.count].append(adc)
+                    buckets[idx % args.count].append(adc)
                 idx += 1
             seq += 1
 

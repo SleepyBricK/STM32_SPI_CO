@@ -2,6 +2,7 @@
 #include "usb_stream_frame.h"
 #include "usb_stream_ring.h"
 #include "usb_stream_service.h"
+#include "intan_spi.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -125,7 +126,7 @@ static void intan_stream_append_samples(const uint16_t *src, uint32_t count, uin
 
 static void intan_stream_append_tagged_from_adc(const uint16_t *adc, uint32_t count,
                                                 uint8_t first_channel, uint8_t channel_count,
-                                                uint8_t phase)
+                                                uint8_t phase, uint32_t rx_offset)
 {
   uint32_t off = 0U;
 
@@ -165,7 +166,8 @@ static void intan_stream_append_tagged_from_adc(const uint16_t *adc, uint32_t co
 
       if (channel_count > 1U)
       {
-        ch = (uint8_t)(first_channel + ((phase + off + i) % (uint32_t)channel_count));
+        ch = (uint8_t)(first_channel +
+                       Intan_PipelineChannelIndex(phase, off + i, rx_offset, channel_count));
       }
 
       dst[s_cur_pos + i] = USB_STREAM_MAKE_TAGGED_WORD(ch, adc[off + i]);
@@ -247,14 +249,14 @@ void IntanStream_PushBlock(const uint16_t *src, uint32_t count)
 }
 
 void IntanStream_PushBlockTaggedFromAdc(const uint16_t *adc, uint32_t count, uint8_t first_channel,
-                                        uint8_t channel_count, uint8_t phase)
+                                        uint8_t channel_count, uint8_t phase, uint32_t rx_offset)
 {
   if (s_active == 0U || adc == NULL || count == 0U)
   {
     return;
   }
 
-  intan_stream_append_tagged_from_adc(adc, count, first_channel, channel_count, phase);
+  intan_stream_append_tagged_from_adc(adc, count, first_channel, channel_count, phase, rx_offset);
 }
 
 uint32_t IntanStream_PeekNextSample(void)

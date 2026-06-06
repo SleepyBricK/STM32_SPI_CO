@@ -49,7 +49,9 @@ void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx)
 #define INTAN_IMPEDANCE_CS_SETUP_NS 20U
 
 static uint8_t s_dma_stream_continuous;
+static uint8_t s_dma_stream_channel_count;
 static uint8_t s_convert_pipeline_primed;
+static uint32_t s_last_unpack_rx_offset;
 static uint8_t s_dma_timslot_armed;
 static uint8_t s_dma_timcs_armed;
 static uint32_t s_dma_saved_midi;
@@ -389,11 +391,17 @@ void Intan_SetDmaStreamContinuous(uint8_t enable)
   }
 }
 
+void Intan_SetDmaStreamChannelCount(uint8_t channel_count)
+{
+  s_dma_stream_channel_count = (channel_count == 0U) ? 1U : channel_count;
+}
+
 void Intan_DmaPathRelease(void)
 {
   uint32_t midi = READ_REG(INTAN_SPI_INSTANCE->CFG2) & SPI_CFG2_MIDI;
 
   s_dma_stream_continuous = 0U;
+  s_dma_stream_channel_count = 1U;
   s_convert_pipeline_primed = 0U;
   s_dma_timslot_armed = 0U;
   s_dma_timcs_armed = 0U;
@@ -404,12 +412,14 @@ void Intan_DmaPathRelease(void)
 /*
  * RHS2116 CONVERT: ответ на команду N приходит в слоте N+2.
  * Холодный старт: n+2 SPI-слота, первые два RX — pipeline fill → rx_offset=2.
- * Continuous chunk (хвост предыдущего DMA): sample 0 уже в RX[0] → rx_offset=0.
+ * Continuous single-channel chunk (хвост предыдущего DMA): sample 0 уже в RX[0] → rx_offset=0.
+ * RR / multi-channel: всегда rx_offset=2 — иначе CHANNEL_TAG смещается на pipeline latency.
  */
 static void intan_pipeline_layout(uint32_t n, uint32_t *chunk_slots, uint32_t *rx_offset)
 {
   *chunk_slots = n + 2U;
-  if (s_dma_stream_continuous != 0U && s_convert_pipeline_primed != 0U)
+  if (s_dma_stream_continuous != 0U && s_convert_pipeline_primed != 0U &&
+      s_dma_stream_channel_count <= 1U)
   {
     *rx_offset = 0U;
   }
@@ -417,6 +427,37 @@ static void intan_pipeline_layout(uint32_t n, uint32_t *chunk_slots, uint32_t *r
   {
     *rx_offset = 2U;
   }
+}
+
+uint32_t Intan_GetLastUnpackRxOffset(void)
+{
+  return s_last_unpack_rx_offset;
+}
+
+uint8_t Intan_PipelineChannelIndex(uint8_t phase, uint32_t sample_index, uint32_t rx_offset,
+                                   uint8_t n_ch)
+{
+  uint32_t ch_idx;
+
+  if (n_ch == 0U)
+  {
+    return 0U;
+  }
+
+  ch_idx = (uint32_t)phase + sample_index + rx_offset;
+  if (rx_offset >= INTAN_CONVERT_PIPELINE_LATENCY)
+  {
+    ch_idx -= INTAN_CONVERT_PIPELINE_LATENCY;
+  }
+  ch_idx += (uint32_t)n_ch * 4U;
+  ch_idx %= (uint32_t)n_ch;
+  return (uint8_t)ch_idx;
+}
+
+static void intan_pipeline_layout_remember(uint32_t n, uint32_t *chunk_slots, uint32_t *rx_offset)
+{
+  intan_pipeline_layout(n, chunk_slots, rx_offset);
+  s_last_unpack_rx_offset = *rx_offset;
 }
 
 static void intan_pipeline_mark_done(void)
@@ -805,7 +846,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
     return HAL_ERROR;
   }
 
-  intan_pipeline_layout(n, &chunk_slots, &rx_offset);
+  intan_pipeline_layout_remember(n, &chunk_slots, &rx_offset);
   if (intan_pipeline_validate_n(n, chunk_slots) != HAL_OK)
   {
     return HAL_ERROR;
@@ -892,7 +933,7 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock(uint32_t n, uint8_t channel,
     return HAL_ERROR;
   }
 
-  intan_pipeline_layout(n, &chunk_slots, &rx_offset);
+  intan_pipeline_layout_remember(n, &chunk_slots, &rx_offset);
   if (intan_pipeline_validate_n(n, chunk_slots) != HAL_OK)
   {
     return HAL_ERROR;
@@ -1014,7 +1055,7 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock_range(uint32_t n, uint8_t fi
     phase = *phase_io;
   }
 
-  intan_pipeline_layout(n, &chunk_slots, &rx_offset);
+  intan_pipeline_layout_remember(n, &chunk_slots, &rx_offset);
   if (intan_pipeline_validate_n(n, chunk_slots) != HAL_OK)
   {
     return HAL_ERROR;
@@ -1182,7 +1223,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsReadRR(uint32_t n, uint8_t n_ch, 
     phase = *phase_io;
   }
 
-  intan_pipeline_layout(n, &chunk_slots, &rx_offset);
+  intan_pipeline_layout_remember(n, &chunk_slots, &rx_offset);
   if (intan_pipeline_validate_n(n, chunk_slots) != HAL_OK)
   {
     return HAL_ERROR;
@@ -1434,7 +1475,7 @@ static HAL_StatusTypeDef intan_stream_dma_start_job(uint8_t is_range, uint32_t n
   s_stream_job.samples = samples;
   s_stream_job.phase_io = phase_io;
 
-  intan_pipeline_layout(n, &s_stream_job.chunk_slots, &s_stream_job.rx_offset);
+  intan_pipeline_layout_remember(n, &s_stream_job.chunk_slots, &s_stream_job.rx_offset);
   if (intan_pipeline_validate_n(n, s_stream_job.chunk_slots) != HAL_OK)
   {
     s_stream_job.active = 0U;
@@ -1833,7 +1874,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineRead(uint32_t n, uint8_t channel, uint8_t
   {
     uint32_t chunk_slots;
     uint32_t rx_offset;
-    intan_pipeline_layout(n, &chunk_slots, &rx_offset);
+    intan_pipeline_layout_remember(n, &chunk_slots, &rx_offset);
     if (intan_pipeline_validate_n(n, chunk_slots) != HAL_OK)
     {
       return HAL_ERROR;
@@ -1895,7 +1936,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineSafeRead(uint32_t n, uint8_t channel, uin
   {
     uint32_t chunk_slots;
     uint32_t rx_offset;
-    intan_pipeline_layout(n, &chunk_slots, &rx_offset);
+    intan_pipeline_layout_remember(n, &chunk_slots, &rx_offset);
     if (intan_pipeline_validate_n(n, chunk_slots) != HAL_OK)
     {
       return HAL_ERROR;
@@ -1948,7 +1989,7 @@ HAL_StatusTypeDef Intan_ConvertPipelineSafeReadRR(uint32_t n, uint8_t n_ch, uint
   {
     uint32_t chunk_slots;
     uint32_t rx_offset;
-    intan_pipeline_layout(n, &chunk_slots, &rx_offset);
+    intan_pipeline_layout_remember(n, &chunk_slots, &rx_offset);
     if (intan_pipeline_validate_n(n, chunk_slots) != HAL_OK)
     {
       return HAL_ERROR;

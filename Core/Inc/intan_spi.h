@@ -38,6 +38,8 @@ static inline uint8_t Intan_HW_IsPresent(void)
 
 #define INTAN_IMPEDANCE_MAX_SAMPLES 128U
 #define INTAN_DMA_CHUNK_SLOTS         8192U
+/** CONVERT: ADC в RX-слоте k относится к TX-слоту k − LATENCY. */
+#define INTAN_CONVERT_PIPELINE_LATENCY 2U
 
 /* Chip Select: выход, idle = high */
 #define INTAN_CS_GPIO_PORT   GPIOE
@@ -148,9 +150,13 @@ HAL_StatusTypeDef Intan_MeasureImpedanceTimed(const IntanImpedanceTimedArg *arg,
 void Intan_DmaPathRelease(void);
 /** Непрерывный USB-stream: pipeline primed после 1-го chunk; TIM/SPI без halt между chunk. */
 void Intan_SetDmaStreamContinuous(uint8_t enable);
+void Intan_SetDmaStreamChannelCount(uint8_t channel_count);
 
 void Intan_SpiStats_Reset(void);
 uint32_t Intan_SpiStats_GetXfer32Count(void);
+uint32_t Intan_GetLastUnpackRxOffset(void);
+uint8_t Intan_PipelineChannelIndex(uint8_t phase, uint32_t sample_index, uint32_t rx_offset,
+                                   uint8_t n_ch);
 void Intan_SpiStats_AddXfer32(uint32_t count);
 
 #ifdef __cplusplus
