@@ -59,6 +59,10 @@ static uint8_t s_dma_timslot_armed;
 static uint8_t s_dma_timcs_armed;
 static uint32_t s_dma_saved_midi;
 static uint16_t s_stream_tail_adc = 0x8000U;
+static uint16_t s_stream_tail_adc_ch[16];
+static uint8_t s_unpack_first_ch;
+static uint8_t s_unpack_n_ch;
+static uint8_t s_unpack_phase;
 
 static uint32_t s_dma_tx_word __attribute__((section(".dma_buffer"), aligned(32)));
 static uint32_t s_dma_tx_words[INTAN_DMA_CHUNK_SLOTS] __attribute__((section(".dma_buffer"), aligned(32)));
@@ -132,6 +136,18 @@ static uint16_t intan_adc_sanitize(uint16_t adc, uint16_t prev)
   return adc;
 }
 
+static inline uint8_t intan_rr_abs_channel(uint8_t first_ch, uint8_t n_ch, uint8_t phase, uint32_t i)
+{
+  return (uint8_t)(first_ch + ((phase + i) % (uint32_t)n_ch));
+}
+
+static void intan_unpack_set_rr_context(uint8_t first_ch, uint8_t n_ch, uint8_t phase)
+{
+  s_unpack_first_ch = first_ch;
+  s_unpack_n_ch = n_ch;
+  s_unpack_phase = phase;
+}
+
 static void intan_stitch_subchunk_edge(uint16_t *samples, uint32_t n)
 {
   uint16_t hold;
@@ -158,23 +174,45 @@ static void intan_stitch_subchunk_edge(uint16_t *samples, uint32_t n)
 
 static void intan_unpack_convert_block(uint16_t *samples, uint32_t n, uint32_t rx_offset)
 {
-  uint16_t prev = s_stream_tail_adc;
   uint32_t i;
 
-  for (i = 0U; i < n; i++)
+  if (s_dma_stream_channel_count > 1U)
   {
-    uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
+    uint8_t first_ch = s_unpack_first_ch;
+    uint8_t n_ch = s_unpack_n_ch;
+    uint8_t phase = s_unpack_phase;
 
-    adc = intan_adc_sanitize(adc, prev);
-    samples[i] = adc;
-    prev = adc;
+    for (i = 0U; i < n; i++)
+    {
+      uint8_t ch = intan_rr_abs_channel(first_ch, n_ch, phase, i);
+      uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
+      uint16_t prev = s_stream_tail_adc_ch[ch];
+
+      adc = intan_adc_sanitize(adc, prev);
+      samples[i] = adc;
+      s_stream_tail_adc_ch[ch] = adc;
+    }
+    return;
   }
 
-  intan_stitch_subchunk_edge(samples, n);
-
-  if (n > 0U)
   {
-    s_stream_tail_adc = samples[n - 1U];
+    uint16_t prev = s_stream_tail_adc;
+
+    for (i = 0U; i < n; i++)
+    {
+      uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
+
+      adc = intan_adc_sanitize(adc, prev);
+      samples[i] = adc;
+      prev = adc;
+    }
+
+    intan_stitch_subchunk_edge(samples, n);
+
+    if (n > 0U)
+    {
+      s_stream_tail_adc = samples[n - 1U];
+    }
   }
 }
 
@@ -479,6 +517,10 @@ void Intan_DmaPathRelease(void)
   s_dma_timslot_armed = 0U;
   s_dma_timcs_armed = 0U;
   s_stream_tail_adc = 0x8000U;
+  for (uint32_t i = 0U; i < 16U; i++)
+  {
+    s_stream_tail_adc_ch[i] = 0x8000U;
+  }
   intan_dma_timcs_recover(midi);
 }
 
@@ -537,7 +579,8 @@ static void intan_apply_chunk_recover(uint16_t *samples, uint32_t n, uint32_t rx
   uint32_t recover;
   uint16_t hold;
 
-  if (apply_recover == 0U || n <= 1U || s_stream_recover_done != 0U)
+  if (apply_recover == 0U || n <= 1U || s_stream_recover_done != 0U ||
+      s_dma_stream_channel_count > 1U)
   {
     return;
   }
@@ -1220,6 +1263,7 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock_range(uint32_t n, uint8_t fi
     Intan_SpiDiag_RecordBlock(cyc_start, DWT->CYCCNT, n, chunk_slots, *period_ticks);
   }
 
+  intan_unpack_set_rr_context(first_ch, n_ch, phase);
   intan_unpack_convert_block(samples, n, rx_offset);
 
   if (apply_recover != 0U && s_convert_pipeline_primed != 0U && n > 1U)
@@ -1493,6 +1537,11 @@ static HAL_StatusTypeDef intan_stream_dma_hw_start(uint32_t chunk_slots, uint8_t
 
 static void intan_stream_dma_unpack(void)
 {
+  if (s_stream_job.is_range != 0U)
+  {
+    intan_unpack_set_rr_context(s_stream_job.first_ch, s_stream_job.n_ch, s_stream_job.rr_phase);
+  }
+
   intan_unpack_convert_block(s_stream_job.samples, s_stream_job.n, s_stream_job.rx_offset);
 
   if (s_stream_job.apply_recover != 0U && s_convert_pipeline_primed != 0U && s_stream_job.n > 1U)

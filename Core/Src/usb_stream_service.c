@@ -415,7 +415,7 @@ static void usb_spi_sanitize_adc_block(uint16_t *samples, uint32_t count)
 
 static void usb_spi_push_chunk(uint32_t chunk, uint8_t phase0)
 {
-  if (s_spi_counter_mode == 0U)
+  if (s_spi_counter_mode == 0U && s_spi_rr_channels <= 1U)
   {
     usb_spi_sanitize_adc_block(s_spi_buf, chunk);
   }
