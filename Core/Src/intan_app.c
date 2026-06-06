@@ -10,6 +10,11 @@
 
 #define INTAN_APP_FAST_ADC_KSPS 610U
 
+#define INTAN_RECORD_REG4  0x0016U
+#define INTAN_RECORD_REG5  0x0017U
+#define INTAN_RECORD_REG6  0x00A8U
+#define INTAN_RECORD_REG7  0x000AU
+
 static void delay_post(void)
 {
   HAL_Delay(1);
@@ -358,25 +363,25 @@ HAL_StatusTypeDef Intan_App_InitRecord(uint16_t adc_ksps)
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(4U, 0x015EU, 0U, 0U);
+  st = Intan_WriteReg(4U, INTAN_RECORD_REG4, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(5U, 0x01ABU, 0U, 0U);
+  st = Intan_WriteReg(5U, INTAN_RECORD_REG5, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(6U, 0x0036U, 0U, 0U);
+  st = Intan_WriteReg(6U, INTAN_RECORD_REG6, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
-  st = Intan_WriteReg(7U, 0x000AU, 0U, 0U);
+  st = Intan_WriteReg(7U, INTAN_RECORD_REG7, 0U, 0U);
   if (st != HAL_OK)
   {
     return st;
@@ -401,12 +406,37 @@ HAL_StatusTypeDef Intan_App_InitRecord(uint16_t adc_ksps)
   }
   delay_post();
 
+  st = Intan_WriteReg(44U, 0x0000U, 0U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  delay_post();
+  st = Intan_WriteReg(46U, 0x0000U, 0U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  delay_post();
+  st = Intan_WriteReg(48U, 0x0000U, 0U, 0U);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+  delay_post();
+
   st = Intan_WriteReg(42U, 0x0000U, 1U, 0U);
   if (st != HAL_OK)
   {
     return st;
   }
   delay_post();
+
+  st = Intan_App_ClearCompliance();
+  if (st != HAL_OK)
+  {
+    return st;
+  }
 
   return HAL_OK;
 }

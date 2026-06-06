@@ -60,9 +60,20 @@ static void intan_stream_finalize_frame(void)
   s_cur_pos = 0U;
 }
 
+static uint32_t intan_stream_max_samples(void)
+{
+  if ((s_frame_flags & USB_STREAM_FLAG_CHANNEL_TAG) != 0U)
+  {
+    return USB_STREAM_FRAME_TAGGED_SAMPLES;
+  }
+
+  return USB_STREAM_FRAME_RESPONSES;
+}
+
 static void intan_stream_append_samples(const uint16_t *src, uint32_t count, uint32_t counter_base)
 {
   uint32_t off = 0U;
+  uint32_t max_samples = intan_stream_max_samples();
 
   while (off < count)
   {
@@ -79,7 +90,7 @@ static void intan_stream_append_samples(const uint16_t *src, uint32_t count, uin
       }
     }
 
-    room = USB_STREAM_FRAME_RESPONSES - s_cur_pos;
+    room = max_samples - s_cur_pos;
     n = count - off;
     if (n > room)
     {
@@ -103,7 +114,68 @@ static void intan_stream_append_samples(const uint16_t *src, uint32_t count, uin
     s_next_sample += n;
     off += n;
 
-    if (s_cur_pos >= USB_STREAM_FRAME_RESPONSES)
+    if (s_cur_pos >= max_samples)
+    {
+      intan_stream_finalize_frame();
+    }
+  }
+
+  UsbStreamService_NoteSamples(count);
+}
+
+static void intan_stream_append_tagged_from_adc(const uint16_t *adc, uint32_t count,
+                                                uint8_t first_channel, uint8_t channel_count,
+                                                uint8_t phase)
+{
+  uint32_t off = 0U;
+
+  if ((s_frame_flags & USB_STREAM_FLAG_CHANNEL_TAG) == 0U || adc == NULL || count == 0U)
+  {
+    return;
+  }
+
+  while (off < count)
+  {
+    uint32_t room;
+    uint32_t n;
+    uint32_t i;
+    uint32_t *dst;
+
+    if (s_cur == NULL)
+    {
+      intan_stream_open_frame();
+      if (s_cur == NULL)
+      {
+        UsbStreamService_NoteUsbOverflow();
+        return;
+      }
+    }
+
+    room = USB_STREAM_FRAME_TAGGED_SAMPLES - s_cur_pos;
+    n = count - off;
+    if (n > room)
+    {
+      n = room;
+    }
+
+    dst = UsbStreamFrame_TaggedPayload(s_cur);
+    for (i = 0U; i < n; i++)
+    {
+      uint8_t ch = first_channel;
+
+      if (channel_count > 1U)
+      {
+        ch = (uint8_t)(first_channel + ((phase + off + i) % (uint32_t)channel_count));
+      }
+
+      dst[s_cur_pos + i] = USB_STREAM_MAKE_TAGGED_WORD(ch, adc[off + i]);
+    }
+
+    s_cur_pos += n;
+    s_next_sample += n;
+    off += n;
+
+    if (s_cur_pos >= USB_STREAM_FRAME_TAGGED_SAMPLES)
     {
       intan_stream_finalize_frame();
     }
@@ -172,6 +244,17 @@ void IntanStream_PushBlock(const uint16_t *src, uint32_t count)
   }
 
   intan_stream_append_samples(src, count, 0U);
+}
+
+void IntanStream_PushBlockTaggedFromAdc(const uint16_t *adc, uint32_t count, uint8_t first_channel,
+                                        uint8_t channel_count, uint8_t phase)
+{
+  if (s_active == 0U || adc == NULL || count == 0U)
+  {
+    return;
+  }
+
+  intan_stream_append_tagged_from_adc(adc, count, first_channel, channel_count, phase);
 }
 
 uint32_t IntanStream_PeekNextSample(void)

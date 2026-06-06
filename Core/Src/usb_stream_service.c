@@ -16,7 +16,7 @@
 #define SPI_STREAM_CHUNK_MAX  (INTAN_DMA_CHUNK_SLOTS - 2U)
 #define SPI_STREAM_SAFE_CHUNK_MAX  128U
 #define SPI_CHUNKS_PER_TICK   8U
-#define INTAN_RECORD_STREAM_ADC_KSPS 610U
+#define INTAN_RECORD_STREAM_ADC_KSPS INTAN_APP_RECORD_ADC_KSPS
 #define SPI_REAL_PATH_DMA_TIMCS       0U
 #define SPI_REAL_PATH_SAFE_POLLING    1U
 #define SPI_REAL_PATH_FAST_POLLING    2U
@@ -252,6 +252,8 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
   uint16_t frame_flags = 0U;
   uint8_t first_channel = channel;
   uint8_t channel_count = 1U;
+  uint8_t channel_bits = 0U;
+  uint32_t stream_meta;
 
   usb_stream_reset_all();
   memset(&s_stats, 0, sizeof(s_stats));
@@ -290,12 +292,22 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
     channel_count = 16U;
   }
 
-  IntanStream_BeginWithMeta(frame_flags, USB_STREAM_META(first_channel, channel_count, flags));
+  if (counter_mode == 0U && channel_count > 1U)
+  {
+    frame_flags |= USB_STREAM_FLAG_CHANNEL_TAG;
+    channel_bits = UsbStream_ChannelBitsForCount(channel_count);
+  }
+
+  stream_meta = USB_STREAM_META(first_channel, channel_count, flags, channel_bits);
+  Intan_SetDmaStreamContinuous(1U);
+
+  IntanStream_BeginWithMeta(frame_flags, stream_meta);
 }
 
 static uint8_t usb_spi_run_one_chunk(void)
 {
   uint32_t chunk;
+  uint8_t phase0;
   HAL_StatusTypeDef st;
 
   if (s_spi_remaining == 0U)
@@ -312,6 +324,8 @@ static uint8_t usb_spi_run_one_chunk(void)
   {
     chunk = SPI_STREAM_SAFE_CHUNK_MAX;
   }
+
+  phase0 = s_spi_rr_phase;
   if (s_spi_rr_channels != 0U)
   {
     if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
@@ -365,6 +379,10 @@ static uint8_t usb_spi_run_one_chunk(void)
   if (s_spi_counter_mode != 0U)
   {
     IntanStream_PushCounterBlock(IntanStream_PeekNextSample(), chunk);
+  }
+  else if (s_spi_rr_channels > 1U)
+  {
+    IntanStream_PushBlockTaggedFromAdc(s_spi_buf, chunk, s_spi_rr_first, s_spi_rr_channels, phase0);
   }
   else
   {
