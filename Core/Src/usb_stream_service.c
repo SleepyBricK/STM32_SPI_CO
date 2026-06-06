@@ -51,6 +51,13 @@ static uint8_t s_tx_active;
 
 static void usb_stream_on_frame_tx_complete(uint32_t len);
 static void usb_stream_tx_pump(void);
+static void usb_spi_idle_hook(void *ctx);
+
+static void usb_spi_idle_hook(void *ctx)
+{
+  (void)ctx;
+  usb_stream_tx_pump();
+}
 static void usb_reply_text(const char *text);
 static void usb_stream_reset_all(void);
 static void usb_spi_stream_process(void);
@@ -1407,6 +1414,7 @@ void UsbStreamService_Init(void)
   memset(&s_stats, 0, sizeof(s_stats));
   Intan_SpiDiag_Init();
   usb_stream_reset_all();
+  Intan_SetIdleHook(usb_spi_idle_hook, NULL);
   USBD_VENDOR_BULK_SetTxCompleteCallback(usb_stream_on_frame_tx_complete);
 }
 
