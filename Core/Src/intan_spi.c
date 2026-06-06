@@ -397,18 +397,17 @@ void Intan_DmaPathRelease(void)
   intan_dma_timcs_recover(midi);
 }
 
+/*
+ * RHS2116 CONVERT: ответ на команду N приходит в слоте N+2.
+ * Всегда n+2 SPI-слота и rx_offset=2, иначе RR8 после 1-го chunk даёт чужой канал
+ * (одноканальный stream с тем же CONVERT cmd это маскирует).
+ */
 static void intan_pipeline_layout(uint32_t n, uint32_t *chunk_slots, uint32_t *rx_offset)
 {
-  if (s_dma_stream_continuous != 0U && s_convert_pipeline_primed != 0U)
-  {
-    *chunk_slots = n;
-    *rx_offset = 0U;
-  }
-  else
-  {
-    *chunk_slots = n + 2U;
-    *rx_offset = 2U;
-  }
+  (void)s_dma_stream_continuous;
+  (void)s_convert_pipeline_primed;
+  *chunk_slots = n + 2U;
+  *rx_offset = 2U;
 }
 
 static void intan_pipeline_mark_done(void)
