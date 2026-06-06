@@ -45,7 +45,6 @@ void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx)
 #define INTAN_DMA_TIMSLOT_PERIOD_SCK_CYCLES 42U
 #define INTAN_DMA_TIMSLOT_HIGH_NS 300U
 #define INTAN_ADC_GLITCH_LSB        1200U
-#define INTAN_SUBCHUNK_STITCH_HOLD    20U
 #define INTAN_POLL_PIPE_DELAY_NOPS 16U
 #define INTAN_IMPEDANCE_CS_OFF_NS  100U
 #define INTAN_IMPEDANCE_CS_SETUP_NS 20U
@@ -53,7 +52,6 @@ void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx)
 static uint8_t s_dma_stream_continuous;
 static uint8_t s_dma_stream_channel_count;
 static uint8_t s_convert_pipeline_primed;
-static uint8_t s_stream_recover_done;
 static uint32_t s_last_unpack_rx_offset;
 static uint8_t s_dma_timslot_armed;
 static uint8_t s_dma_timcs_armed;
@@ -148,71 +146,22 @@ static void intan_unpack_set_rr_context(uint8_t first_ch, uint8_t n_ch, uint8_t 
   s_unpack_phase = phase;
 }
 
-static void intan_stitch_subchunk_edge(uint16_t *samples, uint32_t n)
+static void intan_unpack_rr_sanitize_block(uint16_t *samples, uint32_t n, uint32_t rx_offset)
 {
-  uint16_t hold;
-  uint32_t hold_end;
-
-  if (s_dma_stream_continuous == 0U || s_convert_pipeline_primed == 0U || n == 0U ||
-      s_dma_stream_channel_count > 1U)
-  {
-    return;
-  }
-
-  hold = s_stream_tail_adc;
-  samples[0U] = hold;
-  hold_end = INTAN_SUBCHUNK_STITCH_HOLD;
-  if (hold_end >= n)
-  {
-    hold_end = n - 1U;
-  }
-  for (uint32_t i = 1U; i <= hold_end; i++)
-  {
-    samples[i] = hold;
-  }
-}
-
-static void intan_unpack_convert_block(uint16_t *samples, uint32_t n, uint32_t rx_offset)
-{
+  uint8_t first_ch = s_unpack_first_ch;
+  uint8_t n_ch = s_unpack_n_ch;
+  uint8_t phase = s_unpack_phase;
   uint32_t i;
 
-  if (s_dma_stream_channel_count > 1U)
+  for (i = 0U; i < n; i++)
   {
-    uint8_t first_ch = s_unpack_first_ch;
-    uint8_t n_ch = s_unpack_n_ch;
-    uint8_t phase = s_unpack_phase;
+    uint8_t ch = intan_rr_abs_channel(first_ch, n_ch, phase, i);
+    uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
+    uint16_t prev = s_stream_tail_adc_ch[ch];
 
-    for (i = 0U; i < n; i++)
-    {
-      uint8_t ch = intan_rr_abs_channel(first_ch, n_ch, phase, i);
-      uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
-      uint16_t prev = s_stream_tail_adc_ch[ch];
-
-      adc = intan_adc_sanitize(adc, prev);
-      samples[i] = adc;
-      s_stream_tail_adc_ch[ch] = adc;
-    }
-    return;
-  }
-
-  {
-    uint16_t prev = s_stream_tail_adc;
-
-    for (i = 0U; i < n; i++)
-    {
-      uint16_t adc = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
-
-      adc = intan_adc_sanitize(adc, prev);
-      samples[i] = adc;
-      prev = adc;
-    }
-
-    intan_stitch_subchunk_edge(samples, n);
-
-    if (n > 0U)
-    {
-      s_stream_tail_adc = samples[n - 1U];
-    }
+    adc = intan_adc_sanitize(adc, prev);
+    samples[i] = adc;
+    s_stream_tail_adc_ch[ch] = adc;
   }
 }
 
@@ -497,7 +446,6 @@ void Intan_SetDmaStreamContinuous(uint8_t enable)
   if (enable == 0U)
   {
     s_convert_pipeline_primed = 0U;
-    s_stream_recover_done = 0U;
   }
 }
 
@@ -513,7 +461,6 @@ void Intan_DmaPathRelease(void)
   s_dma_stream_continuous = 0U;
   s_dma_stream_channel_count = 1U;
   s_convert_pipeline_primed = 0U;
-  s_stream_recover_done = 0U;
   s_dma_timslot_armed = 0U;
   s_dma_timcs_armed = 0U;
   s_stream_tail_adc = 0x8000U;
@@ -525,21 +472,23 @@ void Intan_DmaPathRelease(void)
 }
 
 /*
- * Всегда rx_offset=2 (pipeline latency). rx_offset=0 на continuous sub-chunk давал
- * мусор на +1..8; settle-discard ломал длинный stream на rearm DMA.
+ * RHS2116 CONVERT: ответ на команду N приходит в слоте N+2.
+ * Холодный старт: n+2 SPI-слота, первые два RX — pipeline fill → rx_offset=2.
+ * Continuous single-channel chunk (хвост предыдущего DMA): sample 0 уже в RX[0] → rx_offset=0.
+ * RR / multi-channel: всегда rx_offset=2 — иначе CHANNEL_TAG смещается на pipeline latency.
  */
 static void intan_pipeline_layout(uint32_t n, uint32_t *chunk_slots, uint32_t *rx_offset)
 {
-  (void)s_dma_stream_continuous;
-  (void)s_convert_pipeline_primed;
-  (void)s_dma_stream_channel_count;
-  *rx_offset = INTAN_CONVERT_PIPELINE_LATENCY;
-  *chunk_slots = n + INTAN_CONVERT_PIPELINE_LATENCY;
-}
-
-uint32_t Intan_DmaSubchunkMax(void)
-{
-  return INTAN_DMA_SUBCHUNK_MAX;
+  *chunk_slots = n + 2U;
+  if (s_dma_stream_continuous != 0U && s_convert_pipeline_primed != 0U &&
+      s_dma_stream_channel_count <= 1U)
+  {
+    *rx_offset = 0U;
+  }
+  else
+  {
+    *rx_offset = 2U;
+  }
 }
 
 uint32_t Intan_GetLastUnpackRxOffset(void)
@@ -571,37 +520,6 @@ static void intan_pipeline_layout_remember(uint32_t n, uint32_t *chunk_slots, ui
 {
   intan_pipeline_layout(n, chunk_slots, rx_offset);
   s_last_unpack_rx_offset = *rx_offset;
-}
-
-static void intan_apply_chunk_recover(uint16_t *samples, uint32_t n, uint32_t rx_offset,
-                                      uint8_t apply_recover)
-{
-  uint32_t recover;
-  uint16_t hold;
-
-  if (apply_recover == 0U || n <= 1U || s_stream_recover_done != 0U ||
-      s_dma_stream_channel_count > 1U)
-  {
-    return;
-  }
-
-  /* rx_offset=0: continuous sub-chunk — recover на каждом 8190 давал провал на +20. */
-  if (rx_offset < INTAN_CONVERT_PIPELINE_LATENCY)
-  {
-    return;
-  }
-
-  recover = INTAN_CHUNK_RECOVER_SAMPLES;
-  hold = samples[0U];
-  if (recover > n)
-  {
-    recover = n;
-  }
-  for (uint32_t i = 1U; i < recover; i++)
-  {
-    samples[i] = hold;
-  }
-  s_stream_recover_done = 1U;
 }
 
 static void intan_pipeline_mark_done(void)
@@ -636,29 +554,6 @@ static void intan_dma_block_halt(void)
   INTAN_SPI_INSTANCE->IFCR = SPI_IFCR_EOTC | SPI_IFCR_TXTFC | SPI_IFCR_UDRC | SPI_IFCR_OVRC |
                              SPI_IFCR_MODFC | SPI_IFCR_SUSPC;
   /* Continuous stream: keep SPE — re-disabling breaks RHS2116 CONVERT pipeline after halt. */
-}
-
-static uint8_t intan_timslot_tim_continue(void)
-{
-  return (s_dma_stream_continuous != 0U && s_convert_pipeline_primed != 0U &&
-          ((TIM1->CR1 & TIM_CR1_CEN) != 0U)) ? 1U : 0U;
-}
-
-static void intan_timslot_tim_start(uint8_t tim_continue)
-{
-  if (tim_continue != 0U)
-  {
-    TIM1->DIER = TIM_DIER_UDE;
-    TIM1->CCER |= TIM_CCER_CC2E;
-    TIM1->CR1 |= TIM_CR1_CEN;
-    return;
-  }
-
-  TIM1->CNT = 0U;
-  TIM1->SR = 0U;
-  TIM1->CCER |= TIM_CCER_CC2E;
-  TIM1->DIER = TIM_DIER_UDE;
-  TIM1->CR1 |= TIM_CR1_CEN;
 }
 
 static void intan_dma_finish_read(uint32_t old_midi, uint8_t tim_path_armed, uint8_t halt_after)
@@ -1146,12 +1041,15 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock(uint32_t n, uint8_t channel,
   DMA1_Stream1->CR |= DMA_SxCR_EN;
 
   INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_SPE;
-  {
-    uint8_t tim_continue = intan_timslot_tim_continue();
-    uint32_t cyc_start = DWT->CYCCNT;
+  INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
 
-    intan_timslot_tim_start(tim_continue);
-    INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
+  {
+    uint32_t cyc_start = DWT->CYCCNT;
+    TIM1->CNT = 0U;
+    TIM1->SR = 0U;
+    TIM1->CCER |= TIM_CCER_CC2E;
+    TIM1->DIER = TIM_DIER_UDE;
+    TIM1->CR1 |= TIM_CR1_CEN;
 
     if (intan_wait_reg_flag_guard(&INTAN_SPI_INSTANCE->SR, SPI_SR_EOT) != HAL_OK ||
         intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream0_done) != HAL_OK ||
@@ -1166,11 +1064,29 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock(uint32_t n, uint8_t channel,
     Intan_SpiDiag_RecordBlock(cyc_start, DWT->CYCCNT, n, chunk_slots, *period_ticks);
   }
 
-  intan_unpack_convert_block(samples, n, rx_offset);
+  for (uint32_t i = 0U; i < n; i++)
+  {
+    samples[i] = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
+  }
 
   if (apply_recover != 0U && s_convert_pipeline_primed != 0U && n > 1U)
   {
-    intan_apply_chunk_recover(samples, n, rx_offset, apply_recover);
+    uint32_t recover = INTAN_CHUNK_RECOVER_SAMPLES;
+    uint16_t hold = samples[0U];
+
+    if (recover > n)
+    {
+      recover = n;
+    }
+    for (uint32_t i = 1U; i < recover; i++)
+    {
+      samples[i] = hold;
+    }
+  }
+
+  if (n > 0U)
+  {
+    s_stream_tail_adc = samples[n - 1U];
   }
 
   Intan_SpiStats_AddXfer32(chunk_slots);
@@ -1243,12 +1159,15 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock_range(uint32_t n, uint8_t fi
   DMA1_Stream1->CR |= DMA_SxCR_EN;
 
   INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_SPE;
-  {
-    uint8_t tim_continue = intan_timslot_tim_continue();
-    uint32_t cyc_start = DWT->CYCCNT;
+  INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
 
-    intan_timslot_tim_start(tim_continue);
-    INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
+  {
+    uint32_t cyc_start = DWT->CYCCNT;
+    TIM1->CNT = 0U;
+    TIM1->SR = 0U;
+    TIM1->CCER |= TIM_CCER_CC2E;
+    TIM1->DIER = TIM_DIER_UDE;
+    TIM1->CR1 |= TIM_CR1_CEN;
 
     if (intan_wait_reg_flag_guard(&INTAN_SPI_INSTANCE->SR, SPI_SR_EOT) != HAL_OK ||
         intan_wait_reg_flag_guard(&DMA1->LISR, dma_stream0_done) != HAL_OK ||
@@ -1263,12 +1182,42 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock_range(uint32_t n, uint8_t fi
     Intan_SpiDiag_RecordBlock(cyc_start, DWT->CYCCNT, n, chunk_slots, *period_ticks);
   }
 
-  intan_unpack_set_rr_context(first_ch, n_ch, phase);
-  intan_unpack_convert_block(samples, n, rx_offset);
-
-  if (apply_recover != 0U && s_convert_pipeline_primed != 0U && n > 1U)
+  if (s_dma_stream_channel_count > 1U)
   {
-    intan_apply_chunk_recover(samples, n, rx_offset, apply_recover);
+    intan_unpack_set_rr_context(first_ch, n_ch, phase);
+    intan_unpack_rr_sanitize_block(samples, n, rx_offset);
+  }
+  else
+  {
+    for (uint32_t i = 0U; i < n; i++)
+    {
+      if ((s_idle_hook != NULL) && ((i & 0x0FU) == 0U))
+      {
+        s_idle_hook(s_idle_ctx);
+      }
+      samples[i] = intan_u16_from_convert_word(s_dma_rx_words[i + rx_offset]);
+    }
+  }
+
+  if (apply_recover != 0U && s_convert_pipeline_primed != 0U && n > 1U &&
+      s_dma_stream_channel_count <= 1U)
+  {
+    uint32_t recover = INTAN_CHUNK_RECOVER_SAMPLES;
+    uint16_t hold = samples[0U];
+
+    if (recover > n)
+    {
+      recover = n;
+    }
+    for (uint32_t i = 1U; i < recover; i++)
+    {
+      samples[i] = hold;
+    }
+  }
+
+  if (n > 0U && s_dma_stream_channel_count <= 1U)
+  {
+    s_stream_tail_adc = samples[n - 1U];
   }
 
   if (phase_io != NULL)
@@ -1514,7 +1463,7 @@ static uint8_t intan_stream_dma_hw_done(void)
   return 1U;
 }
 
-static HAL_StatusTypeDef intan_stream_dma_hw_start(uint32_t chunk_slots, uint8_t tim_continue)
+static HAL_StatusTypeDef intan_stream_dma_hw_start(uint32_t chunk_slots)
 {
   INTAN_SPI_INSTANCE->CFG2 &= ~SPI_CFG2_COMM;
   MODIFY_REG(INTAN_SPI_INSTANCE->CFG2, SPI_CFG2_MIDI, INTAN_DMA_TIMCS_SPI_MIDI);
@@ -1529,25 +1478,54 @@ static HAL_StatusTypeDef intan_stream_dma_hw_start(uint32_t chunk_slots, uint8_t
   DMA1_Stream1->CR |= DMA_SxCR_EN;
 
   INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_SPE;
-  intan_timslot_tim_start(tim_continue);
   INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
+
+  TIM1->CNT = 0U;
+  TIM1->SR = 0U;
+  TIM1->CCER |= TIM_CCER_CC2E;
+  TIM1->DIER = TIM_DIER_UDE;
+  TIM1->CR1 |= TIM_CR1_CEN;
   s_stream_job.cyc_start = DWT->CYCCNT;
   return HAL_OK;
 }
 
 static void intan_stream_dma_unpack(void)
 {
-  if (s_stream_job.is_range != 0U)
+  uint32_t i;
+  uint16_t *samples = s_stream_job.samples;
+
+  if (s_stream_job.is_range != 0U && s_dma_stream_channel_count > 1U)
   {
     intan_unpack_set_rr_context(s_stream_job.first_ch, s_stream_job.n_ch, s_stream_job.rr_phase);
+    intan_unpack_rr_sanitize_block(samples, s_stream_job.n, s_stream_job.rx_offset);
+  }
+  else
+  {
+    for (i = 0U; i < s_stream_job.n; i++)
+    {
+      samples[i] = intan_u16_from_convert_word(s_dma_rx_words[i + s_stream_job.rx_offset]);
+    }
   }
 
-  intan_unpack_convert_block(s_stream_job.samples, s_stream_job.n, s_stream_job.rx_offset);
-
-  if (s_stream_job.apply_recover != 0U && s_convert_pipeline_primed != 0U && s_stream_job.n > 1U)
+  if (s_stream_job.apply_recover != 0U && s_convert_pipeline_primed != 0U && s_stream_job.n > 1U &&
+      s_dma_stream_channel_count <= 1U)
   {
-    intan_apply_chunk_recover(s_stream_job.samples, s_stream_job.n, s_stream_job.rx_offset,
-                              s_stream_job.apply_recover);
+    uint32_t recover = INTAN_CHUNK_RECOVER_SAMPLES;
+    uint16_t hold = samples[0U];
+
+    if (recover > s_stream_job.n)
+    {
+      recover = s_stream_job.n;
+    }
+    for (i = 1U; i < recover; i++)
+    {
+      samples[i] = hold;
+    }
+  }
+
+  if (s_stream_job.n > 0U && s_dma_stream_channel_count <= 1U)
+  {
+    s_stream_tail_adc = samples[s_stream_job.n - 1U];
   }
 
   if (s_stream_job.is_range != 0U && s_stream_job.phase_io != NULL)
@@ -1629,7 +1607,7 @@ static HAL_StatusTypeDef intan_stream_dma_start_job(uint8_t is_range, uint32_t n
     return HAL_TIMEOUT;
   }
 
-  return intan_stream_dma_hw_start(s_stream_job.chunk_slots, intan_timslot_tim_continue());
+  return intan_stream_dma_hw_start(s_stream_job.chunk_slots);
 }
 
 void Intan_StreamDmaReset(void)

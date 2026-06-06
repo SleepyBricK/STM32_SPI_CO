@@ -401,15 +401,13 @@ static HAL_StatusTypeDef usb_spi_run_chunk_dma(uint32_t chunk, uint8_t phase0)
 static void usb_spi_sanitize_adc_block(uint16_t *samples, uint32_t count)
 {
   uint32_t i;
-  uint16_t prev = 0x8000U;
 
   for (i = 0U; i < count; i++)
   {
-    if (samples[i] == 0U || (samples[i] >= 0xC000U && samples[i] < 0xD000U))
+    if (samples[i] >= 0xC000U && samples[i] < 0xD000U)
     {
-      samples[i] = (i > 0U) ? samples[i - 1U] : prev;
+      samples[i] = (i > 0U) ? samples[i - 1U] : 0x8000U;
     }
-    prev = samples[i];
   }
 }
 
