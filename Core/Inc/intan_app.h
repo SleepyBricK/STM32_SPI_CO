@@ -16,7 +16,7 @@ extern "C" {
 
 void Intan_App_DWT_Reset(void);
 
-/** ksps для Reg0 при SPI stream (≈ фактическая wall rate TIM-slot path). */
+/** ksps для Reg0 при SPI stream (bias для ≤350 kS/s — стабильнее на текущей плате). */
 #define INTAN_APP_RECORD_ADC_KSPS 350U
 
 HAL_StatusTypeDef Intan_App_InitStim(void);

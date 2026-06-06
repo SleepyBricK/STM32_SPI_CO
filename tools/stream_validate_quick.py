@@ -66,8 +66,8 @@ def check_ch4(codes: list[int], elapsed: float, stats: str) -> None:
         raise SystemExit(f"FAIL: ch4 boundary dip {dip_max:.1f} uV")
     if np.std(uv) > 80.0:
         raise SystemExit(f"FAIL: ch4 std {np.std(uv):.1f} uV > 80")
-    if ksps < 300.0:
-        raise SystemExit(f"FAIL: ch4 USB rate {ksps:.1f} kS/s < 300")
+    if ksps < 330.0:
+        raise SystemExit(f"FAIL: ch4 USB rate {ksps:.1f} kS/s < 330")
 
 
 def check_rr8(codes: list[int], elapsed: float, stats: str) -> None:
