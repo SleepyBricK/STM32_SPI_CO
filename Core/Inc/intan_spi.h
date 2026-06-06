@@ -112,6 +112,23 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotReadRR(uint32_t n, uint8_t n_ch
 HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotReadRange(uint32_t n, uint8_t first_ch, uint8_t n_ch,
                                                            uint8_t flags, uint16_t *samples,
                                                            uint8_t *phase_io);
+
+/** Non-blocking TIM-slot stream DMA (USB stream path). */
+typedef enum {
+  INTAN_STREAM_DMA_IDLE = 0,
+  INTAN_STREAM_DMA_RUNNING,
+  INTAN_STREAM_DMA_DONE,
+  INTAN_STREAM_DMA_ERROR,
+} IntanStreamDmaState;
+
+void Intan_StreamDmaReset(void);
+HAL_StatusTypeDef Intan_StreamDmaStartSingle(uint32_t n, uint8_t channel, uint8_t flags,
+                                             uint16_t *samples);
+HAL_StatusTypeDef Intan_StreamDmaStartRange(uint32_t n, uint8_t first_ch, uint8_t n_ch, uint8_t flags,
+                                            uint16_t *samples, uint8_t *phase_io);
+IntanStreamDmaState Intan_StreamDmaPoll(void);
+HAL_StatusTypeDef Intan_StreamDmaComplete(uint8_t halt_after);
+
 /** Conservative round-robin polling path; *phase_io updated for next block. */
 HAL_StatusTypeDef Intan_ConvertPipelineSafeReadRR(uint32_t n, uint8_t n_ch, uint8_t flags,
                                                   uint16_t *samples, uint8_t *phase_io);

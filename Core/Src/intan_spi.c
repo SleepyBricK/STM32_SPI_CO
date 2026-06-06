@@ -1307,6 +1307,244 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimSlotReadRange(uint32_t n, uint8_t f
   return HAL_OK;
 }
 
+typedef struct {
+  uint8_t active;
+  uint8_t is_range;
+  uint8_t channel;
+  uint8_t first_ch;
+  uint8_t n_ch;
+  uint8_t flags;
+  uint8_t apply_recover;
+  uint8_t rr_phase;
+  uint32_t n;
+  uint32_t rx_offset;
+  uint32_t chunk_slots;
+  uint32_t cyc_start;
+  uint16_t *samples;
+  uint8_t *phase_io;
+} IntanStreamDmaJob;
+
+static IntanStreamDmaJob s_stream_job;
+static uint8_t s_stream_tim_ready;
+static uint32_t s_stream_period_ticks;
+static uint32_t s_stream_low_ticks;
+static uint32_t s_stream_old_midi;
+
+static uint8_t intan_stream_dma_hw_done(void)
+{
+  const uint32_t dma_stream0_done = DMA_LISR_TCIF0;
+  const uint32_t dma_stream1_done = DMA_LISR_TCIF1;
+
+  if ((INTAN_SPI_INSTANCE->SR & SPI_SR_EOT) == 0U)
+  {
+    return 0U;
+  }
+  if ((DMA1->LISR & dma_stream0_done) == 0U)
+  {
+    return 0U;
+  }
+  if ((DMA1->LISR & dma_stream1_done) == 0U)
+  {
+    return 0U;
+  }
+  return 1U;
+}
+
+static HAL_StatusTypeDef intan_stream_dma_hw_start(uint32_t chunk_slots)
+{
+  INTAN_SPI_INSTANCE->CFG2 &= ~SPI_CFG2_COMM;
+  MODIFY_REG(INTAN_SPI_INSTANCE->CFG2, SPI_CFG2_MIDI, INTAN_DMA_TIMCS_SPI_MIDI);
+  INTAN_SPI_INSTANCE->IER = 0U;
+  INTAN_SPI_INSTANCE->IFCR = SPI_IFCR_EOTC | SPI_IFCR_TXTFC | SPI_IFCR_UDRC | SPI_IFCR_OVRC |
+                             SPI_IFCR_MODFC | SPI_IFCR_SUSPC;
+  INTAN_SPI_INSTANCE->CR2 = chunk_slots;
+  INTAN_SPI_INSTANCE->CFG1 &= ~SPI_CFG1_TXDMAEN;
+  INTAN_SPI_INSTANCE->CFG1 |= SPI_CFG1_RXDMAEN;
+
+  DMA1_Stream0->CR |= DMA_SxCR_EN;
+  DMA1_Stream1->CR |= DMA_SxCR_EN;
+
+  INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_SPE;
+  INTAN_SPI_INSTANCE->CR1 |= SPI_CR1_CSTART;
+
+  TIM1->CNT = 0U;
+  TIM1->SR = 0U;
+  TIM1->CCER |= TIM_CCER_CC2E;
+  TIM1->DIER = TIM_DIER_UDE;
+  TIM1->CR1 |= TIM_CR1_CEN;
+  s_stream_job.cyc_start = DWT->CYCCNT;
+  return HAL_OK;
+}
+
+static void intan_stream_dma_unpack(void)
+{
+  uint32_t i;
+  uint16_t *samples = s_stream_job.samples;
+
+  for (i = 0U; i < s_stream_job.n; i++)
+  {
+    samples[i] = intan_u16_from_convert_word(s_dma_rx_words[i + s_stream_job.rx_offset]);
+  }
+
+  if (s_stream_job.apply_recover != 0U && s_convert_pipeline_primed != 0U && s_stream_job.n > 1U)
+  {
+    uint32_t recover = INTAN_CHUNK_RECOVER_SAMPLES;
+    uint16_t hold = samples[0U];
+
+    if (recover > s_stream_job.n)
+    {
+      recover = s_stream_job.n;
+    }
+    for (i = 1U; i < recover; i++)
+    {
+      samples[i] = hold;
+    }
+  }
+
+  if (s_stream_job.n > 0U)
+  {
+    s_stream_tail_adc = samples[s_stream_job.n - 1U];
+  }
+
+  if (s_stream_job.is_range != 0U && s_stream_job.phase_io != NULL)
+  {
+    *s_stream_job.phase_io =
+        (uint8_t)((s_stream_job.rr_phase + s_stream_job.n) % (uint32_t)s_stream_job.n_ch);
+  }
+}
+
+static HAL_StatusTypeDef intan_stream_dma_start_job(uint8_t is_range, uint32_t n, uint8_t channel,
+                                                    uint8_t first_ch, uint8_t n_ch, uint8_t flags,
+                                                    uint16_t *samples, uint8_t *phase_io)
+{
+  if (!g_intan_spi_ready || samples == NULL || n == 0U || s_stream_job.active != 0U)
+  {
+    return (s_stream_job.active != 0U) ? HAL_BUSY : HAL_ERROR;
+  }
+
+  s_stream_job.active = 1U;
+  s_stream_job.is_range = is_range;
+  s_stream_job.channel = channel;
+  s_stream_job.first_ch = first_ch;
+  s_stream_job.n_ch = n_ch;
+  s_stream_job.flags = flags;
+  s_stream_job.apply_recover = s_convert_pipeline_primed;
+  s_stream_job.n = n;
+  s_stream_job.samples = samples;
+  s_stream_job.phase_io = phase_io;
+
+  intan_pipeline_layout(n, &s_stream_job.chunk_slots, &s_stream_job.rx_offset);
+  if (intan_pipeline_validate_n(n, s_stream_job.chunk_slots) != HAL_OK)
+  {
+    s_stream_job.active = 0U;
+    return HAL_ERROR;
+  }
+
+  if (is_range != 0U)
+  {
+    if (n_ch == 0U || first_ch >= INTAN_STREAM_RR16_CHANNELS || (first_ch + n_ch) > INTAN_STREAM_RR16_CHANNELS)
+    {
+      s_stream_job.active = 0U;
+      return HAL_ERROR;
+    }
+    s_stream_job.rr_phase = (phase_io != NULL) ? *phase_io : 0U;
+    intan_fill_rr_range_tx_words(n, first_ch, n_ch, flags, s_stream_job.rr_phase, 1U);
+  }
+  else
+  {
+    uint32_t cmd = intan_convert_cmd_word(channel, flags);
+    for (uint32_t i = 0U; i < s_stream_job.chunk_slots; i++)
+    {
+      s_dma_tx_words[i] = cmd;
+    }
+  }
+
+  if (s_stream_tim_ready == 0U)
+  {
+    if (intan_dma_compute_tim_ticks(INTAN_DMA_TIMSLOT_PERIOD_SCK_CYCLES, INTAN_DMA_TIMSLOT_HIGH_NS,
+                                    &s_stream_period_ticks, &s_stream_low_ticks) != HAL_OK)
+    {
+      intan_cs_gpio_mode();
+      s_stream_job.active = 0U;
+      return HAL_ERROR;
+    }
+    if (intan_dma_timslot_ensure_armed(s_stream_period_ticks, s_stream_low_ticks, &s_stream_old_midi) !=
+        HAL_OK)
+    {
+      intan_dma_timcs_recover(s_stream_old_midi);
+      s_stream_job.active = 0U;
+      return HAL_ERROR;
+    }
+    s_stream_tim_ready = 1U;
+  }
+
+  if (intan_dma_prepare_streams_ex(s_dma_tx_words, s_stream_job.chunk_slots, 1U, DMA_REQUEST_TIM1_UP) !=
+      HAL_OK)
+  {
+    s_stream_job.active = 0U;
+    return HAL_TIMEOUT;
+  }
+
+  return intan_stream_dma_hw_start(s_stream_job.chunk_slots);
+}
+
+void Intan_StreamDmaReset(void)
+{
+  if (s_stream_job.active != 0U)
+  {
+    intan_dma_finish_read(s_stream_old_midi, s_dma_timslot_armed, 1U);
+  }
+  memset(&s_stream_job, 0, sizeof(s_stream_job));
+  s_stream_tim_ready = 0U;
+}
+
+HAL_StatusTypeDef Intan_StreamDmaStartSingle(uint32_t n, uint8_t channel, uint8_t flags,
+                                             uint16_t *samples)
+{
+  return intan_stream_dma_start_job(0U, n, channel, 0U, 0U, flags, samples, NULL);
+}
+
+HAL_StatusTypeDef Intan_StreamDmaStartRange(uint32_t n, uint8_t first_ch, uint8_t n_ch, uint8_t flags,
+                                          uint16_t *samples, uint8_t *phase_io)
+{
+  return intan_stream_dma_start_job(1U, n, 0U, first_ch, n_ch, flags, samples, phase_io);
+}
+
+IntanStreamDmaState Intan_StreamDmaPoll(void)
+{
+  if (s_stream_job.active == 0U)
+  {
+    return INTAN_STREAM_DMA_IDLE;
+  }
+
+  if (intan_stream_dma_hw_done() == 0U)
+  {
+    if (s_idle_hook != NULL)
+    {
+      s_idle_hook(s_idle_ctx);
+    }
+    return INTAN_STREAM_DMA_RUNNING;
+  }
+
+  return INTAN_STREAM_DMA_DONE;
+}
+
+HAL_StatusTypeDef Intan_StreamDmaComplete(uint8_t halt_after)
+{
+  if (s_stream_job.active == 0U)
+  {
+    return HAL_ERROR;
+  }
+
+  Intan_SpiDiag_RecordBlock(s_stream_job.cyc_start, DWT->CYCCNT, s_stream_job.n,
+                            s_stream_job.chunk_slots, s_stream_period_ticks);
+  intan_stream_dma_unpack();
+  Intan_SpiStats_AddXfer32(s_stream_job.chunk_slots);
+  intan_dma_finish_read(s_stream_old_midi, s_dma_timslot_armed, halt_after);
+  s_stream_job.active = 0U;
+  return HAL_OK;
+}
+
 static HAL_StatusTypeDef intan_xfer32_repeat_timcs(uint32_t tx_word, uint32_t n, uint32_t target_ksps,
                                                    uint32_t *last_rx_out)
 {

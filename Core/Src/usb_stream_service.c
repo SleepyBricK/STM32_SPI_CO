@@ -23,6 +23,11 @@
 #define SPI_REAL_PATH_FAST_POLLING    2U
 #define SPI_REAL_PATH_DMA_TIMSLOT     3U
 
+typedef enum {
+  USB_SPI_ASYNC_IDLE = 0,
+  USB_SPI_ASYNC_SUB_DMA,
+} UsbSpiAsyncPhase;
+
 static UsbStreamStats s_stats;
 static uint8_t s_cmd_rx[USB_CMD_RX_MAX];
 static char s_reply[USB_REPLY_MAX];
@@ -43,6 +48,12 @@ static uint8_t s_spi_rr_channels;
 static uint8_t s_spi_rr_phase;
 static uint8_t s_spi_safe_polling;
 
+static UsbSpiAsyncPhase s_spi_async;
+static uint32_t s_async_chunk;
+static uint32_t s_async_sub_off;
+static uint32_t s_async_sub_n;
+static uint8_t s_async_phase0;
+
 static uint16_t s_spi_buf[SPI_STREAM_AGG_MAX]
     __attribute__((section(".dma_buffer"), aligned(32)));
 
@@ -62,6 +73,7 @@ static void usb_reply_text(const char *text);
 static void usb_stream_reset_all(void);
 static void usb_spi_stream_process(void);
 static uint8_t usb_spi_run_one_chunk(void);
+static void usb_spi_async_service(void);
 static void usb_cmd_spi_rate(uint32_t n, uint8_t channel, uint8_t flags);
 static void usb_cmd_spi_rate_fast(uint32_t n, uint8_t channel, uint8_t flags);
 static void usb_cmd_spi_to_ram(uint32_t n, uint8_t channel, uint8_t flags);
@@ -247,10 +259,16 @@ static void usb_stream_reset_all(void)
   s_spi_rr_channels = 0U;
   s_spi_rr_phase = 0U;
   s_spi_safe_polling = SPI_REAL_PATH_DMA_TIMCS;
+  s_spi_async = USB_SPI_ASYNC_IDLE;
+  s_async_chunk = 0U;
+  s_async_sub_off = 0U;
+  s_async_sub_n = 0U;
+  s_async_phase0 = 0U;
   s_tx_active = 0U;
   s_tx_frame = NULL;
   IntanStream_Reset();
   UsbStreamRing_Reset();
+  Intan_StreamDmaReset();
   Intan_DmaPathRelease();
 }
 
@@ -413,6 +431,158 @@ static void usb_spi_push_chunk(uint32_t chunk, uint8_t phase0)
   }
 }
 
+static void usb_spi_stream_end(void)
+{
+  s_spi_async = USB_SPI_ASYNC_IDLE;
+  s_async_chunk = 0U;
+  s_async_sub_off = 0U;
+  s_async_sub_n = 0U;
+  s_spi_active = 0U;
+  IntanStream_End();
+  Intan_StreamDmaReset();
+  Intan_DmaPathRelease();
+}
+
+static HAL_StatusTypeDef usb_spi_async_start_sub(void)
+{
+  uint32_t sub_n;
+  HAL_StatusTypeDef st;
+
+  sub_n = s_async_chunk - s_async_sub_off;
+  if (sub_n > SPI_STREAM_CHUNK_MAX)
+  {
+    sub_n = SPI_STREAM_CHUNK_MAX;
+  }
+  s_async_sub_n = sub_n;
+
+  if (s_spi_rr_channels != 0U)
+  {
+    st = Intan_StreamDmaStartRange(sub_n, s_spi_rr_first, s_spi_rr_channels, s_spi_flags,
+                                   &s_spi_buf[s_async_sub_off], &s_spi_rr_phase);
+  }
+  else
+  {
+    st = Intan_StreamDmaStartSingle(sub_n, s_spi_channel, s_spi_flags, &s_spi_buf[s_async_sub_off]);
+  }
+
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+
+  s_spi_async = USB_SPI_ASYNC_SUB_DMA;
+  return HAL_OK;
+}
+
+static void usb_spi_async_begin_chunk(void)
+{
+  if (usb_spi_acquire_chunk(&s_async_chunk) != HAL_OK)
+  {
+    usb_spi_stream_end();
+    return;
+  }
+
+  s_async_sub_off = 0U;
+  s_async_phase0 = s_spi_rr_phase;
+
+  if (usb_spi_async_start_sub() != HAL_OK)
+  {
+    s_stats.spi_overflow_count += s_async_chunk;
+    usb_spi_stream_end();
+  }
+}
+
+static void usb_spi_async_finish_sub(void)
+{
+  uint8_t halt_after;
+
+  halt_after = ((s_async_sub_off + s_async_sub_n) >= s_async_chunk) ? 1U : 0U;
+  if (Intan_StreamDmaComplete(halt_after) != HAL_OK)
+  {
+    s_stats.spi_overflow_count += (s_async_chunk - s_async_sub_off);
+    usb_spi_stream_end();
+    return;
+  }
+
+  s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
+  s_async_sub_off += s_async_sub_n;
+
+  if (s_async_sub_off < s_async_chunk)
+  {
+    if (usb_spi_async_start_sub() != HAL_OK)
+    {
+      s_stats.spi_overflow_count += (s_async_chunk - s_async_sub_off);
+      usb_spi_stream_end();
+    }
+    return;
+  }
+
+  usb_spi_push_chunk(s_async_chunk, s_async_phase0);
+  s_spi_remaining -= s_async_chunk;
+  s_spi_async = USB_SPI_ASYNC_IDLE;
+
+  if (s_spi_remaining == 0U)
+  {
+    usb_spi_stream_end();
+  }
+}
+
+static void usb_spi_async_service(void)
+{
+  uint32_t n;
+
+  for (n = 0U; n < SPI_CHUNKS_PER_TICK; n++)
+  {
+    if (s_spi_active == 0U)
+    {
+      break;
+    }
+
+    if (UsbStreamRing_FreeCount() < 2U)
+    {
+      break;
+    }
+
+    if (s_spi_async == USB_SPI_ASYNC_SUB_DMA)
+    {
+      IntanStreamDmaState dma_st;
+
+      do
+      {
+        dma_st = Intan_StreamDmaPoll();
+      } while (dma_st == INTAN_STREAM_DMA_RUNNING);
+
+      if (dma_st == INTAN_STREAM_DMA_DONE)
+      {
+        usb_spi_async_finish_sub();
+        if (s_spi_active == 0U)
+        {
+          break;
+        }
+        continue;
+      }
+
+      s_stats.spi_overflow_count += (s_async_chunk - s_async_sub_off);
+      usb_spi_stream_end();
+      break;
+    }
+
+    if (s_spi_async == USB_SPI_ASYNC_IDLE)
+    {
+      usb_spi_async_begin_chunk();
+    }
+    else
+    {
+      break;
+    }
+
+    if (s_spi_usb_pump != 0U)
+    {
+      UsbStreamService_TxPump();
+    }
+  }
+}
+
 static uint8_t usb_spi_run_one_chunk(void)
 {
   uint32_t chunk;
@@ -457,9 +627,17 @@ static void usb_spi_stream_process(void)
   if (Intan_SPI_IsReady() == 0U)
   {
     s_stats.spi_overflow_count += s_spi_remaining;
-    s_spi_active = 0U;
-    IntanStream_End();
-    Intan_DmaPathRelease();
+    usb_spi_stream_end();
+    return;
+  }
+
+  if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
+  {
+    usb_spi_async_service();
+    if (s_spi_usb_pump != 0U)
+    {
+      UsbStreamService_TxPump();
+    }
     return;
   }
 
