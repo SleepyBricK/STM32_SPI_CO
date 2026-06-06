@@ -155,6 +155,7 @@ void Intan_SetDmaStreamChannelCount(uint8_t channel_count);
 void Intan_SpiStats_Reset(void);
 uint32_t Intan_SpiStats_GetXfer32Count(void);
 uint32_t Intan_GetLastUnpackRxOffset(void);
+uint32_t Intan_DmaSubchunkMax(void);
 uint8_t Intan_PipelineChannelIndex(uint8_t phase, uint32_t sample_index, uint32_t rx_offset,
                                    uint8_t n_ch);
 void Intan_SpiStats_AddXfer32(uint32_t count);
