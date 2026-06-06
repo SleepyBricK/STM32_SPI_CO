@@ -14,6 +14,7 @@
 #define USB_CMD_RX_MAX        256U
 #define USB_REPLY_MAX         512U
 #define SPI_STREAM_CHUNK_MAX  (INTAN_DMA_CHUNK_SLOTS - 2U)
+#define SPI_STREAM_AGG_MAX    ((SPI_STREAM_CHUNK_MAX) * 2U)
 #define SPI_STREAM_SAFE_CHUNK_MAX  128U
 #define SPI_CHUNKS_PER_TICK   8U
 #define INTAN_RECORD_STREAM_ADC_KSPS INTAN_APP_RECORD_ADC_KSPS
@@ -42,7 +43,7 @@ static uint8_t s_spi_rr_channels;
 static uint8_t s_spi_rr_phase;
 static uint8_t s_spi_safe_polling;
 
-static uint16_t s_spi_buf[SPI_STREAM_CHUNK_MAX]
+static uint16_t s_spi_buf[SPI_STREAM_AGG_MAX]
     __attribute__((section(".dma_buffer"), aligned(32)));
 
 static UsbStreamFrame *s_tx_frame;
@@ -304,19 +305,24 @@ static void usb_spi_stream_start(uint32_t n, uint8_t channel, uint8_t flags, uin
   IntanStream_BeginWithMeta(frame_flags, stream_meta);
 }
 
-static uint8_t usb_spi_run_one_chunk(void)
+static HAL_StatusTypeDef usb_spi_acquire_chunk(uint32_t *chunk_out)
 {
   uint32_t chunk;
-  uint8_t phase0;
-  HAL_StatusTypeDef st;
 
   if (s_spi_remaining == 0U)
   {
-    return 0U;
+    return HAL_ERROR;
   }
 
   chunk = s_spi_remaining;
-  if (chunk > SPI_STREAM_CHUNK_MAX)
+  if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
+  {
+    if (chunk > SPI_STREAM_AGG_MAX)
+    {
+      chunk = SPI_STREAM_AGG_MAX;
+    }
+  }
+  else if (chunk > SPI_STREAM_CHUNK_MAX)
   {
     chunk = SPI_STREAM_CHUNK_MAX;
   }
@@ -325,55 +331,65 @@ static uint8_t usb_spi_run_one_chunk(void)
     chunk = SPI_STREAM_SAFE_CHUNK_MAX;
   }
 
-  phase0 = s_spi_rr_phase;
+  *chunk_out = chunk;
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef usb_spi_run_chunk_dma(uint32_t chunk, uint8_t phase0)
+{
   if (s_spi_rr_channels != 0U)
   {
     if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
     {
-      st = Intan_ConvertPipelineDmaTimSlotReadRange(chunk, s_spi_rr_first, s_spi_rr_channels,
-                                                    s_spi_flags, s_spi_buf, &s_spi_rr_phase);
+      return Intan_ConvertPipelineDmaTimSlotReadRange(chunk, s_spi_rr_first, s_spi_rr_channels,
+                                                      s_spi_flags, s_spi_buf, &s_spi_rr_phase);
     }
-    else if ((s_spi_safe_polling != SPI_REAL_PATH_DMA_TIMCS) && (s_spi_rr_first == 0U))
+    if ((s_spi_safe_polling != SPI_REAL_PATH_DMA_TIMCS) && (s_spi_rr_first == 0U))
     {
-      st = Intan_ConvertPipelineSafeReadRR(chunk, s_spi_rr_channels, s_spi_flags,
-                                           s_spi_buf, &s_spi_rr_phase);
+      return Intan_ConvertPipelineSafeReadRR(chunk, s_spi_rr_channels, s_spi_flags,
+                                             s_spi_buf, &s_spi_rr_phase);
     }
-    else if (s_spi_rr_first == 0U)
+    if (s_spi_rr_first == 0U)
     {
-      st = Intan_ConvertPipelineDmaTimCsReadRR(chunk, s_spi_rr_channels, s_spi_flags,
+      return Intan_ConvertPipelineDmaTimCsReadRR(chunk, s_spi_rr_channels, s_spi_flags,
                                                s_spi_buf, &s_spi_rr_phase);
     }
-    else
-    {
-      st = HAL_ERROR;
-    }
+    return HAL_ERROR;
   }
-  else
-  {
-    if (s_spi_safe_polling == SPI_REAL_PATH_SAFE_POLLING)
-    {
-      st = Intan_ConvertPipelineSafeRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
-    }
-    else if (s_spi_safe_polling == SPI_REAL_PATH_FAST_POLLING)
-    {
-      st = Intan_ConvertPipelineRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
-    }
-    else if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
-    {
-      st = Intan_ConvertPipelineDmaTimSlotRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
-    }
-    else
-    {
-      st = Intan_ConvertPipelineDmaTimCsRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
-    }
-  }
-  s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
 
-  if (st != HAL_OK)
+  if (s_spi_safe_polling == SPI_REAL_PATH_SAFE_POLLING)
   {
-    s_stats.spi_overflow_count += chunk;
-    s_spi_remaining = 0U;
-    return 0U;
+    return Intan_ConvertPipelineSafeRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+  }
+  if (s_spi_safe_polling == SPI_REAL_PATH_FAST_POLLING)
+  {
+    return Intan_ConvertPipelineRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+  }
+  if (s_spi_safe_polling == SPI_REAL_PATH_DMA_TIMSLOT)
+  {
+    return Intan_ConvertPipelineDmaTimSlotRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+  }
+  return Intan_ConvertPipelineDmaTimCsRead(chunk, s_spi_channel, s_spi_flags, s_spi_buf);
+}
+
+static void usb_spi_sanitize_adc_block(uint16_t *samples, uint32_t count)
+{
+  uint32_t i;
+
+  for (i = 0U; i < count; i++)
+  {
+    if (samples[i] >= 0xC000U && samples[i] < 0xD000U)
+    {
+      samples[i] = (i > 0U) ? samples[i - 1U] : 0x8000U;
+    }
+  }
+}
+
+static void usb_spi_push_chunk(uint32_t chunk, uint8_t phase0)
+{
+  if (s_spi_counter_mode == 0U)
+  {
+    usb_spi_sanitize_adc_block(s_spi_buf, chunk);
   }
 
   if (s_spi_counter_mode != 0U)
@@ -388,7 +404,31 @@ static uint8_t usb_spi_run_one_chunk(void)
   {
     IntanStream_PushBlock(s_spi_buf, chunk);
   }
+}
 
+static uint8_t usb_spi_run_one_chunk(void)
+{
+  uint32_t chunk;
+  uint8_t phase0;
+  HAL_StatusTypeDef st;
+
+  if (usb_spi_acquire_chunk(&chunk) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  phase0 = s_spi_rr_phase;
+  st = usb_spi_run_chunk_dma(chunk, phase0);
+  s_stats.spi_xfer32_count = Intan_SpiStats_GetXfer32Count();
+
+  if (st != HAL_OK)
+  {
+    s_stats.spi_overflow_count += chunk;
+    s_spi_remaining = 0U;
+    return 0U;
+  }
+
+  usb_spi_push_chunk(chunk, phase0);
   s_spi_remaining -= chunk;
   return (s_spi_remaining > 0U) ? 1U : 0U;
 }

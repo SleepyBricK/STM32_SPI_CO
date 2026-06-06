@@ -129,7 +129,7 @@ HAL_StatusTypeDef Intan_MeasureImpedanceTimed(const IntanImpedanceTimedArg *arg,
                                               IntanImpedanceTimedResult *result);
 /** Останов TIM+DMA+SPI (CS в GPIO) — между STREAM и текстовыми SPI-командами. */
 void Intan_DmaPathRelease(void);
-/** Непрерывный USB-stream: pipeline +2 только на первом chunk, TIM не сбрасывать между chunk. */
+/** Непрерывный USB-stream: pipeline primed после 1-го chunk; TIM/SPI без halt между chunk. */
 void Intan_SetDmaStreamContinuous(uint8_t enable);
 
 void Intan_SpiStats_Reset(void);
