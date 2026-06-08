@@ -21,16 +21,17 @@
 | Макрос CMSIS/HAL | `STM32H743xx` |
 | Стартап | `startup_stm32h743xx.s` |
 | Линкер | `STM32H743XX_FLASH.ld` |
-| Питание ядра в коде | `PWR_LDO_SUPPLY`, **`PWR_REGULATOR_VOLTAGE_SCALE2`** (как WorkingVER) |
+| Питание ядра в коде | **480 MHz**: VOS0 (`BOARD_SYSCLK_480=1`, дефолт). **240 MHz**: VSCALE2 (legacy) |
 
 ### Такты (см. `SystemClock_Config` в `Core/Src/main.c`)
 
 - HSE **8 MHz** (PH0/PH1). **LSE 32.768 kHz** (PC14/PC15) — **опционально**, только для RTC (`BOARD_HAS_LSE`).
 - **В `SystemClock_Config` включается только HSE** (не LSE). LSE не должен блокировать UART при старте.
-- PLL1 (как WorkingVER): HSE / 4 × 240 / 2 → **SYSCLK = 240 MHz**; AHB = **120 MHz** (`RCC_HCLK_DIV2`).
-- PLL2 (отдельно, для SPI2): HSE / 2 × 100 / 2 → **PLL2P = 200 MHz**.
+- **Дефолт (`BOARD_SYSCLK_480=ON`)**: PLL1 HSE / 4 × 480 / 2 → **SYSCLK = 480 MHz** (VOS0); AHB = **240 MHz** (`RCC_HCLK_DIV2`).
+- **Legacy (`BOARD_SYSCLK_480=OFF`)**: PLL1 HSE / 4 × 240 / 2 → **SYSCLK = 240 MHz** (VSCALE2); AHB = **120 MHz**.
+- PLL2 (отдельно, для SPI2): HSE / 2 × 100 / 2 → **PLL2P = 200 MHz** — **без изменений** в обоих режимах.
 
-> **`BOARD_SYSCLK_480=ON`**: VOS0 / 480 MHz только для bench SPI; раньше VSCALE0 давал проблемы с UART — не использовать как дефолт.
+> Проверка на плате: `python3 tools/usb_intan_cmd.py STATS --no-reset` → **`sysclk_mhz=480`** (ожидаемый дефолт).
 
 ### Выводы периферии (из `WeActSTM32H743.ioc` + код)
 
@@ -42,8 +43,28 @@
 
 Файлы: `Core/Inc/intan_spi.h`, `Core/Src/intan_spi.c`, `Core/Src/intan_spi4_hw.c`.
 
-- **CS**: **PE11**, активный низкий.
-- Протокол: три CS-транзакции на READ/WRITE/CONVERT; упаковка `(b0<<24)|(b1<<16)|(b2<<8)|b3`.
+- **CS**: **PE11**, активный низкий (программный, SPI NSS не используется).
+- Упаковка кадра: `(b0<<24)|(b1<<16)|(b2<<8)|b3`.
+
+#### Инвариант SPI: CS↑ между каждой командой
+
+**Каждый** 32-битный кадр RHS2116 — **отдельная CS-транзакция**: `CS↓ → transfer 32 bit → CS↑`. Между любыми двумя кадрами линия CS **обязана** подниматься (даташит: tCSOFF ≥ ~100 ns; в `intan_xfer32()` — пауза ~500 ns перед следующим CS↓).
+
+| Путь | CS-циклов на одну логическую операцию |
+|------|----------------------------------------|
+| `Intan_WriteReg` / `READ` / `CONVERT` | **3** (cmd + pipeline + result) |
+| `PATTERN_ADD_RAW` | **1** на слот |
+| `PATTERN_ADD_WRITE` / `READ` / `CONVERT` | **3** на слот (не один CS на всю тройку) |
+| `SPI_STREAM_*_SLOT` (TIM1 + DMA) | **1** на каждое 32-bit слово в burst |
+| `IMPEDANCE_MEASURE` | **1** на каждый `WRITE Reg3` и каждый `CONVERT` |
+
+**Запрещено** (ломает ADC pipeline, triggered-регистры и стим на осцилле):
+
+- держать CS низким на несколько 32-bit слов подряд;
+- «группировать» WRITE/ON/OFF в один SPI burst без CS↑;
+- ускорять `PATTERN_RUN` через TIM/DMA/grouped CS вместо послотового `Intan_Xfer32Word()`.
+
+Эталон реализации: `Intan_Xfer32Word()` → `intan_xfer32()` в `intan_spi.c`. Stim-паттерны: `intan_stim_pattern_guide.md` (`PATTERN_ADD_RAW` для R42/R44 toggle).
 
 Сборка **без запаянного Intan** (по умолчанию): **`INTAN_HW_PRESENT=0`** — пропуск `MX_SPI2_Init` и bringup; приём команд UART по-прежнему работает без вывода.
 
@@ -69,21 +90,21 @@ cmake --build build
 |-------|--------------|------------|
 | `WITH_INTAN_HW` | **OFF** | Intan RHS2116 на SPI2 (`INTAN_HW_PRESENT=1`) |
 | `BOARD_HAS_LSE` | **OFF** | 32.768 kHz на PC14/PC15, RTC через LSE |
-| `BOARD_SYSCLK_480` | **OFF** | Эксперимент: **480 MHz** SYSCLK (VOS0) для SPI bench; SPI kernel без изменений |
+| `BOARD_SYSCLK_480` | **ON** | **480 MHz** SYSCLK (VOS0), основной режим; SPI kernel без изменений |
+| | OFF | Legacy **240 MHz** (VSCALE2, как WorkingVER) |
 
-Пример **480 MHz bench** (отдельный каталог `build480/`):
+Сборка с Intan (типичная):
 
 ```bash
-./tools/build480.sh
-# или:
-cmake -S . -B build480 -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake \
-  -DWITH_INTAN_HW=ON -DBOARD_SYSCLK_480=ON
-cmake --build build480
-STM32_Programmer_CLI ... -w build480/WeActSTM32H743.elf ...
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake \
+  -DWITH_INTAN_HW=ON
+cmake --build build
 python3 tools/usb_intan_cmd.py STATS --no-reset   # sysclk_mhz=480
 ```
 
-> Важно: `-DBOARD_SYSCLK_480=ON` нужен **при cmake configure**. Пересборка в старом `build/` без этого флага остаётся на **240 MHz** (`sysclk_mhz=240` в STATS).
+Каталог `build480/` — то же самое (скрипт `./tools/build480.sh`), если нужен отдельный tree.
+
+> После смены `BOARD_SYSCLK_480` нужен **reconfigure** (`cmake -S . -B build ...`). Старый cache без флага мог остаться на 240 MHz (`sysclk_mhz=240` в STATS).
 
 - ELF: `build/WeActSTM32H743.elf`
 - Прошивка: `STM32_Programmer_CLI -c port=SWD freq=400 ap=0 reset=HWrst -w build/WeActSTM32H743.elf -v -rst`
@@ -123,7 +144,7 @@ python3 tools/usb_intan_cmd.py STATS --no-reset   # sysclk_mhz=480
 - **USB V2**: producer-consumer — `SPI/DMA → frame ring (.dma_buffer) → USB bulk IN`; SPI **не ждёт** USB; при переполнении ring — `usb_overflow_count`, без блокировок в acquisition path.
 - **Проверки host**: `python3 tools/usb_intan_cmd.py PING`; `python3 tools/usb_frame_bench.py -n 50000 --no-reset --runs 5`; длинный: `-n 5000000 --runs 3`. HS: `lsusb -t` → **480M**.
 - **Интеграция SPI (порядок)**: (1) длинный USB-only bench; (2) SPI-only ~713 kS/s; (3) `SPI_STREAM` — TIM+DMA + счётчик в RHS1; (4) `SPI_STREAM_REAL` — реальный RESPONSE.
-- **STATS / SPI bench**: `cyc_samp` / `ksps_cyc_x10` — **целевой TIM-slot** (DMA CEN→EOT), не wall-clock. **`wall_cyc` / `wall_ksps_x10`** — фактический DWT over full command (setup + SPI + unpack). При 240 MHz: **713 kS/s ≈ wall_cyc 336**, **562 kS/s ≈ 427**, **495 kS/s ≈ 485**. `sck_khz=25000` — норма.
+- **STATS / SPI bench**: `cyc_samp` / `ksps_cyc_x10` — **целевой TIM-slot** (DMA CEN→EOT), не wall-clock. **`wall_cyc` / `wall_ksps_x10`** — фактический DWT over full command (setup + SPI + unpack). При **480 MHz** (дефолт): те же **µs**, но `wall_cyc` ≈ **2×** относительно 240 MHz. Ориентиры 240 MHz: **713 kS/s ≈ wall_cyc 336**. `sck_khz=25000` — норма.
 - **USB SPI команды**: stream/bench — `SPI_STREAM_REAL`, `SPI_STREAM_REAL_SLOT`, `SPI_STREAM_REAL_FAST`, `SPI_STREAM_REAL_LEGACY`, `SPI_STREAM_RR8_REAL`, `SPI_STREAM_RR8_REAL_SLOT`, `SPI_STREAM_RR16_REAL`, `SPI_STREAM_RANGE_REAL`, `SPI_STREAM_RANGE_REAL_SLOT`, `SPI_RATE_RR8`, … Host: `python3 tools/usb_spi_rr8_bench.py`, range scan: `python3 tools/usb_intan_scan_range.py --first 0 --count 16`. `SPI_STREAM_REAL`, `SPI_STREAM_RR8_REAL`, `SPI_STREAM_RR16_REAL` и `SPI_STREAM_RANGE_REAL` используют slot-DMA (`TIM1_CH2` CS на PE11 + `TIM1_UP` TX DMA + `SPI2_RX` DMA): **CS↑ между каждым 32-bit словом**, period **42 SCK cycles**, CS-high **300 ns**, `INIT_RECORD` Reg0 **350 kS/s**; перед стартом — `CONVERT H=1`. `SPI_STREAM_REAL_FAST` — регистровый polling, `SPI_STREAM_REAL_LEGACY` — старый свободно бегущий TIM+DMA CS path.
 - **USB Intan (V1 текст, EP OUT/IN как PING)**: `ID`, `READ reg`, `WRITE reg val [u m]`, `INIT_RECORD [ksps]`, `INIT_STIM`, `CLEAR_ADC`, `CLEAR_COMP`, `CONVERT ch [flags]`, `IMPEDANCE_MEASURE ch scale_bits freq_hz samples_per_period periods flags`, `PATTERN_*`. Перед обычными SPI-командами — `usb_stream_reset_all()` (как STOP); `IMPEDANCE_MEASURE` вместо этого возвращает `ERR busy`, если stream активен. Ответы: `OK ID chip=…`, `OK READ reg=…`, `OK IMPEDANCE ... sin_accum=... cos_accum=... actual_freq_millihz=... averages=1 p0_sin=... p0_cos=...`, `ERR …`. `IMPEDANCE_MEASURE` делает Zcheck на STM32: safe state `Reg2/3/42/44/46/48`, optional `phase_safe` для `Reg1`, paced path через полные 3-slot `Intan_WriteReg(3)` + `Intan_Convert(ch)` на sample, 20 ms settle после enable Zcheck, flush pipeline, zero-mean sin/cos accumulators; затем `Reg2=0`, `Reg3=0x0080`, optional restore regs. Для 10 kΩ ch0: `IMPEDANCE_MEASURE 0 1 1000 16 128 3`, `overruns=0`; подробности в `intan_impedance_guide.md`. `PATTERN_RUN` для стимуляции оставлять старым послотовым path через `Intan_Xfer32Word()`; каждый SPI slot — отдельная транзакция `CS↓ word CS↑` с закрытием SPI transfer. Попытки ускорять generic pattern группировкой SPI-слотов (TIM/DMA или fast CS-pulse block) ломали видимый стим-сигнал. Для точных стим-фаз лучше делать специализированный `STIM_PULSE`/`STIM_PATTERN`, а не собирать всё из generic pattern. Stimulator (`msu-neuro-terminal-linux`) — тот же формат, что UART CLI V1.
 

@@ -80,8 +80,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 option(WITH_INTAN_HW "Intan RHS2116 soldered on SPI2" OFF)
 # User: 32.768 kHz LSE on PC14/PC15. OFF if crystal not populated.
 option(BOARD_HAS_LSE "Board has 32.768 kHz LSE on PC14/PC15" OFF)
-# User: 480 MHz SYSCLK bench (VOS0). Default 240 MHz VSCALE2.
-option(BOARD_SYSCLK_480 "Experimental 480 MHz SYSCLK for SPI bench" OFF)
+# User: 480 MHz SYSCLK (VOS0) — основной режим проекта. 240 MHz — legacy (WorkingVER).
+option(BOARD_SYSCLK_480 "480 MHz SYSCLK (VOS0); OFF = 240 MHz VSCALE2" ON)
 if(BOARD_SYSCLK_480)
     message(STATUS "WeActSTM32H743: SYSCLK 480 MHz (VOS0 overdrive)")
 else()

@@ -290,6 +290,15 @@ HAL_StatusTypeDef Intan_Pattern_Run(uint32_t repeat_count)
     }
   }
 
+  /* Full 3-slot WRITE R42=0 U=1 — raw OFF в паттерне иногда не гасит выход. */
+  st = Intan_WriteReg(42U, 0x0000U, 1U, 0U);
+  if (st != HAL_OK)
+  {
+    s_status.running = 0U;
+    s_status.last_error = 7U;
+    return st;
+  }
+
   s_status.running = 0U;
   return HAL_OK;
 }

@@ -40,7 +40,7 @@ cmake --build build
 |---|---:|---|
 | `WITH_INTAN_HW` | `OFF` | Включить SPI2/RHS2116 bringup и реальные Intan-команды |
 | `BOARD_HAS_LSE` | `OFF` | Использовать LSE 32.768 kHz для RTC |
-| `BOARD_SYSCLK_480` | `OFF` | Экспериментальный SYSCLK 480 MHz, обычно достаточно 240 MHz |
+| `BOARD_SYSCLK_480` | `ON` | SYSCLK **480 MHz** (VOS0, дефолт); `OFF` → 240 MHz legacy |
 
 ELF: `build/WeActSTM32H743.elf`.
 

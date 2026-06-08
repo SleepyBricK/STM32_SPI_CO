@@ -1,4 +1,5 @@
 #!/bin/sh
+# Отдельный build tree (480 MHz + Intan). То же, что дефолтный build/ после cmake reconfigure.
 set -e
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 cmake -S "$ROOT" -B "$ROOT/build480" \
