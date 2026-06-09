@@ -24,6 +24,7 @@
 | `intan_tcp_server.py` | TCP‑сервер для команд стимуляции (из GUI) |
 | `intan_udp_recorder.py` | UDP‑сервер для потоковой регистрации ADC |
 | `stimulate_channel0.py` | Низкоуровневые функции: SPI, GPIO, регистры Intan |
+| `setup_permissions.sh` | Одноразовая настройка прав для GPIO/SPI (udev, группа gpio) |
 
 ---
 
@@ -38,6 +39,8 @@ pip install numpy   # опционально, для оптимизаций
 
 ## Запуск
 
+После выполнения `setup_permissions.sh` и перелогина:
+
 ```bash
 # Базовый запуск (порты по умолчанию)
 python3 intan_server.py --verbose
@@ -45,6 +48,8 @@ python3 intan_server.py --verbose
 # С указанием портов и устройства
 python3 intan_server.py --tcp-port 9000 --udp-port 9001 --gpio 226 --device /dev/spidev1.1 --verbose
 ```
+
+Без настройки прав потребуется `sudo python3 intan_server.py ...`.
 
 ---
 
@@ -81,7 +86,16 @@ JSON‑команды построчно. Ответ — одна строка J
 |----------|----------|
 | SPI | `/dev/spidev1.1` (Orange Pi Zero 2W) |
 | GPIO 226 | Вывод PH2 для управления питанием Intan |
-| Права | Для работы с GPIO/SPI может потребоваться `root` или настройка через `setup_permissions.sh` |
+
+### Права доступа
+
+Для работы с GPIO и SPI один раз выполните:
+
+```bash
+sudo bash setup_permissions.sh
+```
+
+Скрипт создаёт группу `gpio`, добавляет пользователя, настраивает udev для `/dev/spidev*` и `/sys/class/gpio/`. После перелогина (`newgrp gpio` или выход/вход) запуск без root возможен.
 
 ---
 

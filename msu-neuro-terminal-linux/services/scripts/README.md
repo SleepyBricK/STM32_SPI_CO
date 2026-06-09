@@ -25,37 +25,34 @@
 
 ## start_with_logs.sh
 
-Запускает `intan_server.py` в фоне с перенаправлением вывода в `intan_server.log`.
+Запускает `intan_server.py` в фоне с перенаправлением вывода в `intan_server.log`. Для доступа к SPI/GPIO скрипт автоматически поднимает права (sudo). Требуется NOPASSWD в sudoers.
 
 **Использование:**
 
 ```bash
-./services/scripts/start_with_logs.sh
-```
-
-Или из папки проекта:
-
-```bash
 cd /path/to/Stimulator_2.0_orangepizero2w
-./services/scripts/start_with_logs.sh
+bash services/scripts/start_with_logs.sh
 ```
+
+Примечание: при ручном запуске без автозапуска предварительно выполните `setup_permissions.sh` (см. [services/server/](../server/README.md)).
 
 **Действия скрипта:**
 
-1. Останавливает старый процесс сервера (если есть)
-2. Запускает сервер в фоне с `nohup`
-3. Пишет логи в `services/server/intan_server.log`
+1. Поднимает права (sudo) при необходимости
+2. Останавливает старый процесс сервера (если есть)
+3. Запускает сервер в фоне с `nohup`
+4. Пишет логи в `services/server/intan_server.log`
 
 ---
 
 ## view_logs.sh
 
-Проверяет, запущен ли сервер, и показывает последние 50 строк логов.
+Проверяет, запущен ли сервер, и показывает последние 50 строк логов. Прав root не требует.
 
 **Использование:**
 
 ```bash
-./services/scripts/view_logs.sh
+bash services/scripts/view_logs.sh
 ```
 
 **Вывод:**

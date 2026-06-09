@@ -22,6 +22,7 @@ import math
 import os
 import socket
 import socketserver
+import subprocess
 import threading
 import time
 import sys
@@ -32,11 +33,12 @@ try:
 except ImportError:
     NUMPY_AVAILABLE = False
 
+from intan_impedance import rhs2116_safe_impedance_commands, run_rhs2116_sequence
 from stimulate_channel0 import (
     GPIOController,
     GPIOError,
     SPIController,
-    get_preferred_spi_device,
+    initialize_intan_chip,
     setup_stimulation_channels,
     clear_compliance_monitor,
     enable_stimulation_channels,
@@ -46,22 +48,42 @@ from stimulate_channel0 import (
     read_intan_register,
     write_intan_register,
     clear_adc,
+    convert_intan,
+    _is_usb_backend,
 )
-from rhs2116_profiles import (
-    RHS2116_STIM_BIAS_1UA,
-    RHS2116_STIM_STEP_1UA,
-    rhs2116_recording_init_commands,
-    rhs2116_safe_impedance_commands,
-    rhs2116_stimulation_init_commands,
-    run_rhs2116_sequence,
+from intan_usb_transport import (
+    encode_intan_write_raw_word,
+    intan_spi_slots_to_us,
 )
-from intan_shared_state import IntanSharedState
 
-PATTERN_OP_WRITE_REG = 1
-PATTERN_OP_READ_REG = 2
-PATTERN_OP_CLEAR_ADC = 3
-PATTERN_OP_DELAY = 4
-PATTERN_OP_CLEAR_COMPLIANCE = 5
+
+def _token_um_flag(parts, name, default=0):
+    name = name.upper()
+    for token in parts[2:]:
+        t = token.strip().upper()
+        if t == name:
+            return 1
+        if t.startswith(f"{name}="):
+            try:
+                return 1 if int(t.split("=", 1)[1], 0) else 0
+            except Exception:
+                return default
+    return default
+
+
+def parse_write_um_flags(parts):
+    """WRITE reg value [U] [M] или WRITE reg value u m (0/1)."""
+    if any(
+        t.upper() in ("U", "M") or t.upper().startswith(("U=", "M="))
+        for t in parts[3:]
+    ):
+        return _token_um_flag(parts, "U", 0), _token_um_flag(parts, "M", 0)
+    if len(parts) >= 5:
+        try:
+            return int(parts[3], 0), int(parts[4], 0)
+        except ValueError:
+            pass
+    return 0, 0
 
 
 class IntanController:
@@ -69,23 +91,58 @@ class IntanController:
     Обертка над существующими функциями стимуляции для использования из TCP-сервера.
     """
 
-    def __init__(self, gpio_number=226, spi_device="/dev/spidev1.1", verbose=False, shared_state=None):
+    def __init__(
+        self,
+        gpio_number=226,
+        spi_device="/dev/spidev1.1",
+        verbose=False,
+        transport=None,
+        backend="spi",
+    ):
         self.gpio_number = gpio_number
-        self.spi_device = get_preferred_spi_device(spi_device)
+        self.spi_device = spi_device
         self.verbose = verbose
-        self.shared_state = shared_state or IntanSharedState()
+        self.transport = transport
+        self.backend = backend
 
         self.gpio = None
         self.spi = None
         self.initialized = False
-        self.using_driver = self.spi_device == "/dev/intan"
-        self.current_mode = "unknown"
         
         # Память для хранения паттерна
         self.pattern_commands = []
-        self.pattern_ops = []
         self.pattern_loaded = False
+        
+        # Автоматически экспортируем GPIO при инициализации
+        self._ensure_gpio_exported()
         self.lock = threading.Lock()
+    
+    def _ensure_gpio_exported(self):
+        """Убеждается, что GPIO экспортирован (через sudo если нужно)"""
+        gpio_path = f"/sys/class/gpio/gpio{self.gpio_number}"
+        if not os.path.exists(gpio_path):
+            try:
+                export_script = "/home/admin/export_gpio.sh"
+                if os.path.exists(export_script):
+                    result = subprocess.run(
+                        ["sudo", export_script, str(self.gpio_number)],
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                else:
+                    result = subprocess.run(
+                        ["sudo", "sh", "-c", f"echo {self.gpio_number} > /sys/class/gpio/export"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                if result.returncode == 0 and self.verbose:
+                    print(f"  GPIO {self.gpio_number} экспортирован через sudo")
+            except Exception as e:
+                if self.verbose:
+                    print(f"  Предупреждение: не удалось автоматически экспортировать GPIO: {e}")
+                # Не критично, попробуем позже при инициализации
 
     def _log(self, msg):
         if self.verbose:
@@ -102,66 +159,52 @@ class IntanController:
             sleep_fn=time.sleep,
         )
 
-    def _restore_recording_after_stimulation(self, operation, recording_snapshot):
-        if not recording_snapshot.get("recording_active"):
-            return False
+    def ensure_chip_ready(self):
+        """
+        Быстрая проверка доступа к чипу (без полной инициализации стимуляции).
+        Для read_register / ping GUI — не блокирует на десятки WRITE.
+        """
+        with self.lock:
+            if self.backend == "usb":
+                if self.transport is None:
+                    raise RuntimeError("USB backend requires transport")
+                self.spi = self.transport
+                self.transport.verify_chip()
+                return
 
-        adc_rate_ksps = float(recording_snapshot.get("adc_rate_ksps") or 480.0)
-        self.shared_state.emit_event(
-            "recording_reinit_started",
-            operation=operation,
-            adc_rate_ksps=adc_rate_ksps,
-        )
-        self._initialize_for_recording(
-            verbose=self.verbose,
-            adc_sampling_rate_ksps=adc_rate_ksps,
-        )
-        self.shared_state.emit_event(
-            "recording_reinit_done",
-            operation=operation,
-            adc_rate_ksps=adc_rate_ksps,
-        )
-        return True
+            if self.initialized:
+                return
 
-    def _run_coordinated_stimulation(self, operation, callback):
-        recording_snapshot = self.shared_state.begin_stimulation(operation)
-        restored_recording = False
-        result = None
-        pending_error = None
+            chip_id = read_intan_register(
+                self._open_spi_for_probe(), 255, verbose=False
+            )
+            if chip_id != 32:
+                raise RuntimeError(
+                    f"Intan не отвечает: регистр 255 = {chip_id} (ожидалось 32)"
+                )
 
-        with self.shared_state.chip_lock:
-            try:
-                result = callback()
-            except Exception as exc:
-                pending_error = exc
-            finally:
-                if recording_snapshot.get("recording_active"):
-                    try:
-                        restored_recording = self._restore_recording_after_stimulation(
-                            operation,
-                            recording_snapshot,
-                        )
-                    except Exception as restore_exc:
-                        if pending_error is None:
-                            pending_error = restore_exc
-                        elif self.verbose:
-                            self._log(
-                                "Не удалось восстановить recording mode после ошибки "
-                                f"'{operation}': {restore_exc}"
-                            )
-
-        self.shared_state.end_stimulation(
-            operation,
-            restored_recording=restored_recording,
+    def _open_spi_for_probe(self):
+        """Открывает SPI только для проверки chip ID (legacy backend)."""
+        if self.spi is not None:
+            return self.spi
+        if not os.path.exists(self.spi_device):
+            raise FileNotFoundError(f"SPI устройство не найдено: {self.spi_device}")
+        self.gpio = GPIOController(self.gpio_number, raise_exceptions=True)
+        self.gpio.set_direction("out")
+        self.gpio.set_value(1)
+        time.sleep(0.1)
+        self.spi = SPIController(
+            device=self.spi_device,
+            max_speed_hz=10000000,
+            mode=0,
         )
-        if pending_error is not None:
-            raise pending_error
-        return result
+        self.spi.open()
+        return self.spi
 
     def ensure_initialized(self):
         """
-        Ленивая безопасная инициализация GPIO, SPI и чипа Intan.
-        По умолчанию переводит чип в recording-safe режим без unlock stimulation path.
+        Ленивая инициализация GPIO, SPI и чипа Intan.
+        Вызывается перед любой командой, требующей доступа к чипу.
         """
         with self.lock:
             if self.initialized:
@@ -171,26 +214,38 @@ class IntanController:
             EXPECTED_VALUE = 32  # Chip ID для RHS2116
 
             self._log("== Инициализация Intan для TCP-сервера ==")
-            self._log(f"GPIO PH2: {self.gpio_number}")
-            self._log(f"SPI устройство: {self.spi_device}")
 
             try:
-                if self.using_driver:
-                    self._log("[1/6] Используется драйвер /dev/intan: GPIO питания управляется ядром")
-                    self._log("[2/6] Пропуск ручного включения питания через sysfs")
-                else:
-                    # Инициализация GPIO
-                    self._log("[1/6] Настройка GPIO...")
-                    self.gpio = GPIOController(self.gpio_number, raise_exceptions=True)
-                    self.gpio.set_direction("out")
-                    self._log(f"      GPIO {self.gpio_number} настроен как выход")
+                if self.backend == "usb":
+                    if self.transport is None:
+                        raise RuntimeError("USB backend requires transport")
+                    self.spi = self.transport
+                    self._log("Backend: USB STM32 coprocessor")
+                    self._log("[1/3] Проверка USB и chip ID...")
+                    self.transport.verify_chip()
+                    self._log("[2/3] Инициализация регистров для стимуляции...")
+                    self._initialize_for_stimulation(verbose=self.verbose)
+                    self._log("[3/3] Очистка compliance monitor...")
+                    clear_compliance_monitor(self.spi, verbose=self.verbose)
+                    self.initialized = True
+                    self._log("== Инициализация завершена успешно ==")
+                    return
 
-                    # Включаем питание
-                    self._log("[2/6] Включение питания Intan (PH2 = 1)...")
-                    self.gpio.set_value(1)
-                    time.sleep(0.1)  # Даем время на включение питания
-                    gpio_value = self.gpio.get_value()
-                    self._log(f"      Питание включено, GPIO значение: {gpio_value}")
+                self._log(f"GPIO PH2: {self.gpio_number}")
+                self._log(f"SPI устройство: {self.spi_device}")
+
+                # Инициализация GPIO
+                self._log("[1/6] Настройка GPIO...")
+                self.gpio = GPIOController(self.gpio_number, raise_exceptions=True)
+                self.gpio.set_direction("out")
+                self._log(f"      GPIO {self.gpio_number} настроен как выход")
+
+                # Включаем питание
+                self._log("[2/6] Включение питания Intan (PH2 = 1)...")
+                self.gpio.set_value(1)
+                time.sleep(0.1)  # Даем время на включение питания
+                gpio_value = self.gpio.get_value()
+                self._log(f"      Питание включено, GPIO значение: {gpio_value}")
 
                 # Инициализация SPI
                 self._log("[3/6] Инициализация SPI...")
@@ -203,12 +258,9 @@ class IntanController:
                     mode=0,
                 )
                 self.spi.open()
-                if getattr(self.spi, "using_driver", False):
-                    self._log("      SPI backend: /dev/intan (driver ioctl)")
-                else:
-                    self._log(
-                        f"      SPI настроен: скорость {self.spi.max_speed_hz/1e6:.1f} МГц, режим {self.spi.mode}"
-                    )
+                self._log(
+                    f"      SPI настроен: скорость {self.spi.max_speed_hz/1e6:.1f} МГц, режим {self.spi.mode}"
+                )
 
                 # Проверка инициализации
                 self._log("[4/6] Проверка инициализации Intan...")
@@ -226,18 +278,18 @@ class IntanController:
                     )
                 self._log(f"      Intan обнаружен (регистр {REG_ADDR} = {reg_value})")
 
-                # Безопасная инициализация для чтения/регистрации без включения stimulation path
-                self._log("[5/6] Инициализация регистров чипа для safe recording mode...")
-                self._initialize_for_recording(verbose=self.verbose)
-                self._log("      Чип переведен в safe recording mode (регистры 32-33 = 0x0000)")
+                # Инициализация регистров чипа для стимуляции
+                # По аналогии с StimulationWithPreset.py: полная инициализация с установкой регистров 32-33
+                self._log("[5/6] Инициализация регистров чипа для стимуляции...")
+                self._initialize_for_stimulation(verbose=self.verbose)
+                self._log("      Регистры чипа инициализированы (регистры 32-33 установлены в 0xAAAA/0x00FF)")
 
-                # Финальная очистка compliance monitor
+                # Очистка compliance monitor
                 self._log("[6/6] Очистка compliance monitor...")
                 clear_compliance_monitor(self.spi, verbose=self.verbose)
                 self._log("      Compliance monitor очищен")
 
                 self.initialized = True
-                self.current_mode = "recording"
                 self._log("== Инициализация завершена успешно ==")
             except GPIOError as e:
                 self._log(f"❌ Ошибка GPIO: {e}")
@@ -249,7 +301,6 @@ class IntanController:
                 self.spi = None
                 self.gpio = None
                 self.initialized = False
-                self.current_mode = "unknown"
                 raise RuntimeError(f"Ошибка GPIO: {e}") from e
             except Exception as e:
                 self._log(f"❌ Ошибка инициализации: {e}")
@@ -264,15 +315,7 @@ class IntanController:
                 self.spi = None
                 self.gpio = None
                 self.initialized = False
-                self.current_mode = "unknown"
                 raise  # Пробрасываем исключение дальше
-
-    def _initialize_for_recording(self, verbose=False, adc_sampling_rate_ksps=480.0):
-        """Переводит чип в безопасный recording mode без unlock stimulation path."""
-        self._run_rhs2116_sequence(rhs2116_recording_init_commands(adc_sampling_rate_ksps))
-        self.current_mode = "recording"
-        if verbose:
-            self._log("      ✓ Инициализация для записи завершена (stimulation path locked)")
 
     def _initialize_for_stimulation(self, verbose=False):
         """
@@ -285,7 +328,7 @@ class IntanController:
         Последовательность:
         1. READ 255 (dummy команда)
         2. WRITE 32/33 0x0000 (отключить стимуляцию)
-        3. Инициализация регистров 0-44 (включая Register 9 для Low-Gain Amplifiers)
+        3. Инициализация регистров 0-48
         4. Инициализация регистров 64-79 и 96-111 (токи стимуляции) в 0x8000
         5. WRITE 32 0xAAAA, WRITE 33 0x00FF (разрешить работу стимуляторов)
         6. READ 255 U=0 M=1 (очистка compliance monitor)
@@ -293,25 +336,148 @@ class IntanController:
         Register 36 (Vrecov): 0x0080 = 0V (8-bit DAC, 128 = 0V, диапазон ±1.22V)
         Register 37 (Imax): 0x4F00 = 1 nA (sel1=0, sel2=30, sel3=2 согласно даташиту)
         """
-        self._run_rhs2116_sequence(rhs2116_stimulation_init_commands(adc_sampling_rate_ksps=480.0))
-        self.current_mode = "stimulation"
+        spi = self.spi
+        
+        # 1. READ 255 U=0 M=0 - dummy команда
+        if verbose:
+            self._log("      READ 255 (dummy команда)...")
+        read_intan_register(spi, 255, verbose=False)
+        time.sleep(0.001)
+        
+        # 2. WRITE 32/33 0x0000 - отключить стимуляцию
+        if verbose:
+            self._log("      WRITE 32 0x0000, WRITE 33 0x0000 - отключить стимуляцию...")
+        write_intan_register(spi, 32, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(spi, 33, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 3. Инициализация основных регистров (как в StimulationWithPreset.py)
+        if verbose:
+            self._log("      Инициализация основных регистров...")
+        
+        # WRITE 38 0xFFFF - включить DC-coupled amplifiers
+        write_intan_register(spi, 38, 0xFFFF, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # CLEAR - инициализация ADC
+        clear_adc(spi, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 0 0x00C5 - настройка ADC (480 kS/s)
+        write_intan_register(spi, 0, 0x00C5, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 1 - auxiliary outputs и DSP фильтр
+        # В StimulationWithPreset используется 0x051A (DSP cutoff = 0)
+        # Для стимуляции используем оригинальное значение из StimulationWithPreset
+        write_intan_register(spi, 1, 0x051A, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # КРИТИЧНО: НЕ включаем impedance DAC при инициализации
+        # Register 2 и 3 будут включены только при измерении импеданса
+        # WRITE 2 0x0000 - отключить DAC для impedance testing (по умолчанию)
+        write_intan_register(spi, 2, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 3 0x0000 - отключить impedance check DAC (по умолчанию)
+        write_intan_register(spi, 3, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 4 0x0016 - верхняя частота среза (7.5 kHz)
+        write_intan_register(spi, 4, 0x0016, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 5 0x0017 - нижняя частота среза (5 Hz)
+        write_intan_register(spi, 5, 0x0017, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 6 0x00A8 - нижняя частота среза (5 Hz)
+        write_intan_register(spi, 6, 0x00A8, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 7 0x000A - альтернативная нижняя частота среза (1000 Hz)
+        write_intan_register(spi, 7, 0x000A, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 8 0xFFFF - включить AC-coupled amplifiers
+        write_intan_register(spi, 8, 0xFFFF, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # ВАЖНО: Register 9 НЕ устанавливается в StimulationWithPreset.py
+        # Не устанавливаем Register 9 для соответствия оригинальной инициализации
+        
+        # WRITE 10 0x0000 U=1 - отключить fast settle
+        write_intan_register(spi, 10, 0x0000, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 12 0xFFFF U=1 - установить нижнюю частоту среза
+        write_intan_register(spi, 12, 0xFFFF, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 34 0x00E2 - шаг стимуляции 1 µA
+        write_intan_register(spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 35 0x00AA - напряжения смещения для шага 1 µA
+        write_intan_register(spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 36 0x0080 - целевое напряжение charge recovery (0 V)
+        write_intan_register(spi, 36, 0x0080, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # WRITE 37 0x4F00 - лимит тока charge recovery (1 nA)
+        write_intan_register(spi, 37, 0x4F00, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # КРИТИЧНО: Записи в triggered регистры (44, 46, 48, 64-79, 96-111) БЕЗ U-флага
+        # Все изменения накапливаются в shadow-RAM и применяются только при записи в Register 42 с U=1
+        
+        # WRITE 44 0x0000 U=0 - установить отрицательную полярность (накапливаем в shadow-RAM)
+        write_intan_register(spi, 44, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+
+        # WRITE 46/48 0x0000 U=0 - открыть charge recovery switch и отключить CL recovery.
+        # На power-up эти triggered-регистры неопределенные; если их не сбросить, канал может шунтироваться.
+        write_intan_register(spi, 46, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(spi, 48, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 4. Инициализация регистров токов стимуляции (64-79 и 96-111) в 0x8000:
+        # magnitude=0, trim=128 (центральная калибровка по даташиту).
+        # КРИТИЧНО: БЕЗ U-флага - накапливаем в shadow-RAM
+        if verbose:
+            self._log("      Инициализация регистров токов стимуляции (64-79, 96-111) в 0x8000 (без U-флага)...")
+        for channel in range(16):
+            write_intan_register(spi, 64 + channel, 0x8000, u_flag=0, m_flag=0, verbose=False)
+            write_intan_register(spi, 96 + channel, 0x8000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # КРИТИЧНО: Применяем все накопленные изменения через Register 42 с U=1
+        # Это единственное место, где используется U=1 для применения triggered регистров
+        if verbose:
+            self._log("      Применение всех накопленных изменений через Register 42 (U=1)...")
+        write_intan_register(spi, 42, 0x0000, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 5. WRITE 32 0xAAAA, WRITE 33 0x00FF - разрешить работу стимуляторов
+        if verbose:
+            self._log("      WRITE 32 0xAAAA, WRITE 33 0x00FF - разрешить работу стимуляторов...")
+        write_intan_register(spi, 32, 0xAAAA, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(spi, 33, 0x00FF, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 6. READ 255 U=0 M=1 - очистка compliance monitor
+        if verbose:
+            self._log("      READ 255 U=0 M=1 - очистка compliance monitor...")
+        clear_compliance_monitor(spi, verbose=False)
+        time.sleep(0.001)
         
         if verbose:
             self._log("      ✓ Инициализация для стимуляции завершена")
-
-    def ensure_recording_ready(self, adc_sampling_rate_ksps=480.0):
-        """Гарантирует безопасный режим записи без включенной стимуляции."""
-        self.ensure_initialized()
-        if self.current_mode != "recording":
-            self._log("Переключение чипа в recording mode...")
-            self._initialize_for_recording(verbose=self.verbose, adc_sampling_rate_ksps=adc_sampling_rate_ksps)
-
-    def ensure_stimulation_ready(self):
-        """Гарантирует режим стимуляции с полностью инициализированным stimulation path."""
-        self.ensure_initialized()
-        if self.current_mode != "stimulation":
-            self._log("Переключение чипа в stimulation mode...")
-            self._initialize_for_stimulation(verbose=self.verbose)
 
     # --- Высокоуровневые операции, вызываемые из TCP-обработчика ---
 
@@ -327,60 +493,66 @@ class IntanController:
             inter_pulse_delay: задержка между импульсами в секундах (по умолчанию 0.001 = 1 мс)
             repeat_count: количество повторений (по умолчанию 1)
         """
-        def _run():
-            try:
-                self.ensure_stimulation_ready()
-            except Exception as e:
-                raise RuntimeError(f"Ошибка инициализации: {e}")
+        try:
+            self.ensure_initialized()
+        except Exception as e:
+            raise RuntimeError(f"Ошибка инициализации: {e}")
+        
+        channels = parse_channels(channels_str)
 
-            channels = parse_channels(channels_str)
+        # Настраиваем токи
+        setup_stimulation_channels(
+            spi=self.spi,
+            channels=channels,
+            neg_current_magnitude=neg_current,
+            pos_current_magnitude=pos_current,
+            step_size_1ua=True,
+            verbose=self.verbose,
+        )
 
-            setup_stimulation_channels(
-                spi=self.spi,
-                channels=channels,
-                neg_current_magnitude=neg_current,
-                pos_current_magnitude=pos_current,
-                step_size_1ua=True,
-                verbose=self.verbose,
-                assume_step_size_configured=True,
-            )
+        for rep in range(repeat_count):
+            # Биполярная или монополярная стимуляция
+            if neg_current > 0 and pos_current > 0:
+                # Сначала отрицательный импульс
+                enable_stimulation_channels(
+                    self.spi, channels, enable=True, negative_polarity=True, verbose=False
+                )
+                time.sleep(pulse_duration)
+                enable_stimulation_channels(
+                    self.spi, channels, enable=False, negative_polarity=True, verbose=False
+                )
+                time.sleep(inter_pulse_delay)
 
-            for rep in range(repeat_count):
-                if neg_current > 0 and pos_current > 0:
-                    enable_stimulation_channels(
-                        self.spi, channels, enable=True, negative_polarity=True, verbose=False
-                    )
-                    time.sleep(pulse_duration)
-                    enable_stimulation_channels(
-                        self.spi, channels, enable=False, negative_polarity=True, verbose=False
-                    )
-                    time.sleep(inter_pulse_delay)
-
-                    enable_stimulation_channels(
-                        self.spi, channels, enable=True, negative_polarity=False, verbose=False
-                    )
-                    time.sleep(pulse_duration)
-                    enable_stimulation_channels(
-                        self.spi, channels, enable=False, negative_polarity=False, verbose=False
-                    )
-                else:
-                    polarity = neg_current > 0
-                    enable_stimulation_channels(
-                        self.spi, channels, enable=True, negative_polarity=polarity, verbose=self.verbose
-                    )
-                    time.sleep(pulse_duration)
-                    enable_stimulation_channels(
-                        self.spi, channels, enable=False, negative_polarity=polarity, verbose=self.verbose
-                    )
-
-                if rep < repeat_count - 1:
-                    time.sleep(inter_pulse_delay)
-
-            if self.verbose:
-                self._log("      Сброс DSP HPF после стимуляции...")
-            self._reset_dsp_hpf(channels)
-
-        self._run_coordinated_stimulation("pulse", _run)
+                # Затем положительный импульс
+                enable_stimulation_channels(
+                    self.spi, channels, enable=True, negative_polarity=False, verbose=False
+                )
+                time.sleep(pulse_duration)
+                enable_stimulation_channels(
+                    self.spi, channels, enable=False, negative_polarity=False, verbose=False
+                )
+            else:
+                # Монополярная стимуляция
+                polarity = neg_current > 0  # True для отрицательной
+                current = neg_current if neg_current > 0 else pos_current
+                enable_stimulation_channels(
+                    self.spi, channels, enable=True, negative_polarity=polarity, verbose=self.verbose
+                )
+                time.sleep(pulse_duration)
+                enable_stimulation_channels(
+                    self.spi, channels, enable=False, negative_polarity=polarity, verbose=self.verbose
+                )
+            
+            # Задержка между повторениями (кроме последнего)
+            if rep < repeat_count - 1:
+                time.sleep(inter_pulse_delay)
+        
+        # КРИТИЧНО: Сброс DSP HPF после стимуляции для быстрого восстановления baseline
+        # Согласно даташиту: "Each channel's DSP high-pass filter can be instantly reset
+        # by setting the H flag of the CONVERT command to one."
+        if self.verbose:
+            self._log("      Сброс DSP HPF после стимуляции...")
+        self._reset_dsp_hpf(channels)
 
     def sawtooth(self, channels_str, pos_current, steps, duration):
         """
@@ -390,57 +562,64 @@ class IntanController:
         steps: количество шагов
         duration: длительность одного цикла (сек)
         """
-        def _run():
-            try:
-                self.ensure_stimulation_ready()
-            except Exception as e:
-                raise RuntimeError(f"Ошибка инициализации: {e}")
+        try:
+            self.ensure_initialized()
+        except Exception as e:
+            raise RuntimeError(f"Ошибка инициализации: {e}")
+        
+        channels = parse_channels(channels_str)
 
-            channels = parse_channels(channels_str)
-            if steps <= 0 or duration <= 0:
-                raise ValueError("steps и duration должны быть > 0")
+        if steps <= 0 or duration <= 0:
+            raise ValueError("steps и duration должны быть > 0")
 
-            setup_stimulation_channels(
-                spi=self.spi,
-                channels=channels,
-                neg_current_magnitude=0,
-                pos_current_magnitude=0,
-                step_size_1ua=True,
-                verbose=self.verbose,
-                assume_step_size_configured=True,
-            )
+        # Настраиваем токи: отрицательный 0, положительный pos_current (будет изменяться)
+        setup_stimulation_channels(
+            spi=self.spi,
+            channels=channels,
+            neg_current_magnitude=0,
+            pos_current_magnitude=0,
+            step_size_1ua=True,
+            verbose=self.verbose,
+        )
 
-            enable_stimulation_channels(
-                self.spi, channels, enable=True, negative_polarity=False, verbose=self.verbose
-            )
+        # Включаем стимуляторы с положительной полярностью
+        enable_stimulation_channels(
+            self.spi, channels, enable=True, negative_polarity=False, verbose=self.verbose
+        )
 
-            start = time.time()
-            for step in range(steps + 1):
-                current = int((pos_current * step) / steps)
-                for ch in channels:
-                    set_stimulation_current(
-                        self.spi,
-                        current_value=current,
-                        channel=ch,
-                        is_positive=True,
-                        verbose=False,
-                        assume_step_size_configured=True,
-                    )
-                current_reg42 = read_intan_register(self.spi, 42, verbose=False)
-                write_intan_register(self.spi, 42, current_reg42, u_flag=1, m_flag=0, verbose=False)
+        step_delay = duration / steps
+        start = time.time()
 
-            elapsed = time.time() - start
-            self._log(
-                f"TCP: sawtooth cycle completed, requested {duration*1000:.3f} ms, actual {elapsed*1000:.3f} ms"
-            )
-            enable_stimulation_channels(
-                self.spi, channels, enable=False, negative_polarity=False, verbose=self.verbose
-            )
-            if self.verbose:
-                self._log("      Сброс DSP HPF после стимуляции...")
-            self._reset_dsp_hpf(channels)
+        # Пила: от 0 до максимума
+        # КРИТИЧНО: Изменения токов накапливаются в shadow-RAM без U-флага
+        # Нужно применять их через Register 42 с U=1 после каждого изменения
+        for step in range(steps + 1):
+            current = int((pos_current * step) / steps)
+            for ch in channels:
+                set_stimulation_current(
+                    self.spi, current_value=current, channel=ch, is_positive=True, verbose=False
+                )
+            # КРИТИЧНО: Применяем накопленные изменения токов через Register 42 с U=1
+            # Читаем текущее значение Register 42 и записываем обратно с U=1
+            current_reg42 = read_intan_register(self.spi, 42, verbose=False)
+            write_intan_register(self.spi, 42, current_reg42, u_flag=1, m_flag=0, verbose=False)
+            # При желании можно чуть выровнять по времени, но для максимальной скорости можно без задержки
+            # time.sleep(step_delay)
 
-        self._run_coordinated_stimulation("sawtooth", _run)
+        elapsed = time.time() - start
+        self._log(
+            f"TCP: sawtooth cycle completed, requested {duration*1000:.3f} ms, actual {elapsed*1000:.3f} ms"
+        )
+
+        # Отключаем стимуляторы
+        enable_stimulation_channels(
+            self.spi, channels, enable=False, negative_polarity=False, verbose=self.verbose
+        )
+        
+        # КРИТИЧНО: Сброс DSP HPF после стимуляции для быстрого восстановления baseline
+        if self.verbose:
+            self._log("      Сброс DSP HPF после стимуляции...")
+        self._reset_dsp_hpf(channels)
 
     def _reset_dsp_hpf(self, channels):
         """
@@ -457,183 +636,234 @@ class IntanController:
         """
         if not self.spi:
             return
-        
-        # Для каждого канала выполняем CONVERT с H flag = 1
+
         for channel in channels:
-            # Формируем команду CONVERT с H flag = 1
-            # Биты [31:30] = 00 (CONVERT)
-            # Бит [26] = H flag = 1 (сброс DSP HPF)
-            # Биты [21:16] = номер канала
-            cmd_word = 0x00000000
-            cmd_word |= (channel << 16)  # номер канала
-            cmd_word |= (1 << 26)  # H flag для сброса DSP HPF
-            
-            # Преобразуем в байты (MSB first)
-            cmd = [
-                (cmd_word >> 24) & 0xFF,
-                (cmd_word >> 16) & 0xFF,
-                (cmd_word >> 8) & 0xFF,
-                cmd_word & 0xFF
-            ]
-            
-            # Отправляем команду CONVERT (3 фазы для pipeline)
-            dummy = [0x00, 0x00, 0x00, 0x00]
-            self.spi.transfer(cmd)  # Отправка команды
-            self.spi.transfer(dummy)  # Dummy для pipeline
-            self.spi.transfer(dummy)  # Dummy для получения результата
-        
-        # Небольшая задержка для применения сброса
+            convert_intan(self.spi, channel, amp_type="ac", h_flag=1, verbose=False)
+
         time.sleep(0.001)
 
-    def _make_pattern_write_op(self, reg_addr, value, u_flag=0, m_flag=0, visible=True):
-        return {
-            "opcode": PATTERN_OP_WRITE_REG,
-            "reg": reg_addr,
-            "flags": (u_flag & 1) | ((m_flag & 1) << 1),
-            "value": value,
-            "count": 0,
-            "_visible_result": visible,
-            "_result_cmd": "WRITE",
-        }
+    STM32_PATTERN_MAX_SLOTS = 1024
 
-    def _compile_pattern_commands(self, pattern_commands):
-        if len(pattern_commands) > 200:
+    def load_pattern(self, pattern_commands):
+        """
+        Загружает паттерн команд в память устройства без выполнения.
+        Для USB/STM32 backend: intan_pattern.c (до 1024 слотов RAM).
+        PATTERN_ADD_RAW = 1 SPI-слот; PATTERN_ADD_WRITE/READ = 3 слота.
+        
+        Args:
+            pattern_commands: список команд в формате:
+                - "PATTERN_ADD_RAW <word>" / "PATTERN_ADD_DELAY_US <us>"
+                - "WRITE reg_addr value [U] [M]" — конвертируется в 1 RAW-слот
+                - legacy: DELAY / DELAY_US / READ / CLEAR
+        
+        Returns:
+            количество загруженных слотов (USB) или команд (legacy)
+        """
+        if self.backend != "usb" and len(pattern_commands) > 200:
             raise ValueError("Максимум 200 команд в паттерне")
-
+        
         validated_commands = []
-        compiled_ops = []
-        step_reg34_is_1ua = True
-        step_reg35_is_1ua = True
-
         for cmd_line in pattern_commands:
             cmd_line = cmd_line.strip()
             if not cmd_line or cmd_line.startswith('#'):
-                continue
-
+                continue  # Пропускаем пустые строки и комментарии
+            
+            # Базовая валидация синтаксиса
             parts = cmd_line.split()
             if not parts:
                 continue
-
+            
             cmd_type = parts[0].upper()
-            if cmd_type == "WRITE":
-                if len(parts) < 3:
-                    raise ValueError("WRITE требует минимум 2 параметра: регистр и значение")
-                reg_addr = int(parts[1], 0)
-                value = int(parts[2], 0)
-                u_flag = 1 if "U" in parts else 0
-                m_flag = 1 if "M" in parts else 0
-
-                if (64 <= reg_addr <= 79) or (96 <= reg_addr <= 111):
-                    if not (step_reg34_is_1ua and step_reg35_is_1ua):
-                        compiled_ops.append(
-                            self._make_pattern_write_op(
-                                34,
-                                RHS2116_STIM_STEP_1UA,
-                                u_flag=0,
-                                m_flag=0,
-                                visible=False,
-                            )
-                        )
-                        compiled_ops.append(
-                            self._make_pattern_write_op(
-                                35,
-                                RHS2116_STIM_BIAS_1UA,
-                                u_flag=0,
-                                m_flag=0,
-                                visible=False,
-                            )
-                        )
-                        step_reg34_is_1ua = True
-                        step_reg35_is_1ua = True
-
-                    if value < 0x8000 or value > 0x80FF:
-                        if 0 <= value <= 255:
-                            value = 0x8000 | (value & 0xFF)
-                            if self.verbose:
-                                self._log(f"  Преобразовано значение тока: {value & 0xFF} µA -> 0x{value:04X}")
-                        else:
-                            raise ValueError(
-                                "Значение тока должно быть в диапазоне 0-255 µA "
-                                f"или в формате 0x80XX, получено: {value}"
-                            )
-                    elif self.verbose:
-                        current_ua = value & 0xFF
-                        self._log(
-                            f"  Установка тока: регистр {reg_addr} = 0x{value:04X} "
-                            f"(ток = {current_ua} µA при шаге 1 µA)"
-                        )
-
-                compiled_ops.append(
-                    self._make_pattern_write_op(
-                        reg_addr,
-                        value,
-                        u_flag=u_flag,
-                        m_flag=m_flag,
-                        visible=True,
-                    )
-                )
-                if reg_addr == 34:
-                    step_reg34_is_1ua = value == RHS2116_STIM_STEP_1UA
-                elif reg_addr == 35:
-                    step_reg35_is_1ua = value == RHS2116_STIM_BIAS_1UA
-
-            elif cmd_type == "READ":
-                if len(parts) < 2:
-                    raise ValueError("READ требует параметр: адрес регистра")
-                reg_addr = int(parts[1], 0)
-                compiled_ops.append({
-                    "opcode": PATTERN_OP_READ_REG,
-                    "reg": reg_addr,
-                    "flags": 0,
-                    "value": 0,
-                    "count": 0,
-                    "_visible_result": True,
-                    "_result_cmd": "READ",
-                })
-
-            elif cmd_type == "CLEAR":
-                compiled_ops.append({
-                    "opcode": PATTERN_OP_CLEAR_ADC,
-                    "reg": 0,
-                    "flags": 0,
-                    "value": 0,
-                    "count": 0,
-                    "_visible_result": True,
-                    "_result_cmd": "CLEAR",
-                })
-
-            elif cmd_type == "DELAY":
-                if len(parts) < 2:
-                    raise ValueError("DELAY требует параметр: количество SPI-шагов")
-                delay_count = int(parts[1], 0)
-                if delay_count < 0:
-                    raise ValueError("DELAY не может быть отрицательным")
-                compiled_ops.append({
-                    "opcode": PATTERN_OP_DELAY,
-                    "reg": 0,
-                    "flags": 0,
-                    "value": 0,
-                    "count": delay_count,
-                    "_visible_result": True,
-                    "_result_cmd": "DELAY",
-                })
-
-            else:
+            if cmd_type not in [
+                "WRITE", "READ", "CLEAR", "DELAY", "DELAY_US",
+                "PATTERN_ADD_RAW", "PATTERN_ADD_WRITE", "PATTERN_ADD_READ",
+                "PATTERN_ADD_CLEAR_ADC", "PATTERN_ADD_CLEAR_COMP",
+                "PATTERN_ADD_DELAY_US", "PATTERN_ADD_DELAY_CYC",
+                "PATTERN_CLEAR", "PATTERN_STATUS",
+            ]:
                 raise ValueError(f"Неизвестная команда: {cmd_type}")
-
+            
             validated_commands.append(cmd_line)
 
-        return validated_commands, compiled_ops
+        if self.backend == "usb":
+            if self.spi is None:
+                self.ensure_initialized()
+            if self.spi is None or not hasattr(self.spi, "pattern_clear"):
+                raise RuntimeError("USB STM32 firmware не поддерживает PATTERN_* команды")
 
-    def _supports_batch_pattern(self):
-        return bool(self.spi) and hasattr(self.spi, "supports_batch_pattern") and self.spi.supports_batch_pattern()
+            self._prepare_pattern_load_state()
+            self.spi.pattern_clear()
+            loaded_count = 0
+
+            def _reserve_slots(needed: int):
+                if loaded_count + needed > self.STM32_PATTERN_MAX_SLOTS:
+                    raise ValueError(
+                        f"Паттерн не помещается в RAM STM32: "
+                        f"{loaded_count + needed} слотов (максимум {self.STM32_PATTERN_MAX_SLOTS})"
+                    )
+
+            for cmd_line in validated_commands:
+                parts = cmd_line.split()
+                cmd_type = parts[0].upper()
+
+                if cmd_type in ("PATTERN_CLEAR", "PATTERN_STATUS"):
+                    continue
+                if cmd_type == "PATTERN_ADD_RAW":
+                    if len(parts) < 2:
+                        raise ValueError(f"PATTERN_ADD_RAW требует слово: {cmd_line}")
+                    _reserve_slots(1)
+                    self.spi.pattern_add_raw_word(int(parts[1], 0))
+                    loaded_count += 1
+                elif cmd_type == "PATTERN_ADD_DELAY_US":
+                    if len(parts) < 2:
+                        raise ValueError(f"PATTERN_ADD_DELAY_US требует µs: {cmd_line}")
+                    delay_us = int(parts[1], 0)
+                    if delay_us > 0:
+                        _reserve_slots(1)
+                        self.spi.pattern_add_delay_us(delay_us)
+                        loaded_count += 1
+                elif cmd_type == "PATTERN_ADD_DELAY_CYC":
+                    if len(parts) < 2:
+                        raise ValueError(f"PATTERN_ADD_DELAY_CYC требует cycles: {cmd_line}")
+                    cycles = int(parts[1], 0)
+                    if cycles > 0:
+                        _reserve_slots(1)
+                        self.spi.pattern_add_delay_cycles(cycles)
+                        loaded_count += 1
+                elif cmd_type == "PATTERN_ADD_WRITE":
+                    if len(parts) < 3:
+                        raise ValueError(f"PATTERN_ADD_WRITE требует reg value: {cmd_line}")
+                    reg_addr = int(parts[1], 0)
+                    value = int(parts[2], 0)
+                    u_flag, m_flag = parse_write_um_flags(parts)
+                    _reserve_slots(3)
+                    self.spi.pattern_add_write(
+                        reg_addr, value, u_flag=u_flag, m_flag=m_flag
+                    )
+                    loaded_count += 3
+                elif cmd_type == "PATTERN_ADD_READ":
+                    if len(parts) < 2:
+                        raise ValueError(f"PATTERN_ADD_READ требует регистр: {cmd_line}")
+                    _reserve_slots(3)
+                    self.spi.pattern_add_read(int(parts[1], 0))
+                    loaded_count += 3
+                elif cmd_type == "PATTERN_ADD_CLEAR_ADC":
+                    _reserve_slots(3)
+                    self.spi.pattern_add_clear_adc()
+                    loaded_count += 3
+                elif cmd_type == "PATTERN_ADD_CLEAR_COMP":
+                    _reserve_slots(3)
+                    self.spi.pattern_add_clear_comp()
+                    loaded_count += 3
+                elif cmd_type == "WRITE":
+                    if len(parts) < 3:
+                        raise ValueError(f"WRITE требует регистр и значение: {cmd_line}")
+                    reg_addr = int(parts[1], 0)
+                    value = int(parts[2], 0)
+                    u_flag, m_flag = parse_write_um_flags(parts)
+                    raw_word = encode_intan_write_raw_word(
+                        reg_addr, value, u_flag=u_flag, m_flag=m_flag
+                    )
+                    _reserve_slots(1)
+                    self.spi.pattern_add_raw_word(raw_word)
+                    loaded_count += 1
+                elif cmd_type == "READ":
+                    if len(parts) < 2:
+                        raise ValueError(f"READ требует регистр: {cmd_line}")
+                    _reserve_slots(3)
+                    self.spi.pattern_add_read(int(parts[1], 0))
+                    loaded_count += 3
+                elif cmd_type == "CLEAR":
+                    _reserve_slots(3)
+                    self.spi.pattern_add_clear_adc()
+                    loaded_count += 3
+                elif cmd_type == "DELAY_US":
+                    if len(parts) < 2:
+                        raise ValueError(f"DELAY_US требует микросекунды: {cmd_line}")
+                    delay_us = int(parts[1], 0)
+                    if delay_us < 0:
+                        raise ValueError(f"DELAY_US должен быть >= 0: {cmd_line}")
+                    if delay_us > 0:
+                        _reserve_slots(1)
+                        self.spi.pattern_add_delay_us(delay_us)
+                        loaded_count += 1
+                elif cmd_type == "DELAY":
+                    if len(parts) < 2:
+                        raise ValueError(f"DELAY требует количество шагов: {cmd_line}")
+                    delay_slots = int(parts[1], 0)
+                    if delay_slots < 0:
+                        raise ValueError(f"DELAY должен быть >= 0: {cmd_line}")
+                    delay_us = intan_spi_slots_to_us(delay_slots)
+                    if delay_us > 0:
+                        _reserve_slots(1)
+                        self.spi.pattern_add_delay_us(delay_us)
+                        loaded_count += 1
+
+            # Safety OFF: PATTERN_ADD_WRITE R42=0 U=1 (3 CS), если не задан в паттерне.
+            if not self._pattern_ends_with_r42_safety_off(validated_commands):
+                _reserve_slots(3)
+                self.spi.pattern_add_write(42, 0x0000, u_flag=1, m_flag=0)
+                loaded_count += 3
+
+            self.pattern_commands = validated_commands
+            self.pattern_loaded = True
+            self._log(
+                f"✓ Паттерн загружен в STM32: {loaded_count} команд, "
+                f"status={self.spi.pattern_status()}"
+            )
+            return loaded_count
+        
+        self.pattern_commands = validated_commands
+        self.pattern_loaded = True
+        self._log(f"✓ Паттерн загружен в память: {len(validated_commands)} команд")
+        
+        return len(validated_commands)
+
+    def _prepare_pattern_load_state(self):
+        """§1 prep перед pattern_load (intan_pi_gui_guide): INIT_STIM, safe OFF, CLEAR_COMP."""
+        if not self.spi:
+            return
+        if hasattr(self.spi, "stop_stream"):
+            self.spi.stop_stream()
+        if hasattr(self.spi, "init_stim"):
+            self.spi.init_stim()
+        else:
+            write_intan_register(self.spi, 32, 0xAAAA, u_flag=0, m_flag=0, verbose=False)
+            time.sleep(0.001)
+            write_intan_register(self.spi, 33, 0x00FF, u_flag=0, m_flag=0, verbose=False)
+            time.sleep(0.001)
+        write_intan_register(self.spi, 42, 0x0000, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        clear_compliance_monitor(self.spi, verbose=False)
+        time.sleep(0.001)
+
+    @staticmethod
+    def _pattern_ends_with_r42_safety_off(cmd_lines):
+        """Паттерн уже содержит надёжный OFF R42 (PATTERN_ADD_WRITE 42 0 …)."""
+        if not cmd_lines:
+            return False
+        parts = cmd_lines[-1].strip().split()
+        if len(parts) < 4 or parts[0].upper() != "PATTERN_ADD_WRITE":
+            return False
+        try:
+            reg = int(parts[1], 0)
+            value = int(parts[2], 0)
+        except ValueError:
+            return False
+        return reg == 42 and value == 0
 
     def _prepare_pattern_runtime_state(self):
+        """Unlock стима перед PATTERN_RUN: R32/R33, clear_comp, R34/R35."""
+        if not self.spi:
+            return
         reg32 = read_intan_register(self.spi, 32, verbose=False)
         reg33 = read_intan_register(self.spi, 33, verbose=False)
         if reg32 != 0xAAAA or reg33 != 0x00FF:
             if self.verbose:
-                self._log(f"⚠ Регистры 32-33 не установлены для стимуляции (0x{reg32:04X}/0x{reg33:04X}), устанавливаем...")
+                self._log(
+                    f"⚠ Регистры 32-33 не готовы для стима "
+                    f"(0x{reg32:04X}/0x{reg33:04X}), unlock..."
+                )
             write_intan_register(self.spi, 32, 0xAAAA, u_flag=0, m_flag=0, verbose=False)
             time.sleep(0.001)
             write_intan_register(self.spi, 33, 0x00FF, u_flag=0, m_flag=0, verbose=False)
@@ -642,101 +872,17 @@ class IntanController:
             time.sleep(0.001)
 
         reg34 = read_intan_register(self.spi, 34, verbose=False)
-        reg35 = read_intan_register(self.spi, 35, verbose=False)
-        step_reg34_is_1ua = reg34 == RHS2116_STIM_STEP_1UA
-        step_reg35_is_1ua = reg35 == RHS2116_STIM_BIAS_1UA
-        if not (step_reg34_is_1ua and step_reg35_is_1ua):
+        if reg34 != 0x00E2:
             if self.verbose:
-                self._log(
-                    "⚠ Register 34/35 не установлены для шага 1 µA "
-                    f"(0x{reg34:04X}/0x{reg35:04X}), восстанавливаем стандартные значения..."
-                )
-            write_intan_register(self.spi, 34, RHS2116_STIM_STEP_1UA, u_flag=0, m_flag=0, verbose=False)
-            write_intan_register(self.spi, 35, RHS2116_STIM_BIAS_1UA, u_flag=0, m_flag=0, verbose=False)
+                self._log(f"⚠ Register 34 = 0x{reg34:04X}, устанавливаем 0x00E2 (1 µA step)...")
+            write_intan_register(self.spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=False)
             time.sleep(0.001)
-
-    def _format_batch_results(self, compiled_ops, executed_ops, completed_ops):
-        results = []
-        for idx, (compiled_op, executed_op) in enumerate(zip(compiled_ops, executed_ops)):
-            if idx >= completed_ops:
-                break
-            if not compiled_op.get("_visible_result", True):
-                continue
-
-            cmd_type = compiled_op.get("_result_cmd")
-            if cmd_type == "WRITE":
-                results.append({
-                    "cmd": "WRITE",
-                    "reg": executed_op["reg"],
-                    "value": executed_op["value"],
-                    "status": "ok",
-                })
-            elif cmd_type == "READ":
-                results.append({
-                    "cmd": "READ",
-                    "reg": executed_op["reg"],
-                    "value": executed_op["value"],
-                    "status": "ok",
-                })
-            elif cmd_type == "CLEAR":
-                results.append({"cmd": "CLEAR", "status": "ok"})
-            elif cmd_type == "DELAY":
-                results.append({
-                    "cmd": "DELAY",
-                    "count": executed_op["count"],
-                    "status": "ok",
-                })
-        return results
-
-    def _execute_pattern_batch(self, compiled_ops, repeat_count=1):
-        results = []
-        driver_ops = [
-            {
-                "opcode": op["opcode"],
-                "reg": op.get("reg", 0),
-                "flags": op.get("flags", 0),
-                "value": op.get("value", 0),
-                "count": op.get("count", 0),
-            }
-            for op in compiled_ops
-        ]
-
-        for repeat_idx in range(repeat_count):
-            batch_result = self.spi.run_pattern(driver_ops)
-            results = self._format_batch_results(
-                compiled_ops,
-                batch_result.get("ops", []),
-                batch_result.get("completed_ops", len(compiled_ops)),
-            )
-            if repeat_idx < repeat_count - 1:
-                results = []
-
-        return results
-
-    def load_pattern(self, pattern_commands):
-        """
-        Загружает паттерн команд в память устройства без выполнения.
-        
-        Args:
-            pattern_commands: список команд в формате:
-                - "WRITE reg_addr value [U] [M]" - запись в регистр
-                - "READ reg_addr" - чтение регистра
-                - "CLEAR" - команда CLEAR
-                - "DELAY X" - задержка (X одношаговых SPI transfer)
-        
-        Returns:
-            количество загруженных команд
-        """
-        validated_commands, compiled_ops = self._compile_pattern_commands(pattern_commands)
-        self.pattern_commands = validated_commands
-        self.pattern_ops = compiled_ops
-        self.pattern_loaded = True
-        self._log(
-            f"✓ Паттерн загружен в память: {len(validated_commands)} команд, "
-            f"{len(compiled_ops)} batch-операций"
-        )
-        
-        return len(validated_commands)
+        reg35 = read_intan_register(self.spi, 35, verbose=False)
+        if reg35 != 0x00AA:
+            if self.verbose:
+                self._log(f"⚠ Register 35 = 0x{reg35:04X}, устанавливаем 0x00AA...")
+            write_intan_register(self.spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=False)
+            time.sleep(0.001)
 
     def run_pattern_from_memory(self, repeat_count=1):
         """
@@ -751,98 +897,44 @@ class IntanController:
         """
         if not self.pattern_loaded or not self.pattern_commands:
             raise RuntimeError("Паттерн не загружен в память. Используйте pattern_load сначала.")
+
+        if self.backend == "usb":
+            if self.spi is None or not hasattr(self.spi, "pattern_run"):
+                raise RuntimeError("USB STM32 firmware не поддерживает PATTERN_RUN")
+            if self.spi is None:
+                self.ensure_initialized()
+            self._prepare_pattern_runtime_state()
+            run_timeout_ms = max(60_000, int(repeat_count) * 500)
+            self._log(
+                f"▶ Запуск STM32 PATTERN_RUN: repeat_count={repeat_count}, "
+                f"timeout_ms={run_timeout_ms}"
+            )
+            reply = self.spi.pattern_run(
+                repeat_count=repeat_count, timeout_ms=run_timeout_ms
+            )
+            self._log(f"✓ STM32 PATTERN_RUN завершен: {reply}")
+            try:
+                write_intan_register(self.spi, 42, 0x0000, u_flag=1, m_flag=0, verbose=False)
+            except Exception as exc:
+                self._log(f"⚠ Не удалось выключить R42 после паттерна: {exc}")
+            # Не вызываем INIT_STIM сразу после стима — на осциллографе это даёт
+            # артефакт/удлинение последнего импульса; resync — при следующем READ/ID.
+            return [{"cmd": "PATTERN_RUN", "repeat_count": repeat_count, "reply": reply, "status": "ok"}]
         
-        return self.execute_pattern(
-            self.pattern_commands,
-            repeat_count=repeat_count,
-            compiled_ops=self.pattern_ops,
-        )
+        return self.execute_pattern(self.pattern_commands, repeat_count=repeat_count)
 
     def stop_all(self):
         """
         Выключает все стимуляторы.
         """
-        def _run():
-            if not self.initialized or self.spi is None:
-                return
-            write_intan_register(self.spi, 44, 0x0000, u_flag=0, m_flag=0, verbose=False)
-            time.sleep(0.001)
-            write_intan_register(self.spi, 46, 0x0000, u_flag=0, m_flag=0, verbose=False)
-            time.sleep(0.001)
-            write_intan_register(self.spi, 48, 0x0000, u_flag=0, m_flag=0, verbose=False)
-            time.sleep(0.001)
-            write_intan_register(self.spi, 42, 0x0000, u_flag=1, m_flag=0, verbose=False)
-            time.sleep(0.001)
-            write_intan_register(self.spi, 32, 0x0000, u_flag=0, m_flag=0, verbose=False)
-            time.sleep(0.001)
-            write_intan_register(self.spi, 33, 0x0000, u_flag=0, m_flag=0, verbose=False)
-            time.sleep(0.001)
-            clear_compliance_monitor(self.spi, verbose=False)
-            self.current_mode = "idle"
+        if not self.initialized or self.spi is None:
+            return
+        # Пустой список каналов => выключаем все (см. enable_stimulation_channels)
+        enable_stimulation_channels(
+            self.spi, [], enable=False, negative_polarity=False, verbose=self.verbose
+        )
 
-        self._run_coordinated_stimulation("stop", _run)
-
-    def _execute_pattern_slow(self, compiled_ops, repeat_count=1):
-        """
-        Совместимый по-командный fallback, если batch ioctl недоступен.
-        """
-        results = []
-        for repeat_idx in range(repeat_count):
-            for i, op in enumerate(compiled_ops):
-                try:
-                    cmd_type = op.get("_result_cmd")
-                    opcode = op["opcode"]
-
-                    if opcode == PATTERN_OP_WRITE_REG:
-                        reg_addr = op["reg"]
-                        value = op["value"]
-                        u_flag = op.get("flags", 0) & 0x1
-                        m_flag = (op.get("flags", 0) >> 1) & 0x1
-
-                        write_intan_register(self.spi, reg_addr, value, u_flag=u_flag, m_flag=m_flag, verbose=False)
-                        if u_flag == 1 or reg_addr == 42:
-                            time.sleep(0.002)
-                            if self.verbose and reg_addr == 42:
-                                read_back = read_intan_register(self.spi, reg_addr, verbose=False)
-                                if read_back != value:
-                                    self._log(
-                                        f"⚠ ВНИМАНИЕ: Регистр {reg_addr} не применился! "
-                                        f"Записано: 0x{value:04X}, прочитано: 0x{read_back:04X}"
-                                    )
-
-                        if op.get("_visible_result", True):
-                            results.append({"cmd": "WRITE", "reg": reg_addr, "value": value, "status": "ok"})
-
-                    elif opcode == PATTERN_OP_READ_REG:
-                        reg_addr = op["reg"]
-                        reg_value = read_intan_register(self.spi, reg_addr, verbose=False)
-                        if op.get("_visible_result", True):
-                            results.append({"cmd": "READ", "reg": reg_addr, "value": reg_value, "status": "ok"})
-
-                    elif opcode == PATTERN_OP_CLEAR_ADC:
-                        clear_adc(self.spi, verbose=False)
-                        if op.get("_visible_result", True):
-                            results.append({"cmd": "CLEAR", "status": "ok"})
-
-                    elif opcode == PATTERN_OP_DELAY:
-                        delay_count = op.get("count", 0)
-                        for _ in range(delay_count):
-                            self.spi.delay_step()
-                        if op.get("_visible_result", True):
-                            results.append({"cmd": "DELAY", "count": delay_count, "status": "ok"})
-
-                    else:
-                        raise ValueError(f"Неизвестная batch-операция: {opcode}")
-
-                except Exception as e:
-                    results.append({"cmd": cmd_type or opcode, "status": "error", "error": str(e)})
-
-            if repeat_idx < repeat_count - 1:
-                results = []
-
-        return results
-
-    def execute_pattern(self, pattern_commands, repeat_count=1, compiled_ops=None):
+    def execute_pattern(self, pattern_commands, repeat_count=1):
         """
         Выполняет паттерн команд для стимуляции.
         
@@ -851,42 +943,167 @@ class IntanController:
                 - "WRITE reg_addr value [U] [M]" - запись в регистр
                 - "READ reg_addr" - чтение регистра
                 - "CLEAR" - команда CLEAR
-                - "DELAY X" - задержка (X одношаговых SPI transfer)
+                - "DELAY X" - задержка (X раз READ 255)
             repeat_count: количество повторений паттерна (по умолчанию 1)
-            compiled_ops: опциональный скомпилированный batch-представление паттерна
         
         Returns:
             список результатов выполнения команд (только для последнего повторения)
         """
-        def _run():
-            try:
-                self.ensure_stimulation_ready()
-            except Exception as e:
-                raise RuntimeError(f"Ошибка инициализации: {e}")
-
-            if repeat_count < 1:
-                raise ValueError("repeat_count должен быть >= 1")
-
-            self._prepare_pattern_runtime_state()
-
-            effective_compiled_ops = compiled_ops
-            if effective_compiled_ops is None:
-                _, effective_compiled_ops = self._compile_pattern_commands(pattern_commands)
-
-            if self._supports_batch_pattern() and effective_compiled_ops:
+        try:
+            self.ensure_initialized()
+        except Exception as e:
+            raise RuntimeError(f"Ошибка инициализации: {e}")
+        
+        # КРИТИЧНО: Проверяем, что регистры 32-33 установлены для работы стимуляторов
+        # Это необходимо для того, чтобы стимуляция работала
+        reg32 = read_intan_register(self.spi, 32, verbose=False)
+        reg33 = read_intan_register(self.spi, 33, verbose=False)
+        if reg32 != 0xAAAA or reg33 != 0x00FF:
+            if self.verbose:
+                self._log(f"⚠ Регистры 32-33 не установлены для стимуляции (0x{reg32:04X}/0x{reg33:04X}), устанавливаем...")
+            write_intan_register(self.spi, 32, 0xAAAA, u_flag=0, m_flag=0, verbose=False)
+            time.sleep(0.001)
+            write_intan_register(self.spi, 33, 0x00FF, u_flag=0, m_flag=0, verbose=False)
+            time.sleep(0.001)
+            clear_compliance_monitor(self.spi, verbose=False)
+            time.sleep(0.001)
+        
+        # КРИТИЧНО: Проверяем, что Register 34 (step size) установлен правильно
+        # Согласно даташиту, Register 34 должен быть 0x00E2 для шага 1 µA
+        # Без правильного step size токи будут неправильными!
+        reg34 = read_intan_register(self.spi, 34, verbose=False)
+        if reg34 != 0x00E2:
+            if self.verbose:
+                self._log(f"⚠ Register 34 (step size) не установлен правильно (0x{reg34:04X}), устанавливаем 0x00E2 (1 µA step)...")
+            write_intan_register(self.spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=False)
+            time.sleep(0.001)
+        
+        # КРИТИЧНО: Проверяем, что Register 35 (bias) установлен правильно
+        # Согласно даташиту, Register 35 должен быть 0x00AA для шага 1 µA
+        reg35 = read_intan_register(self.spi, 35, verbose=False)
+        if reg35 != 0x00AA:
+            if self.verbose:
+                self._log(f"⚠ Register 35 (bias) не установлен правильно (0x{reg35:04X}), устанавливаем 0x00AA (для шага 1 µA)...")
+            write_intan_register(self.spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=False)
+            time.sleep(0.001)
+        
+        if repeat_count < 1:
+            raise ValueError("repeat_count должен быть >= 1")
+        
+        results = []
+        
+        # Выполняем паттерн указанное количество раз
+        for repeat_idx in range(repeat_count):
+            for i, cmd_line in enumerate(pattern_commands):
+                if i >= 200:  # Ограничение на 200 команд
+                    break
+                
+                cmd_line = cmd_line.strip()
+                if not cmd_line or cmd_line.startswith('#'):
+                    continue  # Пропускаем пустые строки и комментарии
+                
                 try:
-                    return self._execute_pattern_batch(effective_compiled_ops, repeat_count=repeat_count)
-                except AttributeError:
-                    pass
-                except OSError as e:
-                    if getattr(e, "errno", None) != 25:
-                        raise
-                    if self.verbose:
-                        self._log("⚠ Batch ioctl недоступен в текущем модуле, откат на per-command path")
-
-            return self._execute_pattern_slow(effective_compiled_ops, repeat_count=repeat_count)
-
-        return self._run_coordinated_stimulation("pattern_run", _run)
+                    parts = cmd_line.split()
+                    if not parts:
+                        continue
+                    
+                    cmd_type = parts[0].upper()
+                    
+                    if cmd_type == "WRITE":
+                        # Формат: WRITE reg_addr value [U] [M]
+                        if len(parts) < 3:
+                            raise ValueError(f"WRITE требует минимум 2 параметра: регистр и значение")
+                        reg_addr = int(parts[1], 0)  # Поддержка hex (0x...) и десятичного формата
+                        value = int(parts[2], 0)  # Поддержка hex (0x...) и десятичного формата
+                        u_flag = 1 if "U" in parts else 0
+                        m_flag = 1 if "M" in parts else 0
+                        
+                        # КРИТИЧНО: Автоматическое преобразование значений для регистров токов стимуляции
+                        # Регистры 64-79 (отрицательные токи) и 96-111 (положительные токи)
+                        # Согласно даташиту: формат регистров:
+                        # - Биты [15:8] = current trim [7:0] (0x80 = 128 = нормальное значение без подстройки, диапазон ±28%)
+                        # - Биты [7:0] = current magnitude [7:0] (величина тока, 0-255)
+                        # Формат: 0x80XX, где 0x80 = trim (128), XX - значение тока (0-255)
+                        # ВАЖНО: Значение в регистре - это МНОЖИТЕЛЬ шага (Register 34), а не прямой ток!
+                        # При step size = 1 µA (Register 34 = 0x00E2), значение 1 = 1 µA, значение 10 = 10 µA
+                        if (64 <= reg_addr <= 79) or (96 <= reg_addr <= 111):
+                            # Проверяем, что Register 34 установлен правильно (0x00E2 для шага 1 µA)
+                            reg34_check = read_intan_register(self.spi, 34, verbose=False)
+                            if reg34_check != 0x00E2:
+                                if self.verbose:
+                                    self._log(f"⚠ ВНИМАНИЕ: Register 34 = 0x{reg34_check:04X} (ожидается 0x00E2 для шага 1 µA)!")
+                                # Устанавливаем Register 34 в правильное значение
+                                write_intan_register(self.spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=False)
+                                time.sleep(0.001)
+                                # Устанавливаем Register 35 в правильное значение
+                                write_intan_register(self.spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=False)
+                                time.sleep(0.001)
+                            
+                            # Если значение не в формате 0x80XX, преобразуем его
+                            if value < 0x8000 or value > 0x80FF:
+                                # Предполагаем, что значение - это ток в µA (0-255)
+                                if 0 <= value <= 255:
+                                    value = 0x8000 | (value & 0xFF)
+                                    if self.verbose:
+                                        self._log(f"  Преобразовано значение тока: {value & 0xFF} µA -> 0x{value:04X}")
+                                else:
+                                    raise ValueError(f"Значение тока должно быть в диапазоне 0-255 µA или в формате 0x80XX, получено: {value}")
+                            else:
+                                # Значение уже в формате 0x80XX, проверяем его
+                                current_ua = value & 0xFF
+                                if self.verbose:
+                                    self._log(f"  Установка тока: регистр {reg_addr} = 0x{value:04X} (ток = {current_ua} µA при шаге 1 µA)")
+                        
+                        write_intan_register(self.spi, reg_addr, value, u_flag=u_flag, m_flag=m_flag, verbose=False)
+                        
+                        # ВАЖНО: Задержка после записи в triggered registers для их применения
+                        # Регистры 42, 44, 64-79, 96-111 являются triggered registers и требуют времени на применение
+                        if u_flag == 1 or reg_addr in [42, 44] or (64 <= reg_addr <= 79) or (96 <= reg_addr <= 111):
+                            time.sleep(0.002)  # Увеличена задержка для гарантированного применения triggered register
+                            # Проверяем, что регистр применился (для отладки)
+                            if self.verbose and reg_addr in [42, 44]:
+                                read_back = read_intan_register(self.spi, reg_addr, verbose=False)
+                                if read_back != value:
+                                    self._log(f"⚠ ВНИМАНИЕ: Регистр {reg_addr} не применился! Записано: 0x{value:04X}, прочитано: 0x{read_back:04X}")
+                        
+                        results.append({"cmd": "WRITE", "reg": reg_addr, "value": value, "status": "ok"})
+                    
+                    elif cmd_type == "READ":
+                        # Формат: READ reg_addr
+                        if len(parts) < 2:
+                            raise ValueError(f"READ требует параметр: адрес регистра")
+                        reg_addr = int(parts[1], 0)  # Поддержка hex (0x...) и десятичного формата
+                        
+                        reg_value = read_intan_register(self.spi, reg_addr, verbose=False)
+                        results.append({"cmd": "READ", "reg": reg_addr, "value": reg_value, "status": "ok"})
+                    
+                    elif cmd_type == "CLEAR":
+                        # Формат: CLEAR
+                        clear_adc(self.spi, verbose=False)
+                        results.append({"cmd": "CLEAR", "status": "ok"})
+                    
+                    elif cmd_type == "DELAY":
+                        # Формат: DELAY X (X раз READ 255)
+                        if len(parts) < 2:
+                            raise ValueError(f"DELAY требует параметр: количество READ 255")
+                        delay_count = int(parts[1])
+                        
+                        for j in range(delay_count):
+                            read_intan_register(self.spi, 255, verbose=False)
+                        results.append({"cmd": "DELAY", "count": delay_count, "status": "ok"})
+                    
+                    else:
+                        raise ValueError(f"Неизвестная команда: {cmd_type}")
+                        
+                except Exception as e:
+                    error_msg = f"Ошибка в команде [{i+1}] '{cmd_line}': {e}"
+                    results.append({"cmd": cmd_line, "status": "error", "error": str(e)})
+            
+            # Сохраняем результаты только для последнего повторения
+            if repeat_idx < repeat_count - 1:
+                results = []  # Очищаем результаты для промежуточных повторений
+        
+        return results
 
     def close(self):
         """
@@ -896,12 +1113,15 @@ class IntanController:
             self.stop_all()
         except Exception:
             pass
+        if self.backend == "usb":
+            self.spi = self.transport
+            self.initialized = False
+            return
         try:
             if self.spi is not None:
                 self.spi.close()
         except Exception:
             pass
-        self.current_mode = "unknown"
 
 
 class IntanTCPHandler(socketserver.StreamRequestHandler):
@@ -967,37 +1187,9 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
                     return default
         return default
 
-    def _compute_impedance_metrics_from_samples(self, samples, freq_hz, c_farad, samples_per_period=None):
-        """ADC samples -> Z (ohm), v_amp_uv, phase_deg. Phase is Z phase relative to current."""
-        if not samples:
-            return 0.0, 0.0, 0.0
-        values_uv = [0.195 * (int(adc) - 32768) for adc in samples]
-        mean_uv = sum(values_uv) / len(values_uv)
-        values_ac = [x - mean_uv for x in values_uv]
-        n = len(values_ac)
-        if not samples_per_period or samples_per_period <= 0:
-            samples_per_period = n
-        sin_proj = 0.0
-        cos_proj = 0.0
-        for i, x in enumerate(values_ac):
-            angle = 2.0 * math.pi * (i % samples_per_period) / samples_per_period
-            sin_proj += x * math.sin(angle)
-            cos_proj += x * math.cos(angle)
-        sin_coeff = (2.0 / n) * sin_proj
-        cos_coeff = (2.0 / n) * cos_proj
-        v_amp_uv = (sin_coeff * sin_coeff + cos_coeff * cos_coeff) ** 0.5
-        v_dac = 0.6125
-        i_amp = 2.0 * math.pi * freq_hz * c_farad * v_dac
-        z_ohm = (v_amp_uv * 1e-6 / i_amp) if i_amp > 0 else 0.0
-        phase_v_vs_dac_deg = math.degrees(math.atan2(cos_coeff, sin_coeff))
-        phase_deg = phase_v_vs_dac_deg - 90.0
-        while phase_deg <= -180.0:
-            phase_deg += 360.0
-        while phase_deg > 180.0:
-            phase_deg -= 360.0
-        return z_ohm, v_amp_uv, phase_deg
-
-    def _compute_impedance_metrics_from_accumulators(self, sin_accum, cos_accum, sample_count, freq_hz, c_farad, samples_per_period):
+    def _compute_impedance_metrics_from_accumulators(
+        self, sin_accum, cos_accum, sample_count, freq_hz, c_farad, samples_per_period
+    ):
         """Fixed-point projections from driver -> Z (ohm), v_amp_uv, phase_deg."""
         if sample_count <= 0:
             return 0.0, 0.0, 0.0
@@ -1042,12 +1234,12 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
         sin_coeff_basis = ((rhs_s * sum_c2) - (rhs_c * sum_sc)) / det
         cos_coeff_basis = ((sum_s2 * rhs_c) - (sum_sc * rhs_s)) / det
 
-        # The driver uses a zero-mean basis scaled by samples_per_period, so
-        # convert the fitted basis coefficients back to ADC-code amplitudes.
         basis_scale = 127.0 * float(samples_per_period)
         sin_coeff_codes = basis_scale * sin_coeff_basis
         cos_coeff_codes = basis_scale * cos_coeff_basis
-        v_amp_uv = 0.195 * ((sin_coeff_codes * sin_coeff_codes) + (cos_coeff_codes * cos_coeff_codes)) ** 0.5
+        v_amp_uv = 0.195 * (
+            (sin_coeff_codes * sin_coeff_codes) + (cos_coeff_codes * cos_coeff_codes)
+        ) ** 0.5
         v_dac = 0.6125
         i_amp = 2.0 * math.pi * freq_hz * c_farad * v_dac
         z_ohm = (v_amp_uv * 1e-6 / i_amp) if i_amp > 0 else 0.0
@@ -1060,10 +1252,12 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
         return z_ohm, v_amp_uv, phase_deg
 
     def _process_measure_impedance_fast(self, cmd_obj):
-        """Быстрый замер импеданса через /dev/intan с одной командой GUI->сервер."""
+        """Быстрый замер импеданса (USB или /dev/intan) одной командой GUI->сервер."""
         self.controller.ensure_initialized()
         if not hasattr(self.controller.spi, "measure_impedance_raw"):
-            raise RuntimeError("measure_impedance_fast требует backend /dev/intan")
+            raise RuntimeError(
+                "measure_impedance_fast требует backend с measure_impedance_raw (USB или /dev/intan)"
+            )
 
         channel = int(cmd_obj.get("channel", 0))
         freq_hz = float(cmd_obj.get("frequency", 1000))
@@ -1120,17 +1314,18 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
 
         try:
             for reg in (1, 2, 3, 32, 33, 42, 44, 46, 48):
-                saved_state[reg] = read_intan_register(self.controller.spi, reg, verbose=False)
+                saved_state[reg] = read_intan_register(
+                    self.controller.spi, reg, verbose=False
+                )
 
             self.controller._run_rhs2116_sequence(rhs2116_safe_impedance_commands())
 
             if phase_safe:
                 reg1_before = saved_state.get(1)
-                # RHS2116 Register 1 layout:
-                # bit 5 = absmode, bit 4 = DSPen, bits 3:0 = DSP cutoff.
-                # For true phase-safe mode we must clear all of them.
                 reg1_applied = reg1_before & ~0x003F
-                write_intan_register(self.controller.spi, 1, reg1_applied, u_flag=0, m_flag=0, verbose=False)
+                write_intan_register(
+                    self.controller.spi, 1, reg1_applied, u_flag=0, m_flag=0, verbose=False
+                )
                 reg_restore = reg1_before
                 before = _decode_reg1(reg1_before)
                 applied = _decode_reg1(reg1_applied)
@@ -1178,7 +1373,7 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
                         best_dist = dist
                         best_scale = (sstr, sb, cf)
                 if best_scale is None:
-                    raise RuntimeError("Автовыбор шкалы не получил данных от драйвера")
+                    raise RuntimeError("Автовыбор шкалы не получил данных")
                 scale_str, scale_bits, c_farad = best_scale
             else:
                 scale_bits, c_farad = scale_map[scale_str]
@@ -1208,16 +1403,34 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
                     points_raw.append((z_ohm, z_corr, v_amp_uv, phase_deg))
         finally:
             if reg_restore is not None:
-                write_intan_register(self.controller.spi, 1, reg_restore, u_flag=0, m_flag=0, verbose=False)
+                write_intan_register(
+                    self.controller.spi, 1, reg_restore, u_flag=0, m_flag=0, verbose=False
+                )
             if saved_state:
-                write_intan_register(self.controller.spi, 32, saved_state.get(32, 0x0000), u_flag=0, m_flag=0, verbose=False)
-                write_intan_register(self.controller.spi, 33, saved_state.get(33, 0x0000), u_flag=0, m_flag=0, verbose=False)
-                write_intan_register(self.controller.spi, 2, saved_state.get(2, 0x0000), u_flag=0, m_flag=0, verbose=False)
-                write_intan_register(self.controller.spi, 3, saved_state.get(3, 0x0080), u_flag=0, m_flag=0, verbose=False)
-                write_intan_register(self.controller.spi, 44, saved_state.get(44, 0x0000), u_flag=0, m_flag=0, verbose=False)
-                write_intan_register(self.controller.spi, 46, saved_state.get(46, 0x0000), u_flag=0, m_flag=0, verbose=False)
-                write_intan_register(self.controller.spi, 48, saved_state.get(48, 0x0000), u_flag=0, m_flag=0, verbose=False)
-                write_intan_register(self.controller.spi, 42, saved_state.get(42, 0x0000), u_flag=1, m_flag=0, verbose=False)
+                write_intan_register(
+                    self.controller.spi, 32, saved_state.get(32, 0x0000), u_flag=0, m_flag=0, verbose=False
+                )
+                write_intan_register(
+                    self.controller.spi, 33, saved_state.get(33, 0x0000), u_flag=0, m_flag=0, verbose=False
+                )
+                write_intan_register(
+                    self.controller.spi, 2, saved_state.get(2, 0x0000), u_flag=0, m_flag=0, verbose=False
+                )
+                write_intan_register(
+                    self.controller.spi, 3, saved_state.get(3, 0x0080), u_flag=0, m_flag=0, verbose=False
+                )
+                write_intan_register(
+                    self.controller.spi, 44, saved_state.get(44, 0x0000), u_flag=0, m_flag=0, verbose=False
+                )
+                write_intan_register(
+                    self.controller.spi, 46, saved_state.get(46, 0x0000), u_flag=0, m_flag=0, verbose=False
+                )
+                write_intan_register(
+                    self.controller.spi, 48, saved_state.get(48, 0x0000), u_flag=0, m_flag=0, verbose=False
+                )
+                write_intan_register(
+                    self.controller.spi, 42, saved_state.get(42, 0x0000), u_flag=1, m_flag=0, verbose=False
+                )
 
         if len(points_raw) < 2:
             raise RuntimeError(f"Недостаточно валидных измерений (V_amp < {v_amp_min} µV)")
@@ -1298,13 +1511,34 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
             clear_adc(self.controller.spi, verbose=False)
             return "CLEAR RESP: OK"
 
+        if cmd == "CLEAR_COMP":
+            if hasattr(self.controller.spi, "run_intan_command"):
+                self.controller.spi.run_intan_command("CLEAR_COMP")
+            else:
+                clear_compliance_monitor(self.controller.spi, verbose=False)
+            return "CLEAR_COMP RESP: OK"
+
+        if cmd == "INIT_STIM":
+            if hasattr(self.controller.spi, "run_intan_command"):
+                reply = self.controller.spi.run_intan_command("INIT_STIM", timeout_ms=15000)
+            else:
+                self.controller.ensure_initialized()
+                reply = "OK (ensure_initialized)"
+            return f"INIT_STIM RESP: {reply}"
+
+        if cmd == "PATTERN_STATUS":
+            if hasattr(self.controller.spi, "pattern_status"):
+                reply = self.controller.spi.pattern_status()
+            else:
+                reply = "N/A"
+            return f"PATTERN_STATUS RESP: {reply}"
+
         if cmd == "WRITE":
             if len(parts) < 3:
                 raise ValueError("WRITE требует формат: WRITE <reg> <value> [U] [M]")
             reg_addr = int(parts[1], 0)
             value = int(parts[2], 0)
-            u_flag = self._parse_flag(parts, "U", default=0)
-            m_flag = self._parse_flag(parts, "M", default=0)
+            u_flag, m_flag = parse_write_um_flags(parts)
             write_intan_register(
                 self.controller.spi,
                 reg_addr,
@@ -1327,7 +1561,7 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
                 raise ValueError("DELAY требует формат: DELAY <count>")
             delay_count = int(parts[1], 0)
             for _ in range(delay_count):
-                self.controller.spi.delay_step()
+                read_intan_register(self.controller.spi, 255, verbose=False)
             return f"DELAY RESP: {delay_count}"
 
         if cmd == "CONVERT":
@@ -1343,28 +1577,17 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
             if channel == 63 and hasattr(self.controller.spi, "convert_channel_auto"):
                 adc_value = self.controller.spi.convert_channel_auto()
             elif hasattr(self.controller.spi, "convert_channel"):
-                adc_value = self.controller.spi.convert_channel(channel, amp_type=amp_type, h_flag=h_flag)
+                adc_value = self.controller.spi.convert_channel(
+                    channel, amp_type=amp_type, h_flag=h_flag
+                )
             else:
-                cmd_word = 0x00000000
-                cmd_word |= (channel << 16)
-                if d_flag:
-                    cmd_word |= (1 << 27)
-                if h_flag:
-                    cmd_word |= (1 << 26)
+                adc_value = convert_intan(
+                    self.controller.spi,
+                    channel,
+                    amp_type=amp_type,
+                    h_flag=h_flag,
+                )
 
-                cmd_bytes = [
-                    (cmd_word >> 24) & 0xFF,
-                    (cmd_word >> 16) & 0xFF,
-                    (cmd_word >> 8) & 0xFF,
-                    cmd_word & 0xFF,
-                ]
-                dummy = [0x00, 0x00, 0x00, 0x00]
-                self.controller.spi.transfer(cmd_bytes)
-                self.controller.spi.transfer(dummy)
-                resp3 = self.controller.spi.transfer(dummy)
-                adc_value = (resp3[0] << 8) | resp3[1]
-
-            # Совместимо с текущим GUI: он ищет 0x... и берет старшие 16 бит результата.
             resp32 = ((adc_value & 0xFFFF) << 16) & 0xFFFFFFFF
             return f"CONVERT RESP [ch {channel}]: 0x{resp32:08X}"
 
@@ -1429,20 +1652,18 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
 
         if cmd == "init":
             # Принудительная инициализация (если нужно заранее)
-            with self.controller.shared_state.chip_lock:
-                self.controller.ensure_recording_ready()
+            self.controller.ensure_initialized()
             return {"status": "ok", "cmd": "init"}
 
         if cmd == "close":
-            with self.controller.shared_state.chip_lock:
-                self.controller.close()
+            self.controller.close()
             return {"status": "ok", "cmd": "close"}
 
         if cmd == "read_temperature":
-            raise RuntimeError(
-                "RHS2116 не имеет отдельного temperature register в текущем контракте. "
-                "Команда read_temperature отключена, потому что Register 3 используется для Zcheck DAC."
-            )
+            """Читает температуру из регистра 3"""
+            self.controller.ensure_initialized()
+            temp_value = read_intan_register(self.controller.spi, 3, verbose=self.controller.verbose)
+            return {"status": "ok", "cmd": "read_temperature", "temperature": temp_value}
 
         if cmd == "read_register":
             """Читает значение регистра Intan"""
@@ -1450,9 +1671,10 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
             if not (0 <= address <= 255):
                 raise ValueError("address должен быть в диапазоне 0-255")
 
-            with self.controller.shared_state.chip_lock:
-                self.controller.ensure_initialized()
-                value = read_intan_register(self.controller.spi, address, verbose=self.controller.verbose)
+            self.controller.ensure_chip_ready()
+            value = read_intan_register(
+                self.controller.spi, address, verbose=self.controller.verbose
+            )
             return {
                 "status": "ok",
                 "cmd": "read_register",
@@ -1462,8 +1684,7 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
 
         if cmd == "send_line":
             raw_line = cmd_obj.get("line", "")
-            with self.controller.shared_state.chip_lock:
-                response = self._process_send_line(raw_line)
+            response = self._process_send_line(raw_line)
             return {
                 "status": "ok",
                 "cmd": "send_line",
@@ -1472,8 +1693,7 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
             }
 
         if cmd == "measure_impedance_fast":
-            with self.controller.shared_state.chip_lock:
-                return self._process_measure_impedance_fast(cmd_obj)
+            return self._process_measure_impedance_fast(cmd_obj)
 
         if cmd == "measure_impedance":
             """Измеряет импеданс на указанном канале"""
@@ -1487,77 +1707,85 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
             
             if not (0 < test_current_nA <= 1000):
                 raise ValueError("test_current_nA должен быть в диапазоне 0-1000 nA")
-
-            with self.controller.shared_state.chip_lock:
-                controller_was_initialized = self.controller.initialized
-                controller_mode_before = self.controller.current_mode
-
-                from intan_udp_recorder import IntanRecorder
-                recorder = IntanRecorder(
-                    gpio_number=self.controller.gpio_number,
-                    spi_device=self.controller.spi_device,
-                    verbose=self.controller.verbose,
-                    shared_state=self.controller.shared_state,
+            
+            # КРИТИЧНО: Сохраняем состояние инициализации контроллера
+            # Контроллер должен быть инициализирован для стимуляции
+            controller_was_initialized = self.controller.initialized
+            
+            # Используем метод из IntanRecorder для измерения импеданса
+            # НЕ вызываем ensure_initialized() для recorder, чтобы не сбросить регистры
+            from intan_udp_recorder import IntanRecorder
+            recorder = IntanRecorder(
+                gpio_number=self.controller.gpio_number,
+                spi_device=self.controller.spi_device,
+                verbose=self.controller.verbose
+            )
+            # ВАЖНО: Используем SPI напрямую, не инициализируем recorder
+            # Это предотвратит сброс регистров стимуляции
+            if not recorder.spi:
+                recorder.spi = self.controller.spi
+            if not recorder.gpio:
+                recorder.gpio = self.controller.gpio
+            
+            # КРИТИЧНО: Выполняем несколько измерений и усредняем для стабильности
+            # Это уменьшает влияние шума и артефактов на результат
+            num_measurements = int(cmd_obj.get("num_measurements", 3))  # По умолчанию 3 измерения
+            measurements = []
+            
+            for i in range(num_measurements):
+                result = recorder.measure_impedance(
+                    channel=channel,
+                    test_current_nA=test_current_nA,
+                    frequency=frequency,
+                    num_samples=num_samples
                 )
-                if not recorder.spi:
-                    recorder.spi = self.controller.spi
-                if not recorder.gpio:
-                    recorder.gpio = self.controller.gpio
-
-                num_measurements = int(cmd_obj.get("num_measurements", 3))
-                measurements = []
-                for i in range(num_measurements):
-                    result = recorder.measure_impedance(
-                        channel=channel,
-                        test_current_nA=test_current_nA,
-                        frequency=frequency,
-                        num_samples=num_samples
-                    )
-                    measurements.append(result)
-                    if i < num_measurements - 1:
-                        time.sleep(0.1)
-
-                if num_measurements > 1:
-                    avg_impedance = sum(m.get("impedance_ohm", 0) for m in measurements) / len(measurements)
-                    avg_adc_rms = sum(m.get("adc_rms", 0) for m in measurements) / len(measurements)
-                    avg_voltage_rms = sum(m.get("voltage_rms", 0) for m in measurements) / len(measurements)
-                    avg_voltage_peak = sum(m.get("voltage_peak", 0) for m in measurements) / len(measurements)
-
-                    if NUMPY_AVAILABLE:
-                        impedances = [m.get("impedance_ohm", 0) for m in measurements]
-                        std_dev = np.std(impedances)
-                    else:
-                        impedances = [m.get("impedance_ohm", 0) for m in measurements]
-                        mean_imp = sum(impedances) / len(impedances)
-                        variance = sum((x - mean_imp) ** 2 for x in impedances) / len(impedances)
-                        std_dev = math.sqrt(variance)
-
-                    result = {
-                        "impedance_ohm": float(avg_impedance),
-                        "adc_rms": float(avg_adc_rms),
-                        "voltage_rms": float(avg_voltage_rms),
-                        "voltage_peak": float(avg_voltage_peak),
-                        "test_current_nA": float(test_current_nA),
-                        "frequency": float(frequency),
-                        "channel": int(channel),
-                        "num_measurements": num_measurements,
-                        "std_dev_ohm": float(std_dev),
-                        "measurements": measurements
-                    }
+                measurements.append(result)
+                # Небольшая задержка между измерениями для стабилизации
+                if i < num_measurements - 1:
+                    time.sleep(0.1)
+            
+            # Усредняем результаты для стабильности
+            if num_measurements > 1:
+                avg_impedance = sum(m.get("impedance_ohm", 0) for m in measurements) / len(measurements)
+                avg_adc_rms = sum(m.get("adc_rms", 0) for m in measurements) / len(measurements)
+                avg_voltage_rms = sum(m.get("voltage_rms", 0) for m in measurements) / len(measurements)
+                avg_voltage_peak = sum(m.get("voltage_peak", 0) for m in measurements) / len(measurements)
+                
+                # Вычисляем стандартное отклонение для оценки стабильности
+                if NUMPY_AVAILABLE:
+                    impedances = [m.get("impedance_ohm", 0) for m in measurements]
+                    std_dev = np.std(impedances)
                 else:
-                    result = measurements[0] if measurements else {}
-
-                if controller_was_initialized:
-                    if controller_mode_before == "stimulation":
-                        if self.controller.verbose:
-                            self.controller._log("Восстановление stimulation mode после измерения импеданса...")
-                        self.controller.ensure_stimulation_ready()
-                    elif controller_mode_before == "recording":
-                        if self.controller.verbose:
-                            self.controller._log("Восстановление recording mode после измерения импеданса...")
-                        self.controller.ensure_recording_ready()
-                    else:
-                        self.controller.current_mode = controller_mode_before
+                    impedances = [m.get("impedance_ohm", 0) for m in measurements]
+                    mean_imp = sum(impedances) / len(impedances)
+                    variance = sum((x - mean_imp) ** 2 for x in impedances) / len(impedances)
+                    std_dev = math.sqrt(variance)
+                
+                result = {
+                    "impedance_ohm": float(avg_impedance),
+                    "adc_rms": float(avg_adc_rms),
+                    "voltage_rms": float(avg_voltage_rms),
+                    "voltage_peak": float(avg_voltage_peak),
+                    "test_current_nA": float(test_current_nA),
+                    "frequency": float(frequency),
+                    "channel": int(channel),
+                    "num_measurements": num_measurements,
+                    "std_dev_ohm": float(std_dev),  # Стандартное отклонение для оценки стабильности
+                    "measurements": measurements  # Все отдельные измерения для анализа
+                }
+            else:
+                result = measurements[0] if measurements else {}
+            
+            # КРИТИЧНО: После измерения импеданса переинициализируем контроллер для стимуляции
+            # Это гарантирует, что все регистры стимуляции будут правильно настроены
+            if controller_was_initialized:
+                if self.controller.verbose:
+                    self.controller._log("Переинициализация контроллера для стимуляции после измерения импеданса...")
+                # Сбрасываем флаг инициализации и переинициализируем
+                self.controller.initialized = False
+                self.controller.ensure_initialized()
+                if self.controller.verbose:
+                    self.controller._log("✓ Контроллер переинициализирован для стимуляции")
             
             return {
                 "status": "ok",
@@ -1597,32 +1825,35 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
 
         if cmd == "configure_adc":
             """Настраивает Register 0 (ADC buffer bias и MUX bias)"""
-            with self.controller.shared_state.chip_lock:
-                self.controller.ensure_recording_ready()
+            self.controller.ensure_initialized()
             
-                # Получаем значение Register 0 из команды или формируем из параметров
-                if "register_0" in cmd_obj:
-                    reg0_value = int(cmd_obj.get("register_0"))
-                else:
-                    adc_buffer_bias = int(cmd_obj.get("adc_buffer_bias", 3))
-                    mux_bias = int(cmd_obj.get("mux_bias", 5))
-
-                    if not (0 <= adc_buffer_bias <= 255):
-                        raise ValueError("ADC buffer bias должен быть в диапазоне 0-255")
-                    if not (0 <= mux_bias <= 255):
-                        raise ValueError("MUX bias должен быть в диапазоне 0-255")
-
-                    reg0_value = (adc_buffer_bias << 8) | mux_bias
-
-                write_intan_register(
-                    self.controller.spi,
-                    0,
-                    reg0_value,
-                    u_flag=0,
-                    m_flag=0,
-                    verbose=self.controller.verbose
-                )
-                time.sleep(0.001)
+            # Получаем значение Register 0 из команды или формируем из параметров
+            if "register_0" in cmd_obj:
+                reg0_value = int(cmd_obj.get("register_0"))
+            else:
+                # Формируем Register 0 из отдельных параметров
+                adc_buffer_bias = int(cmd_obj.get("adc_buffer_bias", 3))
+                mux_bias = int(cmd_obj.get("mux_bias", 5))
+                
+                # Проверяем диапазоны
+                if not (0 <= adc_buffer_bias <= 255):
+                    raise ValueError("ADC buffer bias должен быть в диапазоне 0-255")
+                if not (0 <= mux_bias <= 255):
+                    raise ValueError("MUX bias должен быть в диапазоне 0-255")
+                
+                # Формируем Register 0: биты [15:8] = ADC buffer bias, биты [7:0] = MUX bias
+                reg0_value = (adc_buffer_bias << 8) | mux_bias
+            
+            # Записываем Register 0
+            write_intan_register(
+                self.controller.spi, 
+                0, 
+                reg0_value, 
+                u_flag=0, 
+                m_flag=0, 
+                verbose=self.controller.verbose
+            )
+            time.sleep(0.001)  # Небольшая задержка для применения
             
             return {
                 "status": "ok",
@@ -1635,36 +1866,45 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
 
         if cmd == "configure_filters":
             """Настраивает аппаратные фильтры (Registers 1, 4, 5, 6, 7)"""
-            with self.controller.shared_state.chip_lock:
-                self.controller.ensure_recording_ready()
-
-                reg1 = int(cmd_obj.get("register_1", 0x051A))
-                reg4 = int(cmd_obj.get("register_4", 0x0016))
-                reg5 = int(cmd_obj.get("register_5", 0x0017))
-                reg6 = int(cmd_obj.get("register_6", 0x00A8))
-                reg7 = int(cmd_obj.get("register_7", 0x000A))
-
-                for reg_val, reg_name in [(reg1, "Register 1"), (reg4, "Register 4"),
-                                          (reg5, "Register 5"), (reg6, "Register 6"),
-                                          (reg7, "Register 7")]:
-                    if not (0 <= reg_val <= 0xFFFF):
-                        raise ValueError(f"{reg_name} должен быть в диапазоне 0-0xFFFF")
-
-                write_intan_register(self.controller.spi, 1, reg1, u_flag=0, m_flag=0, verbose=self.controller.verbose)
-                time.sleep(0.001)
-                write_intan_register(self.controller.spi, 4, reg4, u_flag=0, m_flag=0, verbose=self.controller.verbose)
-                time.sleep(0.001)
-                write_intan_register(self.controller.spi, 5, reg5, u_flag=0, m_flag=0, verbose=self.controller.verbose)
-                time.sleep(0.001)
-                write_intan_register(self.controller.spi, 6, reg6, u_flag=0, m_flag=0, verbose=self.controller.verbose)
-                time.sleep(0.001)
-                write_intan_register(self.controller.spi, 7, reg7, u_flag=0, m_flag=0, verbose=self.controller.verbose)
-                time.sleep(0.001)
+            self.controller.ensure_initialized()
             
-            # RHS2116 Register 1: bit 4 = DSPen, bits 3:0 = DSP cutoff.
-            dsp_enabled = (reg1 >> 4) & 0x1
-            dsp_cutoff = reg1 & 0xF
-            absmode = (reg1 >> 5) & 0x1
+            # Получаем значения регистров
+            reg1 = int(cmd_obj.get("register_1", 0x951A))
+            reg4 = int(cmd_obj.get("register_4", 0x015E))
+            reg5 = int(cmd_obj.get("register_5", 0x01AB))
+            reg6 = int(cmd_obj.get("register_6", 0x0036))
+            reg7 = int(cmd_obj.get("register_7", 0x000A))
+            
+            # Проверяем диапазоны
+            for reg_val, reg_name in [(reg1, "Register 1"), (reg4, "Register 4"), 
+                                      (reg5, "Register 5"), (reg6, "Register 6"), 
+                                      (reg7, "Register 7")]:
+                if not (0 <= reg_val <= 0xFFFF):
+                    raise ValueError(f"{reg_name} должен быть в диапазоне 0-0xFFFF")
+            
+            # Записываем регистры фильтров
+            # Register 1: DSP HPF и auxiliary outputs
+            write_intan_register(self.controller.spi, 1, reg1, u_flag=0, m_flag=0, verbose=self.controller.verbose)
+            time.sleep(0.001)
+            
+            # Register 4: Верхняя частота среза (fH)
+            write_intan_register(self.controller.spi, 4, reg4, u_flag=0, m_flag=0, verbose=self.controller.verbose)
+            time.sleep(0.001)
+            
+            # Register 5: Параметр для верхней частоты среза (fH)
+            write_intan_register(self.controller.spi, 5, reg5, u_flag=0, m_flag=0, verbose=self.controller.verbose)
+            time.sleep(0.001)
+            
+            # Register 6: Нижняя частота среза (fL, версия A)
+            write_intan_register(self.controller.spi, 6, reg6, u_flag=0, m_flag=0, verbose=self.controller.verbose)
+            time.sleep(0.001)
+            
+            # Register 7: RL_B (быстрое восстановление, версия B)
+            write_intan_register(self.controller.spi, 7, reg7, u_flag=0, m_flag=0, verbose=self.controller.verbose)
+            time.sleep(0.001)
+            
+            # Извлекаем DSP cutoff из Register 1 для ответа
+            dsp_cutoff = (reg1 >> 12) & 0xF
             
             return {
                 "status": "ok",
@@ -1679,9 +1919,7 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
                 "register_6_hex": f"0x{reg6:04X}",
                 "register_7": reg7,
                 "register_7_hex": f"0x{reg7:04X}",
-                "dsp_enabled": dsp_enabled,
                 "dsp_cutoff": dsp_cutoff,
-                "absmode": absmode,
                 "fh_freq": cmd_obj.get("fh_freq", ""),
                 "fl_freq": cmd_obj.get("fl_freq", ""),
             }
@@ -1750,8 +1988,8 @@ def main():
     parser.add_argument(
         "-d",
         "--device",
-        default=get_preferred_spi_device(),
-        help="Путь к SPI устройству (по умолчанию: /dev/intan, если доступен, иначе /dev/spidev1.1)",
+        default="/dev/spidev1.1",
+        help="Путь к SPI устройству (по умолчанию: /dev/spidev1.1)",
     )
     parser.add_argument(
         "-v",

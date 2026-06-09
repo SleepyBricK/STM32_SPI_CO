@@ -1,5 +1,11 @@
 #!/bin/bash
 # Скрипт для запуска сервера с логированием в файл
+# Требует root для доступа к SPI/GPIO (автоподнятие через sudo)
+
+if [[ "${EUID}" -ne 0 ]]; then
+  SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  exec sudo "$SCRIPT_PATH" "$@"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="${SCRIPT_DIR}/../server"

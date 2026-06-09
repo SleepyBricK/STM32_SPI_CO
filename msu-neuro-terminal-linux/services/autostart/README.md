@@ -25,17 +25,18 @@
 
 ## Установка автозапуска
 
-**Требуется root:**
+Скрипт автоматически поднимает права (sudo). Требуется NOPASSWD для пользователя в `/etc/sudoers.d/` (например: `admin ALL=(ALL) NOPASSWD: ALL`).
 
 ```bash
-sudo services/autostart/install_autostart.sh
+# Из корня проекта
+cd /path/to/Stimulator_2.0_orangepizero2w
+bash services/autostart/install_autostart.sh
 ```
 
-Или:
+Или с полным путём:
 
 ```bash
-cd /path/to/Stimulator_2.0_orangepizero2w
-sudo services/autostart/install_autostart.sh
+bash /home/admin/Stimulator_2.0_orangepizero2w/services/autostart/install_autostart.sh
 ```
 
 **Что делает скрипт:**
@@ -51,10 +52,10 @@ sudo services/autostart/install_autostart.sh
 ## Удаление автозапуска
 
 ```bash
-sudo services/autostart/uninstall_autostart.sh
+bash services/autostart/uninstall_autostart.sh
 ```
 
-Отключает и останавливает сервис, удаляет unit‑файл.
+Скрипт сам поднимет права. Отключает и останавливает сервис, удаляет unit‑файл.
 
 ---
 

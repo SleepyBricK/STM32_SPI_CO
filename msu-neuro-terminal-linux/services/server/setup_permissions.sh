@@ -1,132 +1,70 @@
 #!/usr/bin/env bash
+# Одноразовая настройка прав для доступа к GPIO и SPI без root.
+# Запуск: sudo bash setup_permissions.sh (или sudo ./setup_permissions.sh)
+# После установки: перелогиньтесь или выполните newgrp gpio
+
 set -euo pipefail
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "Запустите один раз с root-правами: sudo bash $0 [gpio_number] [username]"
+  echo "Запустите с правами root: sudo bash $0"
   exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_OWNER="$(stat -c '%U' "${SCRIPT_DIR}")"
-GPIO_NUMBER="${1:-${INTAN_GPIO:-226}}"
-TARGET_USER="${2:-${INTAN_USER:-${SUDO_USER:-${PROJECT_OWNER}}}}"
-TARGET_GROUP="intan"
-HELPER_PATH="/usr/local/sbin/intan-apply-permissions.sh"
-UDEV_RULE_PATH="/etc/udev/rules.d/60-intan-permissions.rules"
-SERVICE_PATH="/etc/systemd/system/intan-permissions.service"
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
-if ! [[ "${GPIO_NUMBER}" =~ ^[0-9]+$ ]]; then
-  echo "Неверный номер GPIO: ${GPIO_NUMBER}"
-  exit 1
+# Создаём группу gpio, если её нет
+if ! getent group gpio >/dev/null 2>&1; then
+  groupadd gpio
+  echo "Создана группа gpio"
 fi
 
-if ! id "${TARGET_USER}" >/dev/null 2>&1; then
-  echo "Пользователь не найден: ${TARGET_USER}"
-  exit 1
-fi
+# Добавляем пользователя в группу gpio
+usermod -aG gpio "$REAL_USER"
+echo "Пользователь $REAL_USER добавлен в группу gpio"
 
-if [[ "${TARGET_USER}" == "root" ]]; then
-  echo "Нужно указать обычного пользователя, а не root."
-  echo "Пример: sudo bash $0 ${GPIO_NUMBER} orangepi"
-  exit 1
-fi
+# Udev-правило для GPIO (sysfs)
+cat > /etc/udev/rules.d/99-intan-gpio.rules << 'EOF'
+# Intan RHS2116: доступ к GPIO для группы gpio
+SUBSYSTEM=="gpio", KERNEL=="gpiochip*", ACTION=="add", RUN+="/bin/sh -c 'chown root:gpio /sys/class/gpio/export /sys/class/gpio/unexport 2>/dev/null; chmod 220 /sys/class/gpio/export /sys/class/gpio/unexport 2>/dev/null'"
+SUBSYSTEM=="gpio", KERNEL=="gpio[0-9]*", ACTION=="add", RUN+="/bin/sh -c 'for f in direction value edge active_low; do [ -f /sys/class/gpio/%k/$f ] && chown root:gpio /sys/class/gpio/%k/$f && chmod 660 /sys/class/gpio/%k/$f; done'"
+EOF
+echo "Установлено udev-правило для GPIO"
 
-TARGET_PRIMARY_GROUP="$(id -gn "${TARGET_USER}")"
+# Udev-правило для SPI (spidev)
+cat > /etc/udev/rules.d/99-intan-spidev.rules << 'EOF'
+# Intan RHS2116: доступ к spidev для группы gpio
+SUBSYSTEM=="spidev", KERNEL=="spidev*", MODE="0660", GROUP="gpio"
+EOF
+echo "Установлено udev-правило для SPI"
 
-if ! getent group "${TARGET_GROUP}" >/dev/null 2>&1; then
-  groupadd --system "${TARGET_GROUP}"
-fi
+# Перезагрузка udev
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=gpio
+udevadm trigger --subsystem-match=spidev
 
-usermod -aG "${TARGET_GROUP}" "${TARGET_USER}"
-
-cat > "${HELPER_PATH}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-TARGET_GROUP="${TARGET_GROUP}"
-GPIO_NUMBER="${GPIO_NUMBER}"
-
-set_path_permissions() {
-  local path="\$1"
-  local mode="\$2"
-
-  if [[ -e "\${path}" ]]; then
-    chgrp "${TARGET_GROUP}" "\${path}" || true
-    chmod "\${mode}" "\${path}" || true
-  fi
-}
-
-set_path_permissions "/sys/class/gpio/export" 220
-set_path_permissions "/sys/class/gpio/unexport" 220
-
-GPIO_PATH="/sys/class/gpio/gpio\${GPIO_NUMBER}"
-if [[ ! -d "\${GPIO_PATH}" && -w "/sys/class/gpio/export" ]]; then
-  echo "\${GPIO_NUMBER}" > "/sys/class/gpio/export" 2>/dev/null || true
-  sleep 0.1
-fi
-
-if [[ -d "\${GPIO_PATH}" ]]; then
-  chgrp "${TARGET_GROUP}" "\${GPIO_PATH}" || true
-  chmod 750 "\${GPIO_PATH}" || true
-  set_path_permissions "\${GPIO_PATH}/direction" 660
-  set_path_permissions "\${GPIO_PATH}/value" 660
-  set_path_permissions "\${GPIO_PATH}/edge" 660
-  set_path_permissions "\${GPIO_PATH}/active_low" 660
-fi
-
-for dev in /dev/spidev* /dev/intan; do
-  if [[ -e "\${dev}" ]]; then
-    chgrp "${TARGET_GROUP}" "\${dev}" || true
-    chmod 660 "\${dev}" || true
+# Исправляем права на уже экспортированные GPIO (напр. gpio226)
+# На некоторых системах chown для sysfs не применяется — даём доступ через chmod
+for gpiodir in /sys/class/gpio/gpio*; do
+  if [[ -d "$gpiodir" ]]; then
+    chown -R root:gpio "$gpiodir" 2>/dev/null || true
+    chmod 666 "$gpiodir"/direction "$gpiodir"/value "$gpiodir"/edge "$gpiodir"/active_low 2>/dev/null || true
   fi
 done
-EOF
+chown root:gpio /sys/class/gpio/export /sys/class/gpio/unexport 2>/dev/null || true
+chmod 222 /sys/class/gpio/export /sys/class/gpio/unexport 2>/dev/null || true
 
-chmod 0755 "${HELPER_PATH}"
+# Права на spidev
+for spidev in /dev/spidev*; do
+  [[ -e "$spidev" ]] && chown root:gpio "$spidev" && chmod 660 "$spidev"
+done
 
-cat > "${UDEV_RULE_PATH}" <<EOF
-SUBSYSTEM=="spidev", GROUP="${TARGET_GROUP}", MODE="0660"
-KERNEL=="intan", GROUP="${TARGET_GROUP}", MODE="0660"
-ACTION=="add", SUBSYSTEM=="spidev", RUN+="${HELPER_PATH}"
-ACTION=="add", KERNEL=="intan", RUN+="${HELPER_PATH}"
-ACTION=="add", KERNEL=="gpio${GPIO_NUMBER}", RUN+="${HELPER_PATH}"
-EOF
-
-cat > "${SERVICE_PATH}" <<EOF
-[Unit]
-Description=Apply Intan GPIO/SPI permissions
-After=systemd-udevd.service local-fs.target
-Wants=systemd-udevd.service
-
-[Service]
-Type=oneshot
-ExecStart=${HELPER_PATH}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-udevadm control --reload-rules
-systemctl daemon-reload
-systemctl enable --now intan-permissions.service
-"${HELPER_PATH}"
-
-cat <<EOF
-Готово.
-
-Настроены права для:
-- пользователя: ${TARGET_USER}
-- основной группы сервиса: ${TARGET_PRIMARY_GROUP}
-- группы устройств: ${TARGET_GROUP}
-- GPIO: ${GPIO_NUMBER}
-
-Что дальше:
-1. Перелогиньтесь под пользователем ${TARGET_USER} или выполните: newgrp ${TARGET_GROUP}
-2. Запускайте сервер и утилиты без sudo, например:
-   cd "${SCRIPT_DIR}"
-   python3 intan_server.py --verbose
-
-Если используете systemd-автозапуск, переустановите unit:
-  sudo bash ../autostart/install_autostart.sh
-EOF
+echo ""
+echo "Готово. Дальнейшие шаги:"
+echo "  1. Перелогиньтесь (выйдите и войдите снова) ИЛИ выполните: newgrp gpio"
+echo "  2. После этого скрипты смогут работать с GPIO/SPI без sudo"
+echo ""
+echo "Для проверки после перелогина:"
+echo "  groups   # должна быть группа gpio"
+echo "  python3 ${SCRIPT_DIR}/intan_server.py --verbose"

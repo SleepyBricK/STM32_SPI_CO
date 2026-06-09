@@ -14,35 +14,9 @@ import argparse
 try:
     import spidev
 except ImportError:
-    spidev = None
-
-DRIVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "driver"))
-if DRIVER_DIR not in sys.path:
-    sys.path.insert(0, DRIVER_DIR)
-
-try:
-    from intan_driver import IntanDriver, use_driver
-except ImportError:
-    IntanDriver = None
-
-    def use_driver():
-        return False
-
-from rhs2116_profiles import (
-    RHS2116_STIM_BIAS_1UA,
-    RHS2116_STIM_CURRENT_ZERO,
-    RHS2116_STIM_STEP_1UA,
-    rhs2116_current_word,
-    rhs2116_stimulation_init_commands,
-    run_rhs2116_sequence,
-)
-
-
-def get_preferred_spi_device(requested_device="/dev/spidev1.1"):
-    """Предпочитает /dev/intan, если драйвер доступен и явно не запрошен spidev."""
-    if requested_device in (None, "", "/dev/spidev1.1") and use_driver():
-        return "/dev/intan"
-    return requested_device or "/dev/spidev1.1"
+    print("Ошибка: Модуль spidev не установлен.")
+    print("Установите его командой: sudo apt-get install python3-spidev")
+    sys.exit(1)
 
 
 class GPIOError(Exception):
@@ -161,29 +135,16 @@ class GPIOController:
 
 
 class SPIController:
-    """Класс для работы с SPI через spidev или драйвер /dev/intan."""
+    """Класс для работы с SPI через spidev"""
     
     def __init__(self, device="/dev/spidev1.1", max_speed_hz=10000000, mode=0):
-        self.device = get_preferred_spi_device(device)
+        self.device = device
         self.max_speed_hz = max_speed_hz
         self.mode = mode
-        self.spi = None
-        self.using_driver = self.device == "/dev/intan"
+        self.spi = spidev.SpiDev()
     
     def open(self):
         """Открывает SPI устройство"""
-        if self.using_driver:
-            if IntanDriver is None:
-                raise RuntimeError("intan_driver.py недоступен, /dev/intan использовать нельзя")
-            self.spi = IntanDriver(self.device)
-            self.spi.open()
-            return
-
-        if spidev is None:
-            raise RuntimeError(
-                "Модуль spidev не установлен. Установите python3-spidev или используйте /dev/intan"
-            )
-        self.spi = spidev.SpiDev()
         bus, device_num = self.device.split("spidev")[1].split(".")
         self.spi.open(int(bus), int(device_num))
         self.spi.max_speed_hz = self.max_speed_hz
@@ -192,132 +153,48 @@ class SPIController:
     
     def transfer(self, data):
         """Отправляет данные и получает ответ"""
-        if hasattr(self.spi, "xfer2"):
-            return self.spi.xfer2(data)
-        return self.spi.transfer(data)
-
-    def read_reg(self, reg_addr):
-        if hasattr(self.spi, "read_reg"):
-            return self.spi.read_reg(reg_addr)
-        cmd = [0xC0, reg_addr & 0xFF, 0x00, 0x00]
-        self.transfer(cmd)
-        self.transfer([0x00, 0x00, 0x00, 0x00])
-        resp3 = self.transfer([0x00, 0x00, 0x00, 0x00])
-        return (resp3[2] << 8) | resp3[3]
-
-    def write_reg(self, reg_addr, value, u_flag=1, m_flag=0):
-        if hasattr(self.spi, "write_reg"):
-            return self.spi.write_reg(reg_addr, value, u_flag=u_flag, m_flag=m_flag)
-        byte0 = 0x80 | (u_flag << 5) | (m_flag << 4)
-        return self.transfer([byte0, reg_addr & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
-
-    def clear_adc(self):
-        if hasattr(self.spi, "clear_adc"):
-            return self.spi.clear_adc()
-        return self.transfer([0x6A, 0x00, 0x00, 0x00])
-
-    def clear_compliance_monitor(self):
-        if hasattr(self.spi, "clear_compliance_monitor"):
-            return self.spi.clear_compliance_monitor()
-        return self.transfer([0xD0, 255, 0x00, 0x00])
-
-    def delay_step(self):
-        """Один SPI-шаг задержки без полного 3-фазного чтения регистра."""
-        if hasattr(self.spi, "delay_step"):
-            return self.spi.delay_step()
-        return self.transfer([0xC0, 0xFF, 0x00, 0x00])
-
-    def supports_batch_pattern(self):
-        return hasattr(self.spi, "run_pattern")
-
-    def run_pattern(self, ops):
-        if not hasattr(self.spi, "run_pattern"):
-            raise AttributeError("backend не поддерживает batch pattern ioctl")
-        return self.spi.run_pattern(ops)
-
-    def supports_streaming(self):
-        return hasattr(self.spi, "configure_stream") and hasattr(self.spi, "read_stream_packet")
-
-    def configure_stream(self, channels, sample_rate_hz, flags=0, ring_slot_count=0):
-        if not hasattr(self.spi, "configure_stream"):
-            raise AttributeError("backend не поддерживает stream config")
-        return self.spi.configure_stream(
-            channels,
-            sample_rate_hz,
-            flags=flags,
-            ring_slot_count=ring_slot_count,
-        )
-
-    def get_ring_layout(self):
-        if not hasattr(self.spi, "get_ring_layout"):
-            raise AttributeError("backend не поддерживает ring layout")
-        return self.spi.get_ring_layout()
-
-    def start_stream(self):
-        if not hasattr(self.spi, "start_stream"):
-            raise AttributeError("backend не поддерживает start_stream")
-        return self.spi.start_stream()
-
-    def stop_stream(self):
-        if not hasattr(self.spi, "stop_stream"):
-            raise AttributeError("backend не поддерживает stop_stream")
-        return self.spi.stop_stream()
-
-    def get_stream_status(self):
-        if not hasattr(self.spi, "get_stream_status"):
-            raise AttributeError("backend не поддерживает get_stream_status")
-        return self.spi.get_stream_status()
-
-    def read_stream_packet(self, timeout_ms=100):
-        if not hasattr(self.spi, "read_stream_packet"):
-            raise AttributeError("backend не поддерживает read_stream_packet")
-        return self.spi.read_stream_packet(timeout_ms=timeout_ms)
-
-    def convert_channel(self, channel, amp_type="ac", h_flag=0):
-        if hasattr(self.spi, "convert_channel"):
-            return self.spi.convert_channel(channel, amp_type=amp_type, h_flag=h_flag)
-        d_flag = 1 if amp_type == "dc" else 0
-        cmd_word = 0x00000000
-        cmd_word |= (channel & 0x3F) << 16
-        if d_flag:
-            cmd_word |= (1 << 27)
-        if h_flag:
-            cmd_word |= (1 << 26)
-        cmd = [
-            (cmd_word >> 24) & 0xFF,
-            (cmd_word >> 16) & 0xFF,
-            (cmd_word >> 8) & 0xFF,
-            cmd_word & 0xFF,
-        ]
-        self.transfer(cmd)
-        self.transfer([0x00, 0x00, 0x00, 0x00])
-        resp3 = self.transfer([0x00, 0x00, 0x00, 0x00])
-        return (resp3[0] << 8) | resp3[1]
-
-    def convert_channel_auto(self):
-        if hasattr(self.spi, "convert_channel_auto"):
-            return self.spi.convert_channel_auto()
-        cmd = [0x00, 0x3F, 0x00, 0x00]
-        self.transfer(cmd)
-        self.transfer([0x00, 0x00, 0x00, 0x00])
-        resp3 = self.transfer([0x00, 0x00, 0x00, 0x00])
-        return (resp3[0] << 8) | resp3[1]
-
-    def measure_impedance_raw(self, channel, scale_bits, num_samples=64, frequency_hz=1000, num_averages=1):
-        if not hasattr(self.spi, "measure_impedance_raw"):
-            raise AttributeError("backend не поддерживает measure_impedance_raw")
-        return self.spi.measure_impedance_raw(
-            channel,
-            scale_bits,
-            num_samples=num_samples,
-            frequency_hz=frequency_hz,
-            num_averages=num_averages,
-        )
+        return self.spi.xfer2(data)
     
     def close(self):
         """Закрывает SPI устройство"""
         if self.spi:
             self.spi.close()
+
+
+def _is_usb_backend(hw):
+    """True if hw is IntanUsbTransport (or compatible)."""
+    return hasattr(hw, "read_register")
+
+
+def convert_intan(spi, channel, amp_type="ac", h_flag=0, verbose=False):
+    """CONVERT для SPI (pipeline N+2) или USB (одна команда CONVERT)."""
+    if channel < 0 or channel > 63:
+        raise ValueError(f"Номер канала должен быть 0-63, получено: {channel}")
+
+    d_flag = 1 if amp_type == "dc" else 0
+    if _is_usb_backend(spi):
+        flags = (h_flag & 1) | ((d_flag & 1) << 1)
+        val = spi.convert(channel, flags)
+        if verbose:
+            print(f"  CONVERT ch={channel} flags=0x{flags:X} = 0x{val:04X}")
+        return val
+
+    cmd_word = 0x00000000 | (channel << 16)
+    if d_flag:
+        cmd_word |= 1 << 27
+    if h_flag:
+        cmd_word |= 1 << 26
+    cmd = [
+        (cmd_word >> 24) & 0xFF,
+        (cmd_word >> 16) & 0xFF,
+        (cmd_word >> 8) & 0xFF,
+        cmd_word & 0xFF,
+    ]
+    dummy = [0x00, 0x00, 0x00, 0x00]
+    spi.transfer(cmd)
+    spi.transfer(dummy)
+    resp3 = spi.transfer(dummy)
+    return (resp3[0] << 8) | resp3[1]
 
 
 def read_intan_register(spi, reg_addr, verbose=False):
@@ -332,8 +209,11 @@ def read_intan_register(spi, reg_addr, verbose=False):
     - Биты [23:16] = адрес регистра R[7:0]
     - Биты [15:0] = 0x0000
     """
-    if hasattr(spi, "read_reg"):
-        return spi.read_reg(reg_addr)
+    if _is_usb_backend(spi):
+        val = spi.read_register(reg_addr)
+        if verbose:
+            print(f"  READ reg {reg_addr} = 0x{val:04X}")
+        return val
 
     cmd = [0xC0, reg_addr & 0xFF, 0x00, 0x00]
     
@@ -366,8 +246,10 @@ def write_intan_register(spi, reg_addr, value, u_flag=1, m_flag=0, verbose=False
         m_flag: M flag (1 для очистки compliance monitor, 0 иначе)
         verbose: Выводить отладочную информацию
     """
-    if hasattr(spi, "write_reg"):
-        spi.write_reg(reg_addr, value, u_flag=u_flag, m_flag=m_flag)
+    if _is_usb_backend(spi):
+        spi.write_register(reg_addr, value, u_flag, m_flag)
+        if verbose:
+            print(f"  WRITE reg {reg_addr} = 0x{value:04X} (u={u_flag}, m={m_flag})")
         return
 
     # Формируем команду WRITE: 32-битное слово
@@ -395,8 +277,10 @@ def clear_adc(spi, verbose=False):
         spi: Объект SPIController
         verbose: Выводить отладочную информацию
     """
-    if hasattr(spi, "clear_adc"):
+    if _is_usb_backend(spi):
         spi.clear_adc()
+        if verbose:
+            print("  CLEAR_ADC")
         return
 
     # Команда CLEAR: 0x6A000000 
@@ -417,54 +301,151 @@ def initialize_intan_chip(spi, verbose=False):
     if verbose:
         print("\nИнициализация Intan RHS2116...")
     
-    run_rhs2116_sequence(
-        spi,
-        rhs2116_stimulation_init_commands(adc_sampling_rate_ksps=480.0),
-        read_register=read_intan_register,
-        write_register=write_intan_register,
-        clear_adc=clear_adc,
-        clear_compliance=clear_compliance_monitor,
-        sleep_fn=time.sleep,
-    )
+    # READ 255 U=0 M=0 - dummy команда после включения питания
+    if verbose:
+        print("  READ 255 (dummy команда)...")
+    read_intan_register(spi, 255, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 32 0x0000 U=0 M=0 - отключить стимуляцию
+    if verbose:
+        print("  WRITE 32 0x0000 - отключить стимуляцию...")
+    write_intan_register(spi, 32, 0x0000, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 33 0x0000 U=0 M=0 - отключить стимуляцию
+    if verbose:
+        print("  WRITE 33 0x0000 - отключить стимуляцию...")
+    write_intan_register(spi, 33, 0x0000, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 38 0xFFFF U=0 M=0 - включить все DC-coupled low-gain amplifiers
+    if verbose:
+        print("  WRITE 38 0xFFFF - включить DC-coupled amplifiers...")
+    write_intan_register(spi, 38, 0xFFFF, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # CLEAR - инициализация ADC
+    clear_adc(spi, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 0 0x00C5 U=0 M=0 - настройка ADC и MUX для 480 kS/s
+    if verbose:
+        print("  WRITE 0 0x00C5 - настройка ADC (480 kS/s)...")
+    write_intan_register(spi, 0, 0x00C5, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 1 0x051A U=0 M=0 - auxiliary outputs и DSP фильтр
+    if verbose:
+        print("  WRITE 1 0x051A - auxiliary outputs и DSP фильтр...")
+    write_intan_register(spi, 1, 0x051A, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 2 0x0040 U=0 M=0 - включить DAC для impedance testing
+    if verbose:
+        print("  WRITE 2 0x0040 - включить impedance testing DAC...")
+    write_intan_register(spi, 2, 0x0040, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 3 0x0080 U=0 M=0 - инициализация impedance check DAC
+    if verbose:
+        print("  WRITE 3 0x0080 - инициализация impedance DAC...")
+    write_intan_register(spi, 3, 0x0080, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 4 0x0016 U=0 M=0 - верхняя частота среза AC-coupled amplifiers (7.5 kHz)
+    if verbose:
+        print("  WRITE 4 0x0016 - верхняя частота среза (7.5 kHz)...")
+    write_intan_register(spi, 4, 0x0016, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 5 0x0017 U=0 M=0 - нижняя частота среза AC-coupled amplifiers (5 Hz)
+    if verbose:
+        print("  WRITE 5 0x0017 - нижняя частота среза (5 Hz)...")
+    write_intan_register(spi, 5, 0x0017, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 6 0x00A8 U=0 M=0 - нижняя частота среза AC-coupled amplifiers (5 Hz)
+    if verbose:
+        print("  WRITE 6 0x00A8 - нижняя частота среза (5 Hz)...")
+    write_intan_register(spi, 6, 0x00A8, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 7 0x000A U=0 M=0 - альтернативная нижняя частота среза (1000 Hz)
+    if verbose:
+        print("  WRITE 7 0x000A - альтернативная нижняя частота среза (1000 Hz)...")
+    write_intan_register(spi, 7, 0x000A, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 8 0xFFFF U=0 M=0 - включить все AC-coupled high-gain amplifiers
+    if verbose:
+        print("  WRITE 8 0xFFFF - включить AC-coupled amplifiers...")
+    write_intan_register(spi, 8, 0xFFFF, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 10 0x0000 U=1 M=0 - отключить fast settle (triggered register)
+    if verbose:
+        print("  WRITE 10 0x0000 U=1 - отключить fast settle...")
+    write_intan_register(spi, 10, 0x0000, u_flag=1, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 12 0xFFFF U=1 M=0 - установить все amplifiers на нижнюю частоту среза (triggered register)
+    if verbose:
+        print("  WRITE 12 0xFFFF U=1 - установить нижнюю частоту среза...")
+    write_intan_register(spi, 12, 0xFFFF, u_flag=1, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 34 0x00E2 U=0 M=0 - шаг стимуляции 1 µA
+    if verbose:
+        print("  WRITE 34 0x00E2 - шаг стимуляции 1 µA...")
+    write_intan_register(spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 35 0x00AA U=0 M=0 - напряжения смещения для шага 1 µA
+    if verbose:
+        print("  WRITE 35 0x00AA - напряжения смещения...")
+    write_intan_register(spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 36 0x0080 U=0 M=0 - целевое напряжение charge recovery (0 V)
+    if verbose:
+        print("  WRITE 36 0x0080 - целевое напряжение charge recovery (0 V)...")
+    write_intan_register(spi, 36, 0x0080, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 37 0x4F00 U=0 M=0 - лимит тока charge recovery (1 nA)
+    if verbose:
+        print("  WRITE 37 0x4F00 - лимит тока charge recovery (1 nA)...")
+    write_intan_register(spi, 37, 0x4F00, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 42 0x0000 U=1 M=0 - выключить все стимуляторы (triggered register)
+    if verbose:
+        print("  WRITE 42 0x0000 U=1 - выключить все стимуляторы...")
+    write_intan_register(spi, 42, 0x0000, u_flag=1, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # WRITE 44 0x0000 U=1 M=0 - установить все стимуляторы на отрицательную полярность (triggered register)
+    if verbose:
+        print("  WRITE 44 0x0000 U=1 - установить отрицательную полярность...")
+    write_intan_register(spi, 44, 0x0000, u_flag=1, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    
+    # Разрешаем работу стимуляторов (регистры 32-33)
+    # По аналогии с рабочим кодом: устанавливаем 0xAAAA и 0x00FF в конце инициализации
+    if verbose:
+        print("  WRITE 32 0xAAAA, WRITE 33 0x00FF - разрешить работу стимуляторов...")
+    write_intan_register(spi, 32, 0xAAAA, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
+    write_intan_register(spi, 33, 0x00FF, u_flag=0, m_flag=0, verbose=verbose)
+    time.sleep(0.001)
     
     if verbose:
         print("  ✓ Инициализация чипа завершена")
 
 
-def _ensure_stim_step_size_1ua(spi, verbose=False, assume_configured=False):
-    """Гарантирует стандартный шаг стимуляции 1 µA только когда это нужно."""
-    if assume_configured:
-        return
-
-    reg34 = read_intan_register(spi, 34, verbose=False)
-    reg35 = read_intan_register(spi, 35, verbose=False)
-    if reg34 == RHS2116_STIM_STEP_1UA and reg35 == RHS2116_STIM_BIAS_1UA:
-        return
-
-    if verbose:
-        print(
-            f"  ⚠ Register 34/35 = 0x{reg34:04X}/0x{reg35:04X} "
-            f"(ожидается 0x{RHS2116_STIM_STEP_1UA:04X}/0x{RHS2116_STIM_BIAS_1UA:04X})!"
-        )
-        print(
-            f"  Устанавливаем Register 34 = 0x{RHS2116_STIM_STEP_1UA:04X} "
-            f"и Register 35 = 0x{RHS2116_STIM_BIAS_1UA:04X}..."
-        )
-
-    write_intan_register(spi, 34, RHS2116_STIM_STEP_1UA, u_flag=0, m_flag=0, verbose=verbose)
-    write_intan_register(spi, 35, RHS2116_STIM_BIAS_1UA, u_flag=0, m_flag=0, verbose=verbose)
-    time.sleep(0.001)
-
-
-def setup_stimulation_channels(
-    spi,
-    channels,
-    neg_current_magnitude=0,
-    pos_current_magnitude=0,
-    step_size_1ua=True,
-    verbose=False,
-    assume_step_size_configured=False,
-):
+def setup_stimulation_channels(spi, channels, neg_current_magnitude=0, pos_current_magnitude=0, 
+                                step_size_1ua=True, verbose=False):
     """
     Настраивает токи стимуляции для указанных каналов
     
@@ -485,13 +466,17 @@ def setup_stimulation_channels(
         print(f"  Положительный ток: {pos_current_magnitude} µA")
         print(f"  Шаг стимуляции: {'1 µA' if step_size_1ua else 'другой'}")
     
-    if step_size_1ua:
-        # Shadow-регистры токов ниже интерпретируются как множители шага 1 µA.
-        _ensure_stim_step_size_1ua(
-            spi,
-            verbose=verbose,
-            assume_configured=assume_step_size_configured,
-        )
+    # КРИТИЧНО: Проверяем, что Register 34 установлен правильно (0x00E2 для шага 1 µA)
+    # Без правильного step size токи будут неправильными!
+    reg34 = read_intan_register(spi, 34, verbose=False)
+    if reg34 != 0x00E2:
+        if verbose:
+            print(f"  ⚠ ВНИМАНИЕ: Register 34 = 0x{reg34:04X} (ожидается 0x00E2 для шага 1 µA)!")
+            print(f"  Устанавливаем Register 34 = 0x00E2 и Register 35 = 0x00AA...")
+        write_intan_register(spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=verbose)
+        time.sleep(0.001)
+        write_intan_register(spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=verbose)
+        time.sleep(0.001)
     
     # Устанавливаем токи для каждого канала
     # Согласно даташиту: формат регистров 64-79 и 96-111:
@@ -503,29 +488,33 @@ def setup_stimulation_channels(
     for channel in channels:
         # Отрицательный ток (регистры 64-79)
         if neg_current_magnitude == 0:
-            neg_value = RHS2116_STIM_CURRENT_ZERO  # 0 µA (выключено), но с правильным форматом
+            neg_value = 0x8000  # 0 µA (выключено), но с правильным форматом
         else:
             # Ограничиваем значение тока до 0-255
             current_val = min(max(int(neg_current_magnitude), 0), 255)
-            neg_value = rhs2116_current_word(current_val)
+            # Формат: 0x8000 + значение тока
+            neg_value = 0x8000 | (current_val & 0xFF)
         reg_neg = 64 + channel
         if verbose:
             print(f"  Установка отрицательного тока канала {channel} (регистр {reg_neg} = 0x{neg_value:04X}, ток = {neg_value & 0xFF} µA)...")
         # КРИТИЧНО: БЕЗ U-флага - накапливаем в shadow-RAM, применится при записи в Register 42
         write_intan_register(spi, reg_neg, neg_value, u_flag=0, verbose=verbose)
+        time.sleep(0.001)  # Минимальная задержка
         
         # Положительный ток (регистры 96-111)
         if pos_current_magnitude == 0:
-            pos_value = RHS2116_STIM_CURRENT_ZERO  # 0 µA (выключено), но с правильным форматом
+            pos_value = 0x8000  # 0 µA (выключено), но с правильным форматом
         else:
             # Ограничиваем значение тока до 0-255
             current_val = min(max(int(pos_current_magnitude), 0), 255)
-            pos_value = rhs2116_current_word(current_val)
+            # Формат: 0x8000 + значение тока
+            pos_value = 0x8000 | (current_val & 0xFF)
         reg_pos = 96 + channel
         if verbose:
             print(f"  Установка положительного тока канала {channel} (регистр {reg_pos} = 0x{pos_value:04X}, ток = {pos_value & 0xFF} µA)...")
         # КРИТИЧНО: БЕЗ U-флага - накапливаем в shadow-RAM, применится при записи в Register 42
         write_intan_register(spi, reg_pos, pos_value, u_flag=0, verbose=verbose)
+        time.sleep(0.001)  # Минимальная задержка
     
     # Регистры 32-33 уже установлены в initialize_intan_chip (0xAAAA и 0x00FF)
     # Не нужно их устанавливать здесь
@@ -542,28 +531,20 @@ def clear_compliance_monitor(spi, verbose=False):
         spi: Объект SPIController
         verbose: Выводить отладочную информацию
     """
-    if hasattr(spi, "clear_compliance_monitor"):
-        spi.clear_compliance_monitor()
-        return
-
     # READ(255) с M flag = 1 для очистки compliance monitor
     # Формат: 0b11010000 = 0xD0 (11 + U=0 + M=1 + 0000)
     cmd = [0xD0, 255, 0x00, 0x00]
     
     if verbose:
         print("  Очистка compliance monitor (READ 255 с M flag)...")
+    if _is_usb_backend(spi):
+        spi.clear_comp()
+        return
     # M=1 вызывает side-effect (очистку)
     spi.transfer(cmd)
 
 
-def set_stimulation_current(
-    spi,
-    current_value,
-    channel=0,
-    is_positive=True,
-    verbose=False,
-    assume_step_size_configured=False,
-):
+def set_stimulation_current(spi, current_value, channel=0, is_positive=True, verbose=False):
     """
     Устанавливает ток стимуляции для указанного канала (быстрая функция)
     
@@ -577,11 +558,16 @@ def set_stimulation_current(
         is_positive: True для положительного тока, False для отрицательного
         verbose: Выводить отладочную информацию
     """
-    _ensure_stim_step_size_1ua(
-        spi,
-        verbose=verbose,
-        assume_configured=assume_step_size_configured,
-    )
+    # КРИТИЧНО: Проверяем, что Register 34 установлен правильно (0x00E2 для шага 1 µA)
+    reg34 = read_intan_register(spi, 34, verbose=False)
+    if reg34 != 0x00E2:
+        if verbose:
+            print(f"  ⚠ ВНИМАНИЕ: Register 34 = 0x{reg34:04X} (ожидается 0x00E2 для шага 1 µA)!")
+            print(f"  Устанавливаем Register 34 = 0x00E2 и Register 35 = 0x00AA...")
+        write_intan_register(spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=verbose)
+        time.sleep(0.001)
+        write_intan_register(spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=verbose)
+        time.sleep(0.001)
     
     # Регистры: 64-79 для отрицательного тока (каналы 0-15), 96-111 для положительного (каналы 0-15)
     # Согласно даташиту: формат регистров:
@@ -596,7 +582,7 @@ def set_stimulation_current(
     # Ограничиваем значение тока до 0-255
     current_val = min(max(int(current_value), 0), 255)
     # Формат: 0x8000 | (current_val & 0xFF) где 0x80 = trim (128), биты [7:0] = ток
-    value = rhs2116_current_word(current_val)
+    value = 0x8000 | (current_val & 0xFF)
     
     if verbose:
         print(f"  Установка тока: канал {channel}, {'положительный' if is_positive else 'отрицательный'}, регистр {reg_addr} = 0x{value:04X} (ток = {current_val} µA при шаге 1 µA)")
@@ -604,6 +590,7 @@ def set_stimulation_current(
     # КРИТИЧНО: БЕЗ U-флага - накапливаем в shadow-RAM
     # U-флаг будет применен при следующей записи в Register 42 через enable_stimulation_channels
     write_intan_register(spi, reg_addr, value, u_flag=0, verbose=verbose)
+    time.sleep(0.001)  # Минимальная задержка
 
 
 def enable_stimulation_channels(spi, channels, enable=True, negative_polarity=True, verbose=False):
@@ -632,6 +619,7 @@ def enable_stimulation_channels(spi, channels, enable=True, negative_polarity=Tr
         
         # КРИТИЧНО: Register 44 БЕЗ U-флага - накапливаем в shadow-RAM
         write_intan_register(spi, 44, polarity_mask, u_flag=0, verbose=False)
+        time.sleep(0.001)  # Минимальная задержка
         
         # Формируем битовую маску для включения стимуляторов (регистр 42)
         stim_enable_mask = 0x0000
@@ -777,8 +765,8 @@ def main():
                         help='Интервал между стимуляциями в секундах (по умолчанию: 1.0)')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Подробный вывод')
-    parser.add_argument('-d', '--device', default=get_preferred_spi_device(),
-                        help='Путь к SPI устройству (по умолчанию: /dev/intan, если доступен, иначе /dev/spidev1.1)')
+    parser.add_argument('-d', '--device', default='/dev/spidev1.1',
+                        help='Путь к SPI устройству (по умолчанию: /dev/spidev1.1)')
     parser.add_argument('--no-init-check', action='store_true',
                         help='Пропустить проверку инициализации (регистр 255)')
     parser.add_argument('--sawtooth', action='store_true',
@@ -901,8 +889,7 @@ def main():
             neg_current_magnitude=args.neg_current,
             pos_current_magnitude=args.pos_current,
             step_size_1ua=(args.step_size == 1),
-            verbose=args.verbose,
-            assume_step_size_configured=(args.step_size == 1),
+            verbose=args.verbose
         )
         
         # Запускаем стимуляцию
@@ -931,14 +918,7 @@ def main():
                         current = int((args.pos_current * step) / args.sawtooth_steps)
                         # Устанавливаем ток для всех каналов
                         for channel in channels:
-                            set_stimulation_current(
-                                spi,
-                                current,
-                                channel=channel,
-                                is_positive=True,
-                                verbose=False,
-                                assume_step_size_configured=(args.step_size == 1),
-                            )
+                            set_stimulation_current(spi, current, channel=channel, is_positive=True, verbose=False)
                         # Без задержки - максимальная скорость
                     
                     stimulation_count += 1

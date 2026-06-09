@@ -1,0 +1,28 @@
+---
+description: Прошивка STM32 на отдельном устройстве; git pull = уже прошитая версия
+alwaysApply: true
+---
+
+# STM32 firmware workflow
+
+Прошивка MCU — **вне Orange Pi**: пользователь прошивает STM32 на другом устройстве (ST-Link, STM32CubeProgrammer).
+
+## Запрос «загрузи прошивку с гита»
+
+Означает только обновить исходники:
+
+```bash
+cd /home/admin/STM32_SPI_CO_latest && git pull origin main
+```
+
+К моменту запроса эта версия **уже прошита** в MCU. Не делать на Orange Pi:
+
+- сборку `.elf` / `.bin`;
+- `STM32_Programmer_CLI`, `st-flash`, openocd, dfu-util;
+- установку `arm-none-eabi-gcc` / STM32Cube только ради прошивки;
+- диагностику «почему не прошивается» без явной просьбы.
+
+## После git pull
+
+- Считать прошивку на плате актуальной.
+- При смене USB-протокола или паттернов — проверить/обновить host (`services/server/`, `services/gui/`) и при необходимости `sudo systemctl restart intan-server.service`.

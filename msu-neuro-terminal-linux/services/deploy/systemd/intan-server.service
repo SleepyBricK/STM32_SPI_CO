@@ -2,16 +2,23 @@
 Description=Intan RHS2116 TCP/UDP server
 After=network-online.target
 Wants=network-online.target
+# STM32/USB3300 появляются на шине асинхронно после power-on.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
 WorkingDirectory=/home/admin/Stimulator_2.0_orangepizero2w/services/server
-ExecStart=/usr/bin/python3 /home/admin/Stimulator_2.0_orangepizero2w/services/server/intan_server.py --verbose
-Restart=always
-RestartSec=2
-User=orangepi
-Group=orangepi
+ExecStartPre=/home/admin/Stimulator_2.0_orangepizero2w/services/deploy/scripts/wait_usb_stm32.sh
+ExecStart=/usr/bin/python3 /home/admin/Stimulator_2.0_orangepizero2w/services/server/intan_server.py --backend usb --no-usb-reset --verbose
+Restart=on-failure
+RestartSec=10
+User=admin
+Group=admin
 Environment=PYTHONUNBUFFERED=1
+Environment=INTAN_UDP_WIFI=1
+Environment=INTAN_UDP_V5=0
+Environment=INTAN_UDP_V6=0
 
 [Install]
 WantedBy=multi-user.target

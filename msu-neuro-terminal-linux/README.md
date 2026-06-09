@@ -21,22 +21,23 @@
 
 Stimulator 2.0 объединяет:
 
-- **Аппаратуру** — плата Orange Pi Zero 2W с чипом Intan RHS2116, подключение по SPI и GPIO.
+- **Аппаратуру** — Orange Pi Zero 2W + USB‑сопроцессор STM32H743 с Intan RHS2116 (legacy: прямой SPI/GPIO на Pi).
 - **Сервер** — Python‑приложение на плате: TCP‑сервер для команд стимуляции и UDP‑сервер для потоковой передачи ADC‑данных.
 - **Клиенты** — десктопное приложение (Python/Tkinter) для управления стимуляцией и приёма регистрации.
 
-Поддерживаются: регистрация сигналов с 16 каналов, электрическая стимуляция (импульсы, паттерны, пилообразный сигнал).
+Поддерживаются: регистрация сигналов с 16 каналов, стимуляция по паттернам STM32 (`PATTERN_ADD_RAW`), измерение импеданса.
 
 ---
 
 ## Аппаратура
 
-**Orange Pi Zero 2W** — одноплатный компьютер на Allwinner H618 с Linux. Подключение к Intan RHS2116 через SPI и GPIO.
+**Orange Pi Zero 2W** — хост Linux. **Intan RHS2116** на плате **STM32H743** (USB 2.0 HS, `0483:5741`).
 
 | Параметр | Значение |
 |----------|----------|
-| SPI | `/dev/spidev1.1` |
-| GPIO (PH2) | 226 |
+| USB | STM32 coprocessor `0483:5741` |
+| Прошивка | [STM32_SPI_CO](https://github.com/SleepyBricK/STM32_SPI_CO) |
+| Legacy SPI (опционально) | `/dev/spidev1.1`, GPIO 226 |
 | Intan RHS2116 | 16 каналов AC/DC, стимуляция |
 
 ---
@@ -47,8 +48,9 @@ Stimulator 2.0 объединяет:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         ПК (Windows / Linux / macOS)                        │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ GUI (intan_gui_clientv5_linux.py)                                       ││
-│  │ • Стимуляция, паттерны (импульсы, пилообразный)                         ││
+│  │ GUI (intan_gui_new.py)                                                  ││
+│  │ • Паттерны стимуляции (блоки → pattern_load → pattern_run)             ││
+│  │ • Импеданс, recovery; регистрация EMG/ADC                              ││
 │  │ • Регистрация EMG/ADC, графики, сохранение в CSV                        ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 └──────────────────────────────────┬──────────────────────────────────────────┘
@@ -59,8 +61,7 @@ Stimulator 2.0 объединяет:
 │                    Orange Pi Zero 2W (intan_server.py)                      │
 │  • TCP‑сервер: команды ping, pulse, sawtooth, stop и др.                    │
 │  • UDP‑сервер: потоковая отправка ADC‑данных на ПК                          │
-│  • SPI → Intan RHS2116 (16 каналов, стимуляция)                             │
-│  • GPIO → PH2 (питание Intan)                                               │
+│  • USB → STM32 → SPI → Intan RHS2116                                        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -81,33 +82,54 @@ Stimulator 2.0 объединяет:
 
 ## Быстрый старт
 
+### 0. Первоначальная настройка (один раз)
+
+Настройка прав для доступа к GPIO и SPI без root:
+
+```bash
+sudo bash services/server/setup_permissions.sh
+```
+
+После выполнения перелогиньтесь или выполните `newgrp gpio`. Требуется NOPASSWD в sudoers (например: `admin ALL=(ALL) NOPASSWD: ALL`).
+
 ### 1. Запуск сервера на плате (Orange Pi Zero 2W)
+
+**С автозапуском при загрузке** (рекомендуется):
+
+```bash
+bash services/autostart/install_autostart.sh
+```
+
+Скрипт сам поднимет права. После установки сервер стартует при включении платы.
+
+**С логированием в файл** (ручной запуск):
+
+```bash
+bash services/scripts/start_with_logs.sh
+```
+
+**Вручную:**
 
 ```bash
 cd services/server
 python3 intan_server.py --verbose
 ```
 
-Или с логированием в файл:
+(После `setup_permissions.sh` root не нужен; иначе — `sudo python3 ...`.)
+
+### 2. Проверка сервера
 
 ```bash
-./services/scripts/start_with_logs.sh
+systemctl status intan-server.service
+journalctl -u intan-server.service -f
 ```
 
-### 2. Автозапуск при загрузке системы
-
-```bash
-sudo services/autostart/install_autostart.sh
-```
-
-Проверка: `systemctl status intan-server.service`, логи: `journalctl -u intan-server.service -f`.
-
-### 3. Запуск GUI на ПК
+### 3. Запуск GUI на ПК (с ПК в сети)
 
 ```bash
 cd services/gui
 pip install numpy matplotlib   # при необходимости
-python3 intan_gui_clientv5_linux.py
+python3 intan_gui_new.py
 ```
 
 Укажите IP платы (Orange Pi) и порт 9000, нажмите «Подключиться».
@@ -147,9 +169,10 @@ Stimulator_2.0_orangepizero2w/
     │   ├── intan_tcp_server.py
     │   ├── intan_udp_recorder.py
     │   ├── stimulate_channel0.py
+    │   ├── setup_permissions.sh   # Одноразовая настройка GPIO/SPI
     │   └── README.md
     ├── gui/                       # GUI‑клиент (на ПК)
-    │   ├── intan_gui_clientv5_linux.py
+    │   ├── intan_gui_new.py
     │   └── README.md
     ├── scripts/                   # Скрипты запуска и логов
     │   ├── start_with_logs.sh
@@ -171,7 +194,7 @@ Stimulator_2.0_orangepizero2w/
 
 - [Intan RHS2116 Datasheet](https://intantech.com/files/Intan_RHS2116_datasheet.pdf)
 - [Server](services/server/README.md) — протокол TCP, аргументы, аппаратура.
-- [GUI](services/gui/README.md) — подключение, функции, переменные окружения EMG.
+- [GUI](services/gui/README.md) — подключение, паттерны, переменные окружения EMG.
 - [Scripts](services/scripts/README.md) — запуск с логами, просмотр логов.
 - [Autostart](services/autostart/README.md) — установка и удаление systemd‑сервиса.
 - [Deploy](services/deploy/README.md) — unit‑файл systemd.

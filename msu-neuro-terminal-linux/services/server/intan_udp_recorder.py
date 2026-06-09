@@ -18,6 +18,7 @@ UDP-сервер для регистрации данных с Intan RHS2116.
 """
 
 import argparse
+import queue
 import socket
 import struct
 import threading
@@ -25,6 +26,137 @@ import time
 import sys
 import os
 import math
+from collections import namedtuple
+
+from stimulate_channel0 import _is_usb_backend, convert_intan
+from intan_rhs1 import (
+    RR8_CHANNELS,
+    RHS1_FLAG_CHANNEL_TAG,
+    Rhs1ChannelRouter,
+    pack_rr8_multichannel,
+    parse_rhs1_header,
+    rhs1_raw_payload_bytes,
+)
+from intan_usb_transport import V2_STREAM_RELOAD_SAMPLES
+
+# USB STREAM(4096): один batch = сырые bytes с USB (без struct.unpack).
+StreamBatch = namedtuple(
+    "StreamBatch",
+    (
+        "timestamp",
+        "payload",
+        "channels",
+        "pipeline_skip",
+        "hw_counter",
+        "capture_ts_ns",
+        "adc_rate_hz",
+        "stream_mux_count",
+    ),
+    defaults=(0, 0, 350_000, 1),
+)
+
+INTAN_STREAM_MAGIC = 0x334E5449
+INTAN_STREAM_VERSION = 3
+V3_HEADER_SIZE = 44
+V3_CHANNEL_TEMPLATE = bytes(range(16))
+INTAN_STREAM_V4_MAGIC = 0x344E5449
+INTAN_STREAM_V4_VERSION = 4
+V4_HEADER_SIZE = 16
+INTAN_STREAM_V5_MAGIC = 0x354E5449
+INTAN_STREAM_V5_VERSION = 5
+V5_HEADER_SIZE = 20
+INTAN_STREAM_V6_MAGIC = 0x364E5449
+INTAN_STREAM_V6_VERSION = 6
+V6_HEADER_SIZE = 32
+USB_V2_FIRMWARE_ADC_KSPS = 350
+USB_V2_FIRMWARE_ADC_HZ = USB_V2_FIRMWARE_ADC_KSPS * 1000
+INTAN_UDP_WIFI = os.environ.get("INTAN_UDP_WIFI", "1") == "1"
+INTAN_UDP_USE_V5 = os.environ.get("INTAN_UDP_V5", "0") == "1"
+INTAN_UDP_USE_V6 = os.environ.get("INTAN_UDP_V6", "0") == "1"
+USB_V2_YIELD_TARGET_BYTES = int(
+    os.environ.get(
+        "INTAN_UDP_YIELD_BYTES",
+        "262144" if INTAN_UDP_WIFI else "65536",
+    )
+)
+USB_V2_BURST_EXTRA_FRAMES = 31 if INTAN_UDP_WIFI else 15
+UDP_SEND_QUEUE_SIZE = 4096 if INTAN_UDP_WIFI else 1024
+UDP_SENDER_THREADS = 2 if INTAN_UDP_WIFI else 1
+UDP_SENDER_DRAIN_BATCHES = 64 if INTAN_UDP_WIFI else 32
+STREAM_BATCH_QUEUE_SIZE = 12 if INTAN_UDP_WIFI else 0
+# Без фрагментации IP: 1500 - 20 IP - 8 UDP = 1472
+MAX_UDP_DATAGRAM = 1472
+MUX_FRAME_CHANNELS = 16
+
+
+def _rhs1_stream_batch(
+    frame,
+    payload: bytes,
+    channels: list,
+    *,
+    pipeline_skip: int = 0,
+    wall_ts: float | None = None,
+    capture_ts_ns: int | None = None,
+) -> StreamBatch:
+    """Метаданные RHS1 для честной привязки времени на host."""
+    mux_count = frame.channel_count if frame.channel_count > 0 else max(1, len(channels))
+    if capture_ts_ns is None:
+        capture_ts_ns = time.time_ns() if INTAN_UDP_USE_V6 else 0
+    return StreamBatch(
+        wall_ts if wall_ts is not None else time.time(),
+        payload,
+        channels,
+        pipeline_skip,
+        frame.first_sample_counter,
+        capture_ts_ns,
+        USB_V2_FIRMWARE_ADC_HZ,
+        mux_count,
+    )
+
+
+def _extract_mux63_payload(payload: bytes, channels: list) -> bytes:
+    """
+    STREAM(4096) с ch=63 даёт кадры по 16 каналов (mux).
+    Вырезаем только запрошенные каналы в плотный буфер для v3.
+    """
+    nch = len(channels)
+    if nch <= 0:
+        return b""
+    if nch == MUX_FRAME_CHANNELS and channels == list(range(MUX_FRAME_CHANNELS)):
+        return payload
+
+    frame_bytes_mux = MUX_FRAME_CHANNELS * 2
+    n_frames = len(payload) // frame_bytes_mux
+    if n_frames <= 0:
+        return b""
+
+    out = bytearray(n_frames * nch * 2)
+    out_mv = memoryview(out)
+    pay_mv = memoryview(payload)
+
+    if nch == 1:
+        ch = channels[0]
+        for f in range(n_frames):
+            src = f * frame_bytes_mux + ch * 2
+            out_mv[f * 2 : f * 2 + 2] = pay_mv[src : src + 2]
+        return bytes(out)
+
+    start = channels[0]
+    if channels == list(range(start, start + nch)):
+        for f in range(n_frames):
+            src = f * frame_bytes_mux + start * 2
+            dst = f * nch * 2
+            out_mv[dst : dst + nch * 2] = pay_mv[src : src + nch * 2]
+        return bytes(out)
+
+    for f in range(n_frames):
+        frame_base = f * frame_bytes_mux
+        dst_base = f * nch * 2
+        for j, ch in enumerate(channels):
+            src = frame_base + ch * 2
+            dst = dst_base + j * 2
+            out_mv[dst : dst + 2] = pay_mv[src : src + 2]
+    return bytes(out)
 
 try:
     import numpy as np
@@ -51,56 +183,65 @@ from stimulate_channel0 import (
     GPIOController,
     GPIOError,
     SPIController,
-    get_preferred_spi_device,
+    initialize_intan_chip,
     read_intan_register,
     write_intan_register,
     clear_adc,
     clear_compliance_monitor,
 )
-from rhs2116_profiles import (
-    rhs2116_recording_init_commands,
-    rhs2116_register0_for_adc_rate,
-    rhs2116_safe_impedance_commands,
-    rhs2116_stimulation_init_commands,
-    rhs2116_validate_channels,
-    run_rhs2116_sequence,
-)
-from intan_shared_state import IntanSharedState
 
 
 class IntanRecorder:
     """Класс для регистрации данных с Intan RHS2116"""
 
-    def __init__(self, gpio_number=226, spi_device="/dev/spidev1.1", verbose=False, shared_state=None):
+    def __init__(
+        self,
+        gpio_number=226,
+        spi_device="/dev/spidev1.1",
+        verbose=False,
+        transport=None,
+        backend="spi",
+    ):
         self.gpio_number = gpio_number
-        self.spi_device = get_preferred_spi_device(spi_device)
+        self.spi_device = spi_device
         self.verbose = verbose
-        self.shared_state = shared_state or IntanSharedState()
+        self.transport = transport
+        self.backend = backend
 
         self.gpio = None
         self.spi = None
         self.initialized = False
+        self._record_ksps = USB_V2_FIRMWARE_ADC_KSPS
+        self._usb_stream8_ok = None
+        self._usb_stream_range_ok = None
         self.recording = False
         self.lock = threading.Lock()
-        self.using_driver = self.spi_device == "/dev/intan"
+        
+        # Автоматически экспортируем GPIO при инициализации
+        self._ensure_gpio_exported()
+
+    def _ensure_gpio_exported(self):
+        """Убеждается, что GPIO экспортирован"""
+        gpio_path = f"/sys/class/gpio/gpio{self.gpio_number}"
+        if not os.path.exists(gpio_path):
+            try:
+                export_script = "/home/admin/export_gpio.sh"
+                if os.path.exists(export_script):
+                    import subprocess
+                    subprocess.run(
+                        ["sudo", export_script, str(self.gpio_number)],
+                        capture_output=True,
+                        timeout=2
+                    )
+            except Exception:
+                pass
 
     def _log(self, msg):
         if self.verbose:
             print(msg)
 
-    def _run_rhs2116_sequence(self, commands):
-        run_rhs2116_sequence(
-            self.spi,
-            commands,
-            read_register=read_intan_register,
-            write_register=write_intan_register,
-            clear_adc=clear_adc,
-            clear_compliance=clear_compliance_monitor,
-            sleep_fn=time.sleep,
-        )
-
     def ensure_initialized(self):
-        """Инициализирует GPIO, SPI и чип Intan"""
+        """Инициализирует USB или GPIO/SPI и чип Intan"""
         with self.lock:
             if self.initialized:
                 return
@@ -108,37 +249,48 @@ class IntanRecorder:
             self._log("== Инициализация Intan для регистрации ==")
 
             try:
-                # Инициализация GPIO нужна только для userspace spidev-пути.
-                if self.using_driver:
-                    self._log("Используется драйвер /dev/intan: GPIO питания управляется ядром")
+                if self.backend == "usb":
+                    if self.transport is None:
+                        raise RuntimeError("USB backend requires transport")
+                    self.spi = self.transport
+                    self.transport.verify_chip()
+                    if self.transport.firmware_version() == "v2":
+                        self._log(
+                            "USB V2: INIT_RECORD выполняется прошивкой при старте *_REAL stream"
+                        )
+                    else:
+                        self._log("Инициализация чипа для регистрации (USB)...")
+                        self._initialize_for_recording(
+                            verbose=self.verbose, adc_sampling_rate_ksps=USB_V2_FIRMWARE_ADC_KSPS
+                        )
                 else:
                     self.gpio = GPIOController(self.gpio_number, raise_exceptions=True)
                     self.gpio.set_direction("out")
-                    self.gpio.set_value(1)  # Включаем питание
+                    self.gpio.set_value(1)
                     time.sleep(0.1)
 
-                # Инициализация SPI
-                if not os.path.exists(self.spi_device):
-                    raise FileNotFoundError(f"SPI устройство не найдено: {self.spi_device}")
-                
-                # Инициализация SPI: 10 МГц — xfer2 быстрее batch на этой скорости
-                # DMA используется автоматически на уровне драйвера SPI в ядре Linux
-                # для эффективной передачи данных без участия CPU
-                self.spi = SPIController(
-                    device=self.spi_device,
-                    max_speed_hz=10000000,  # 10 МГц — оптимально для xfer2
-                    mode=0,
-                )
-                self.spi.open()
+                    if not os.path.exists(self.spi_device):
+                        raise FileNotFoundError(
+                            f"SPI устройство не найдено: {self.spi_device}"
+                        )
 
-                # Проверка чипа
-                chip_id = read_intan_register(self.spi, 255, verbose=False)
-                if chip_id != 32:
-                    raise RuntimeError(f"Неверный Chip ID: {chip_id} (ожидалось 32)")
+                    self.spi = SPIController(
+                        device=self.spi_device,
+                        max_speed_hz=10000000,
+                        mode=0,
+                    )
+                    self.spi.open()
 
-                # Инициализация чипа для регистрации (без стимуляции).
-                self._log("Инициализация чипа для регистрации данных...")
-                self._initialize_for_recording(verbose=self.verbose, adc_sampling_rate_ksps=480)
+                    chip_id = read_intan_register(self.spi, 255, verbose=False)
+                    if chip_id != 32:
+                        raise RuntimeError(
+                            f"Неверный Chip ID: {chip_id} (ожидалось 32)"
+                        )
+
+                    self._log("Инициализация чипа для регистрации данных...")
+                    self._initialize_for_recording(
+                        verbose=self.verbose, adc_sampling_rate_ksps=USB_V2_FIRMWARE_ADC_KSPS
+                    )
 
                 self.initialized = True
                 self._log("== Инициализация завершена ==")
@@ -151,15 +303,85 @@ class IntanRecorder:
         Полная переинициализация чипа для стимуляции после измерения импеданса.
         Аналогична _initialize_for_stimulation из IntanController.
         """
+        spi = self.spi
+        
         if verbose:
             self._log("      Полная переинициализация для стимуляции...")
-
-        self._run_rhs2116_sequence(rhs2116_stimulation_init_commands(adc_sampling_rate_ksps=480.0))
+        
+        # 1. READ 255 U=0 M=0 - dummy команда
+        read_intan_register(spi, 255, verbose=False)
+        time.sleep(0.001)
+        
+        # 2. WRITE 32/33 0x0000 - отключить стимуляцию
+        write_intan_register(spi, 32, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(spi, 33, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 3. Инициализация основных регистров
+        write_intan_register(spi, 38, 0xFFFF, u_flag=0, m_flag=0, verbose=False)  # DC-coupled amplifiers
+        time.sleep(0.001)
+        clear_adc(spi, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(spi, 0, 0x00C5, u_flag=0, m_flag=0, verbose=False)  # ADC config
+        time.sleep(0.001)
+        write_intan_register(spi, 1, 0x051A, u_flag=0, m_flag=0, verbose=False)  # DSP filter
+        time.sleep(0.001)
+        write_intan_register(spi, 2, 0x0000, u_flag=0, m_flag=0, verbose=False)  # Zcheck выкл.
+        time.sleep(0.001)
+        write_intan_register(spi, 3, 0x0080, u_flag=0, m_flag=0, verbose=False)  # нейтральное значение
+        time.sleep(0.001)
+        write_intan_register(spi, 4, 0x0016, u_flag=0, m_flag=0, verbose=False)  # Upper cutoff 7.5 kHz
+        time.sleep(0.001)
+        write_intan_register(spi, 5, 0x0017, u_flag=0, m_flag=0, verbose=False)  # Lower cutoff 5 Hz
+        time.sleep(0.001)
+        write_intan_register(spi, 6, 0x00A8, u_flag=0, m_flag=0, verbose=False)  # Lower cutoff 5 Hz
+        time.sleep(0.001)
+        write_intan_register(spi, 7, 0x000A, u_flag=0, m_flag=0, verbose=False)  # Alternative lower cutoff 1000 Hz
+        time.sleep(0.001)
+        write_intan_register(spi, 8, 0xFFFF, u_flag=0, m_flag=0, verbose=False)  # AC-coupled amplifiers
+        time.sleep(0.001)
+        write_intan_register(spi, 9, 0xFFFF, u_flag=0, m_flag=0, verbose=False)  # Low-Gain Amplifier Power
+        time.sleep(0.001)
+        write_intan_register(spi, 10, 0x0000, u_flag=1, m_flag=0, verbose=False)  # Fast settle off
+        time.sleep(0.001)
+        write_intan_register(spi, 12, 0xFFFF, u_flag=1, m_flag=0, verbose=False)  # Lower cutoff
+        time.sleep(0.001)
+        
+        # 4. Настройка стимуляции
+        write_intan_register(spi, 34, 0x00E2, u_flag=0, m_flag=0, verbose=False)  # Step size 1 µA
+        time.sleep(0.001)
+        write_intan_register(spi, 35, 0x00AA, u_flag=0, m_flag=0, verbose=False)  # PBIAS/NBIAS
+        time.sleep(0.001)
+        write_intan_register(spi, 36, 0x0080, u_flag=0, m_flag=0, verbose=False)  # Charge recovery voltage
+        time.sleep(0.001)
+        write_intan_register(spi, 37, 0x4F00, u_flag=0, m_flag=0, verbose=False)  # Charge recovery current limit
+        time.sleep(0.001)
+        write_intan_register(spi, 42, 0x0000, u_flag=1, m_flag=0, verbose=False)  # Disable all stimulators
+        time.sleep(0.001)
+        write_intan_register(spi, 44, 0x0000, u_flag=1, m_flag=0, verbose=False)  # Negative polarity
+        time.sleep(0.001)
+        
+        # 5. Инициализация регистров токов стимуляции (64-79 и 96-111) в 0x8000
+        for channel in range(16):
+            write_intan_register(spi, 64 + channel, 0x8000, u_flag=1, m_flag=0, verbose=False)
+            write_intan_register(spi, 96 + channel, 0x8000, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 6. WRITE 32 0xAAAA, WRITE 33 0x00FF - разрешить работу стимуляторов
+        write_intan_register(spi, 32, 0xAAAA, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(spi, 33, 0x00FF, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 7. Очистка compliance monitor
+        clear_compliance_monitor(spi, verbose=False)
+        time.sleep(0.001)
         
         if verbose:
             self._log("        ✓ Переинициализация для стимуляции завершена")
 
-    def _initialize_for_recording(self, verbose=False, adc_sampling_rate_ksps=480):
+    def _initialize_for_recording(self, verbose=False, adc_sampling_rate_ksps=USB_V2_FIRMWARE_ADC_KSPS):
         """
         Инициализация чипа для регистрации данных (без стимуляции).
         
@@ -178,13 +400,195 @@ class IntanRecorder:
         
         Args:
             verbose: выводить отладочную информацию
-            adc_sampling_rate_ksps: частота дискретизации ADC в kS/s (по умолчанию 480 kS/s)
+            adc_sampling_rate_ksps: частота дискретизации ADC в kS/s (по умолчанию 350 kS/s)
         """
+        spi = self.spi
+
+        if _is_usb_backend(spi):
+            ksps = int(adc_sampling_rate_ksps)
+            if ksps <= 0:
+                ksps = USB_V2_FIRMWARE_ADC_KSPS
+            ksps = max(100, min(USB_V2_FIRMWARE_ADC_KSPS, ksps))
+            spi.init_record(ksps)
+            self._record_ksps = ksps
+            if verbose:
+                self._log(f"      INIT_RECORD {ksps} kS/s (USB)")
+            return
+
+        # 1. READ 255 U=0 M=0 - dummy команда после включения питания
+        if verbose:
+            self._log("      READ 255 (dummy команда)...")
+        read_intan_register(spi, 255, verbose=False)
+        time.sleep(0.001)
+        
+        # 2. WRITE 32/33 0x0000 - отключить стимуляцию (дифференциальный режим усилителей)
+        if verbose:
+            self._log("      WRITE 32 0x0000, WRITE 33 0x0000 - дифференциальный режим усилителей...")
+        write_intan_register(spi, 32, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(spi, 33, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 3. WRITE 38 0xFFFF - включить DC-coupled low-gain amplifiers (ПИТАНИЕ)
+        # КРИТИЧНО: В RHS2116 есть аппаратный баг: если выключить DC-усилители,
+        # потребление VDD УВЕЛИЧИВАЕТСЯ (~1.93 mA на канал, >30 mA суммарно).
+        # Intan ПРЯМО рекомендует всегда включать их (Register 38 = 0xFFFF).
+        # Это НЕ означает, что DC-данные используются - это только питание блоков.
+        # Чтение DC управляется флагом D в команде CONVERT.
+        # Для ЭМГ читаем ТОЛЬКО AC high-gain данные (старшие 16 бит результата CONVERT).
+        if verbose:
+            self._log("      WRITE 38 0xFFFF - включить DC-coupled amplifiers (питание, не использование данных)...")
+        write_intan_register(spi, 38, 0xFFFF, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 4. CLEAR - инициализация ADC
+        if verbose:
+            self._log("      CLEAR - инициализация ADC...")
+        clear_adc(spi, verbose=False)
+        time.sleep(0.001)
+        
+        # 5. WRITE 0 - настройка ADC и MUX в зависимости от частоты дискретизации
+        # Согласно даташиту, Register 0 содержит ADC buffer bias и MUX bias
+        # Для 480 kS/s: ADC buffer bias = 3, MUX bias = 5 (из таблицы даташита)
+        # Формат Register 0: биты [15:8] = ADC buffer bias, биты [7:0] = MUX bias
+        # Значение 0x00C5 = ADC buffer bias = 0xC (12), MUX bias = 0x5 (5)
+        # Но согласно таблице для ≥440 kS/s: ADC buffer bias = 3, MUX bias = 5
+        # Правильное значение: (3 << 8) | 5 = 0x0305
+        # Однако в StimulationWithPreset используется 0x00C5, проверим:
+        # 0x00C5 = 197 = 0b11000101 = ADC buffer bias = 0xC (12), MUX bias = 0x5 (5)
+        # Для 480 kS/s используем значение из таблицы: ADC buffer bias = 3, MUX bias = 5
+        # Значение: (3 << 8) | 5 = 0x0305
         if verbose:
             self._log(f"      WRITE 0 - настройка ADC (частота дискретизации: {adc_sampling_rate_ksps} kS/s)...")
-            self._log(f"        Register 0: 0x{rhs2116_register0_for_adc_rate(adc_sampling_rate_ksps):04X}")
-        self._run_rhs2116_sequence(rhs2116_recording_init_commands(adc_sampling_rate_ksps))
-
+        
+        # Определяем значения bias в зависимости от частоты дискретизации
+        if adc_sampling_rate_ksps <= 120:
+            adc_buffer_bias = 32
+            mux_bias = 40
+        elif adc_sampling_rate_ksps <= 140:
+            adc_buffer_bias = 16
+            mux_bias = 40
+        elif adc_sampling_rate_ksps <= 175:
+            adc_buffer_bias = 8
+            mux_bias = 40
+        elif adc_sampling_rate_ksps <= 220:
+            adc_buffer_bias = 8
+            mux_bias = 32
+        elif adc_sampling_rate_ksps <= 280:
+            adc_buffer_bias = 8
+            mux_bias = 26
+        elif adc_sampling_rate_ksps <= 350:
+            adc_buffer_bias = 4
+            mux_bias = 18
+        elif adc_sampling_rate_ksps <= 440:
+            adc_buffer_bias = 3
+            mux_bias = 16
+        else:  # ≥ 440 kS/s
+            adc_buffer_bias = 3
+            mux_bias = 5
+        
+        register_0_value = (adc_buffer_bias << 8) | mux_bias
+        if verbose:
+            self._log(f"        ADC buffer bias: {adc_buffer_bias}, MUX bias: {mux_bias}, Register 0: 0x{register_0_value:04X}")
+        write_intan_register(spi, 0, register_0_value, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 6. WRITE 1 - auxiliary outputs и DSP фильтр
+        # РЕКОМЕНДУЕМЫЕ НАСТРОЙКИ для ЭМГ + стимуляция (f_sample ≈ 1 kHz):
+        # - DSP cutoff = 8-10 (рекомендуется 9)
+        # - aux outputs = Hi-Z
+        # - absmode = 0 (иначе сигнал всегда положительный)
+        # 
+        # Структура Register 1:
+        # - Биты [15:12] = DSP cutoff frequency (k_freq, 0-15)
+        # - Биты [11:8] = Auxiliary outputs
+        # - Биты [7:0] = Другие настройки
+        #
+        # Значение 0x951A:
+        # - DSP cutoff = 9 (биты [15:12] = 0x9)
+        # - Остальные биты как в примере Intan (0x051A)
+        # 
+        # Для f_sample ≈ 1 kHz: DSP f_c = k_freq * f_sample
+        # При k_freq = 9: f_c ≈ 9 Hz (эффективно убирает хвосты после стимуляции)
+        if verbose:
+            self._log("      WRITE 1 0x951A - auxiliary outputs и DSP фильтр (DSP cutoff=9 для ЭМГ+стимуляция)...")
+        write_intan_register(spi, 1, 0x951A, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 7. WRITE 2 0x0000 - Zcheck выключен (экономия 120 µA, включается только при measure_impedance)
+        write_intan_register(spi, 2, 0x0000, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 8. WRITE 3 0x0080 - нейтральное значение impedance DAC (при выкл. Reg2 не влияет)
+        write_intan_register(spi, 3, 0x0080, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 9. WRITE 4 - верхняя частота среза AC-coupled amplifiers (fH)
+        # Для ЭМГ предплечья рекомендуется fH = 500 Hz (вместо 7.5 kHz)
+        # Значение из даташита RHS2116 для 500 Hz: 0x015E
+        # Альтернатива для 750 Hz: 0x00E9 (закомментировано)
+        if verbose:
+            self._log("      WRITE 4 0x015E - верхняя частота среза (500 Hz для ЭМГ)...")
+        write_intan_register(spi, 4, 0x015E, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 10. WRITE 5 - параметр для верхней частоты среза (fH)
+        # Для fH = 500 Hz значение: 0x01AB
+        # Для fH = 750 Hz значение: 0x0124 (закомментировано)
+        if verbose:
+            self._log("      WRITE 5 0x01AB - параметр для верхней частоты среза (500 Hz)...")
+        write_intan_register(spi, 5, 0x01AB, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 11. WRITE 6 - нижняя частота среза AC-coupled amplifiers (fL, версия A)
+        # Для ЭМГ предплечья рекомендуется fL = 20 Hz (вместо 5 Hz)
+        # Значение из даташита RHS2116 для 20 Hz: 0x0036
+        if verbose:
+            self._log("      WRITE 6 0x0036 - нижняя частота среза (20 Hz, версия A для ЭМГ)...")
+        write_intan_register(spi, 6, 0x0036, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 12. WRITE 7 0x000A - RL_B (быстрое восстановление, версия B)
+        # Оставляем как в примере Intan
+        if verbose:
+            self._log("      WRITE 7 0x000A - RL_B (быстрое восстановление, версия B)...")
+        write_intan_register(spi, 7, 0x000A, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 13. WRITE 8 0xFFFF - включить все AC-coupled high-gain amplifiers
+        if verbose:
+            self._log("      WRITE 8 0xFFFF - включить AC-coupled amplifiers...")
+        write_intan_register(spi, 8, 0xFFFF, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 14. WRITE 9 0xFFFF - Low-Gain Amplifier Power
+        # ВАЖНО: Назначение Register 9 в RHS2116 не подтверждено даташитом как управление low-gain power.
+        # В RHS2116:
+        # - AC amplifier power -> Register 8
+        # - DC amplifier power -> Register 38
+        # НЕ МЕНЯТЬ Register 9, пока его назначение не подтверждено страницей даташита RHS2116.
+        if verbose:
+            self._log("      WRITE 9 0xFFFF - Low-Gain Amplifier Power (не менять без подтверждения даташитом)...")
+        write_intan_register(spi, 9, 0xFFFF, u_flag=0, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 15. WRITE 10 0x0000 U=1 - отключить fast settle (triggered register)
+        if verbose:
+            self._log("      WRITE 10 0x0000 U=1 - отключить fast settle...")
+        write_intan_register(spi, 10, 0x0000, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # 16. WRITE 12 0xFFFF U=1 - установить все amplifiers на нижнюю частоту среза версии A (triggered register)
+        # Использует Register 6 (fL = 20 Hz для ЭМГ)
+        if verbose:
+            self._log("      WRITE 12 0xFFFF U=1 - установить нижнюю частоту среза (версия A, 20 Hz для ЭМГ)...")
+        write_intan_register(spi, 12, 0xFFFF, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        
+        # КРИТИЧНО: Регистры 32-33 НЕ устанавливаем в 0xAAAA/0x00FF
+        # Они должны остаться в 0x0000 для дифференциального режима усилителей
+        # Это необходимо для правильной работы EMG регистрации
+        
         if verbose:
             self._log("      ✓ Инициализация для регистрации завершена (регистры 32-33 остались в 0x0000)")
 
@@ -220,50 +624,10 @@ class IntanRecorder:
         """
         if channel < 0 or channel > 15:
             raise ValueError(f"Номер канала должен быть 0-15, получено: {channel}")
-        
-        if hasattr(self.spi, "convert_channel"):
-            return self.spi.convert_channel(channel, amp_type=amp_type, h_flag=h_flag)
 
-        # Формируем команду CONVERT согласно даташиту
-        # Биты [31:30] = 00
-        # Бит [27] = D flag: 1 для чтения DC, 0 для только AC
-        # Бит [26] = H flag: 1 для сброса DSP HPF, 0 для обычного режима
-        d_flag = 1 if amp_type == 'dc' else 0
-        
-        # Команда CONVERT: биты [31:30] = 00, биты [21:16] = канал
-        cmd_word = 0x00000000  # CONVERT команда
-        cmd_word |= (channel << 16)  # номер канала в битах [21:16]
-        if d_flag:
-            cmd_word |= (1 << 27)  # D flag для чтения DC усилителя
-        if h_flag:
-            cmd_word |= (1 << 26)  # H flag для сброса DSP HPF
-        
-        # Преобразуем в байты (MSB first)
-        cmd = [
-            (cmd_word >> 24) & 0xFF,
-            (cmd_word >> 16) & 0xFF,
-            (cmd_word >> 8) & 0xFF,
-            cmd_word & 0xFF
-        ]
-        
-        # Отправляем команду CONVERT (3 фазы как в READ/WRITE)
-        # Важно: каждый transfer поднимает CS, что нужно для Intan pipeline
-        # Согласно даташиту, результат CONVERT приходит через два SPI цикла (N приходит в N+2)
-        if not hasattr(self, '_dummy_cmd'):
-            self._dummy_cmd = [0x00, 0x00, 0x00, 0x00]
-        resp1 = self.spi.transfer(cmd)  # Отправка CONVERT команды, resp1 содержит результат команды N-2
-        resp2 = self.spi.transfer(self._dummy_cmd)  # Dummy, resp2 содержит результат команды N-1
-        resp3 = self.spi.transfer(self._dummy_cmd)  # Dummy, resp3 содержит результат команды N (текущей CONVERT)
-        
-        # Согласно даташиту, результат CONVERT:
-        # - Биты [31:16] = A[15:0] (AC high-gain amplifier, 16 бит) - это то, что нам нужно
-        # - Биты [15:10] = 000000
-        # - Биты [9:0] = W[9:0] (DC low-gain amplifier, 10 бит, только если D=1)
-        
-        # Данные AC усилителя приходят в старших 16 битах результата (resp3[0:2])
-        # resp3[0] и resp3[1] содержат старшие байты AC результата для команды, отправленной в resp1
-        adc_value = (resp3[0] << 8) | resp3[1]
-        return adc_value
+        return convert_intan(
+            self.spi, channel, amp_type=amp_type, h_flag=h_flag, verbose=self.verbose
+        )
 
     def reset_dsp_hpf(self, channel=0):
         """
@@ -286,20 +650,8 @@ class IntanRecorder:
     def convert_channel_auto(self):
         """
         Выполняет CONVERT(63) для автоматического переключения на следующий канал.
-        Согласно даташиту, CONVERT(63) автоматически инкрементирует мультиплексор.
-        Использует 3 транзакции (результат в pipeline N+2) — для одиночных вызовов.
         """
-        if hasattr(self.spi, "convert_channel_auto"):
-            return self.spi.convert_channel_auto()
-
-        cmd = [0x00, 0x3F, 0x00, 0x00]  # CONVERT(63)
-        if not hasattr(self, '_dummy_cmd'):
-            self._dummy_cmd = [0x00, 0x00, 0x00, 0x00]
-        resp1 = self.spi.transfer(cmd)
-        resp2 = self.spi.transfer(self._dummy_cmd)
-        resp3 = self.spi.transfer(self._dummy_cmd)
-        adc_value = (resp3[0] << 8) | resp3[1]
-        return adc_value
+        return convert_intan(self.spi, 63, amp_type="ac", h_flag=0, verbose=self.verbose)
 
     def _convert_1tx(self, cmd_bytes):
         """
@@ -307,14 +659,22 @@ class IntanRecorder:
         Ответ текущей транзакции = результат команды N-2.
         Используется в record_channels для максимальной скорости.
         """
+        if _is_usb_backend(self.spi):
+            channel = cmd_bytes[1] & 0x3F
+            return convert_intan(self.spi, channel, amp_type="ac", h_flag=0)
         resp = self.spi.transfer(cmd_bytes)
         return (resp[0] << 8) | resp[1]
 
     def read_temperature(self):
-        raise RuntimeError(
-            "RHS2116 не предоставляет отдельную temperature-команду в текущем контракте. "
-            "Register 3 зарезервирован под Zcheck DAC и не должен читаться как температура."
-        )
+        """
+        Читает температуру из регистра 3 (Temperature Sensor).
+        
+        Returns:
+            Значение температуры (16-битное значение ADC)
+        """
+        self.ensure_initialized()
+        temp_value = read_intan_register(self.spi, 3, verbose=self.verbose)
+        return temp_value
 
     def measure_impedance(self, channel, test_current_nA=5, frequency=1000, num_samples=5000):
         """
@@ -395,8 +755,6 @@ class IntanRecorder:
             self._log(f"      Сохранено состояние: Reg32=0x{reg32_before:04X}, Reg33=0x{reg33_before:04X}, Reg42=0x{reg42_before:04X}, Reg44=0x{reg44_before:04X}")
             self._log(f"      Reg2=0x{reg2_before:04X}, Reg3=0x{reg3_before:04X}, Reg34=0x{reg34_before:04X}, Reg35=0x{reg35_before:04X}")
             self._log(f"      Регистры токов стимуляции сохранены (64-79, 96-111)")
-
-        self._run_rhs2116_sequence(rhs2116_safe_impedance_commands())
         
         # --- RHS2116 Zcheck: ТОЛЬКО Register 2 и 3 (рег. 15-20 не существуют) ---
         # Register 2: D[13:8]=channel, D[6]=DAC power, D[5]=load(0), D[4:3]=scale, D[0]=en
@@ -481,14 +839,11 @@ class IntanRecorder:
             else:
                 self._log(f"        Регистры 32-33 восстановлены в 0x{reg32_before:04X}/0x{reg33_before:04X}")
         
-        # Восстанавливаем triggered-регистры через shadow write -> единый commit в Register 42.
-        write_intan_register(self.spi, 44, reg44_before, u_flag=0, m_flag=0, verbose=False)
-        time.sleep(0.001)
-        for ch in range(16):
-            write_intan_register(self.spi, 64 + ch, regs_64_79_before[ch], u_flag=0, m_flag=0, verbose=False)
-            write_intan_register(self.spi, 96 + ch, regs_96_111_before[ch], u_flag=0, m_flag=0, verbose=False)
-        time.sleep(0.001)
+        # Восстанавливаем регистры 42 и 44 (стимуляция)
+        # Эти регистры являются triggered registers и требуют u_flag=1
         write_intan_register(self.spi, 42, reg42_before, u_flag=1, m_flag=0, verbose=False)
+        time.sleep(0.001)
+        write_intan_register(self.spi, 44, reg44_before, u_flag=1, m_flag=0, verbose=False)
         time.sleep(0.001)
         
         # Проверяем, что регистры действительно восстановлены
@@ -500,14 +855,10 @@ class IntanRecorder:
                 self._log(f"        Регистры 42/44 восстановлены: 0x{reg42_before:04X}/0x{reg44_before:04X} ✓")
             else:
                 self._log(f"        ⚠ Регистры 42/44 не восстановлены! Ожидалось 0x{reg42_before:04X}/0x{reg44_before:04X}, получено 0x{reg42_after:04X}/0x{reg44_after:04X}")
-                # Принудительно восстанавливаем через тот же commit policy.
-                write_intan_register(self.spi, 44, reg44_before, u_flag=0, m_flag=0, verbose=False)
-                time.sleep(0.001)
-                for ch in range(16):
-                    write_intan_register(self.spi, 64 + ch, regs_64_79_before[ch], u_flag=0, m_flag=0, verbose=False)
-                    write_intan_register(self.spi, 96 + ch, regs_96_111_before[ch], u_flag=0, m_flag=0, verbose=False)
-                time.sleep(0.001)
+                # Принудительно восстанавливаем
                 write_intan_register(self.spi, 42, reg42_before, u_flag=1, m_flag=0, verbose=False)
+                time.sleep(0.001)
+                write_intan_register(self.spi, 44, reg44_before, u_flag=1, m_flag=0, verbose=False)
                 time.sleep(0.001)
                 self._log(f"        Регистры 42/44 принудительно восстановлены в 0x{reg42_before:04X}/0x{reg44_before:04X}")
         
@@ -659,7 +1010,11 @@ class IntanRecorder:
         
         if sample_rate <= 0:
             raise ValueError("Частота дискретизации должна быть > 0")
-        
+
+        if _is_usb_backend(self.spi):
+            yield from self._record_channels_usb(channels, sample_rate, duration)
+            return
+
         start_time = time.time()
         conv_63 = [0x00, 0x3F, 0x00, 0x00]
         conv_ch = lambda ch: [0x00, ch & 0x3F, 0x00, 0x00]
@@ -676,45 +1031,327 @@ class IntanRecorder:
             while True:
                 if duration and (time.time() - start_time) >= duration:
                     break
-                self.shared_state.wait_until_recording_allowed(timeout_s=0.05)
-                if not self.shared_state.snapshot_recording_session().get("recording_active", False):
-                    break
-
+                
                 sample_start = time.time()
                 raw_values = []
-
-                with self.shared_state.chip_lock:
-                    if getattr(self.spi, "using_driver", False):
-                        if sequential:
-                            raw_values.append(self.convert_channel(first_ch))
-                            for _ in range(nch - 1):
-                                raw_values.append(self.convert_channel_auto())
-                        else:
-                            for ch in channels:
-                                raw_values.append(self.convert_channel(ch))
-                        yield (sample_start, raw_values, channels, 0)
-                        continue
-
-                    if sequential:
-                        # 2 dummy + CONVERT(0) + 17×CONVERT(63) = 20 tx; ответы 1–4 мусор, 5–20 = ch0..ch15
-                        for _ in range(2):
-                            raw_values.append(self._convert_1tx(conv_63))
-                        raw_values.append(self._convert_1tx(conv_ch(first_ch)))
-                        for _ in range(17):
-                            raw_values.append(self._convert_1tx(conv_63))
-                    else:
-                        for _ in range(2):
-                            raw_values.append(self._convert_1tx(conv_63))
-                        for ch in channels:
-                            raw_values.append(self._convert_1tx(conv_ch(ch)))
-                        for _ in range(nch + 2):
-                            raw_values.append(self._convert_1tx(conv_63))
+                
+                if sequential:
+                    # 2 dummy + CONVERT(0) + 17×CONVERT(63) = 20 tx; ответы 1–4 мусор, 5–20 = ch0..ch15
+                    for _ in range(2):
+                        raw_values.append(self._convert_1tx(conv_63))
+                    raw_values.append(self._convert_1tx(conv_ch(first_ch)))
+                    for _ in range(17):
+                        raw_values.append(self._convert_1tx(conv_63))
+                else:
+                    for _ in range(2):
+                        raw_values.append(self._convert_1tx(conv_63))
+                    for ch in channels:
+                        raw_values.append(self._convert_1tx(conv_ch(ch)))
+                    for _ in range(nch + 2):
+                        raw_values.append(self._convert_1tx(conv_63))
                 
                 yield (sample_start, raw_values, channels, PIPELINE_SKIP)
         except KeyboardInterrupt:
             self._log("Регистрация прервана пользователем")
         except Exception as e:
             self._log(f"Ошибка в record_channels: {e}")
+            raise
+
+    def _record_channels_usb(self, channels, sample_rate, duration=None):
+        """
+        Регистрация через USB (STM32 coprocessor).
+
+        V2 (RHS1): SPI_STREAM_RR8_REAL / SPI_STREAM_REAL → кадры 4096 B.
+        V1 (legacy): STREAM / STREAM8 → сырой uint16 bulk.
+        """
+        if hasattr(self.spi, "firmware_version"):
+            try:
+                firmware = self.spi.firmware_version()
+            except Exception as exc:
+                self._log(f"⚠ Не удалось определить прошивку USB V2: {exc}")
+            else:
+                if firmware == "v2":
+                    yield from self._record_channels_usb_v2(
+                        channels, sample_rate, duration
+                    )
+                    return
+
+        yield from self._record_channels_usb_v1(channels, sample_rate, duration)
+
+    def _record_channels_usb_v2(self, channels, sample_rate, duration=None):
+        """USB HS Streaming V2 — RHS1 ring, SPI_STREAM_RR8_REAL / SPI_STREAM_REAL."""
+        start_time = time.time()
+        nch = len(channels)
+        PIPELINE_SKIP = 0
+        spi = self.spi
+        use_rr8 = channels == list(range(RR8_CHANNELS))
+        use_rr16 = channels == list(range(16))
+        sequential = (
+            nch > 1
+            and channels == list(range(channels[0], channels[0] + nch))
+        )
+        channel_router = Rhs1ChannelRouter(channels) if nch > 1 else None
+        frame_timeout_ms = 250
+        overflow_logged = False
+        metadata_logged = False
+        tag_errors_logged = False
+        tagged_mismatch_logged = False
+        yield_buf = bytearray()
+        batch_meta = None
+        batch_wall_ts = 0.0
+        batch_capture_ns = 0
+        frame_bytes = nch * 2
+
+        if not (nch == 1 or sequential):
+            raise RuntimeError(
+                "USB V2 STM32 поддерживает real recording одного канала или "
+                f"непрерывного диапазона каналов; запрошено {channels}"
+            )
+
+        self._log(
+            f"USB V2 RHS1: каналы {channels}, цель {sample_rate} Hz/канал, "
+            f"режим={'RR16' if use_rr16 else ('RR8' if use_rr8 else ('range' if nch > 1 else '1ch'))}, "
+            f"yield≥{USB_V2_YIELD_TARGET_BYTES}B, burst+{USB_V2_BURST_EXTRA_FRAMES}, "
+            f"udp_wifi={INTAN_UDP_WIFI}"
+        )
+
+        def reload_stream() -> None:
+            nonlocal batch_meta
+            batch_meta = None
+            yield_buf.clear()
+            if use_rr16:
+                spi.start_spi_stream_rr16_real(V2_STREAM_RELOAD_SAMPLES, 0)
+            elif use_rr8:
+                spi.start_spi_stream_rr8_real(V2_STREAM_RELOAD_SAMPLES, 0)
+            elif nch == 1:
+                spi.start_spi_stream_real(V2_STREAM_RELOAD_SAMPLES, channels[0], 0)
+            else:
+                spi.start_spi_stream_range_real(
+                    V2_STREAM_RELOAD_SAMPLES, channels[0], nch, 0
+                )
+
+        def emit_batch(*, force: bool = False):
+            nonlocal batch_meta, batch_wall_ts, batch_capture_ns
+            if batch_meta is None or not yield_buf:
+                return
+            n_frames = len(yield_buf) // frame_bytes
+            if n_frames <= 0:
+                return
+            if not force and len(yield_buf) < USB_V2_YIELD_TARGET_BYTES:
+                return
+            use_bytes = n_frames * frame_bytes
+            chunk = bytes(yield_buf[:use_bytes])
+            del yield_buf[:use_bytes]
+            yield _rhs1_stream_batch(
+                batch_meta,
+                chunk,
+                channels,
+                pipeline_skip=PIPELINE_SKIP,
+                wall_ts=batch_wall_ts,
+                capture_ts_ns=batch_capture_ns,
+            )
+            batch_meta = None
+
+        reload_stream()
+        try:
+            while True:
+                if duration and (time.time() - start_time) >= duration:
+                    break
+
+                if not getattr(spi, "_v2_stream_active", False):
+                    reload_stream()
+
+                raw_frames = spi.read_rhs1_raw_burst(
+                    timeout_ms=frame_timeout_ms,
+                    max_extra=USB_V2_BURST_EXTRA_FRAMES,
+                )
+                if not raw_frames:
+                    continue
+
+                for raw in raw_frames:
+                    meta = parse_rhs1_header(raw)
+
+                    if (
+                        (meta.spi_overflow_count or meta.usb_overflow_count)
+                        and not overflow_logged
+                    ):
+                        self._log(
+                            f"⚠ RHS1 overflow: spi={meta.spi_overflow_count}, "
+                            f"usb={meta.usb_overflow_count}"
+                        )
+                        overflow_logged = True
+
+                    if not metadata_logged:
+                        tagged = bool(meta.flags & RHS1_FLAG_CHANNEL_TAG)
+                        self._log(
+                            "RHS1 metadata: "
+                            f"first_channel={meta.first_channel}, "
+                            f"channel_count={meta.channel_count}, "
+                            f"flags=0x{meta.flags:04X}, "
+                            f"channel_tagged={tagged}, "
+                            f"channel_bits={meta.channel_bits}, "
+                            f"convert_flags=0x{meta.convert_flags:02X}"
+                        )
+                        metadata_logged = True
+
+                    if nch == 1:
+                        if meta.channel_tagged and meta.channel_count > 1:
+                            if not tagged_mismatch_logged:
+                                self._log(
+                                    "⚠ RHS1: 1ch запись получила tagged multi-ch кадр "
+                                    f"(channel_count={meta.channel_count}); перезапуск потока"
+                                )
+                                tagged_mismatch_logged = True
+                            reload_stream()
+                            break
+                        chunk = rhs1_raw_payload_bytes(raw, channels, meta)
+                        if len(chunk) < 2:
+                            continue
+                    elif channel_router is not None:
+                        chunk = channel_router.feed_raw(raw, meta, validate_tags=False)
+                        if (
+                            channel_router.tag_errors > 0
+                            and not tag_errors_logged
+                        ):
+                            self._log(
+                                f"⚠ RHS1 channel tag mismatch: "
+                                f"errors={channel_router.tag_errors}"
+                            )
+                            tag_errors_logged = True
+                        if not chunk:
+                            continue
+                    else:
+                        continue
+
+                    if batch_meta is None:
+                        batch_meta = meta
+                        batch_wall_ts = time.time()
+                        batch_capture_ns = time.time_ns() if INTAN_UDP_USE_V6 else 0
+                    yield_buf.extend(chunk)
+
+                    for out in emit_batch():
+                        yield out
+
+            for out in emit_batch(force=True):
+                yield out
+        except KeyboardInterrupt:
+            self._log("Регистрация прервана пользователем")
+        except Exception as e:
+            self._log(f"Ошибка в _record_channels_usb_v2: {e}")
+            raise
+        finally:
+            try:
+                spi.stop_stream()
+            except Exception:
+                pass
+
+    def _record_channels_usb_v1(self, channels, sample_rate, duration=None):
+        """Legacy USB: STREAM / STREAM8."""
+        start_time = time.time()
+        nch = len(channels)
+        PIPELINE_SKIP = 0
+        sequential = (
+            nch > 1
+            and channels == list(range(channels[0], channels[0] + nch))
+        )
+        # Пакет: кратно числу каналов в кадре (плотная раскладка v3)
+        if nch == 1:
+            usb_batch = 4096
+        elif sequential and channels[0] == 0 and nch == MUX_FRAME_CHANNELS:
+            usb_batch = 4096  # mux63: 256 кадров × 16
+        else:
+            frames_per_batch = 512
+            usb_batch = frames_per_batch * nch
+            usb_batch = min(4096, (usb_batch // nch) * nch)
+
+        self._log(
+            f"USB V1 STREAM: каналы {channels}, batch={usb_batch}, "
+            f"sequential={sequential}, цель {sample_rate} Hz/канал"
+        )
+
+        try:
+            if nch == 1:
+                stream_ch = channels[0]
+                while True:
+                    if duration and (time.time() - start_time) >= duration:
+                        break
+                    payload = self.spi.stream(usb_batch, stream_ch, 0)
+                    if len(payload) < 2:
+                        continue
+                    yield StreamBatch(time.time(), payload, channels, PIPELINE_SKIP)
+                return
+
+            ch_first = channels[0]
+            ch_last = channels[-1]
+            use_stream8 = channels == list(range(8))
+
+            if use_stream8 and self._usb_stream8_ok is None:
+                try:
+                    probe = self.spi.stream8(64, 0)
+                    self._usb_stream8_ok = len(probe) == 128
+                except Exception:
+                    self._usb_stream8_ok = False
+                if self._usb_stream8_ok:
+                    self._log("USB STREAM8 (каналы 0–7): прошивка поддерживает")
+                else:
+                    self._log(
+                        "USB STREAM8 недоступен — обновите прошивку STM32_SPI_CO; "
+                        "fallback STREAM range / CONVERT(63)"
+                    )
+
+            if sequential and not (use_stream8 and self._usb_stream8_ok):
+                if self._usb_stream_range_ok is None:
+                    try:
+                        probe = self.spi.stream(nch * 16, ch_first, 0, ch_last=ch_last)
+                        self._usb_stream_range_ok = len(probe) == nch * 16 * 2
+                    except Exception:
+                        self._usb_stream_range_ok = False
+                    if self._usb_stream_range_ok:
+                        self._log(
+                            f"USB STREAM range {ch_first}-{ch_last}: прошивка поддерживает"
+                        )
+
+            if use_stream8 and self._usb_stream8_ok:
+                while True:
+                    if duration and (time.time() - start_time) >= duration:
+                        break
+                    payload = self.spi.stream8(usb_batch, 0)
+                    if len(payload) < nch * 2:
+                        continue
+                    yield StreamBatch(time.time(), payload, channels, PIPELINE_SKIP)
+                return
+
+            if sequential:
+                while True:
+                    if duration and (time.time() - start_time) >= duration:
+                        break
+                    if self._usb_stream_range_ok:
+                        payload = self.spi.stream(
+                            usb_batch, ch_first, 0, ch_last=ch_last
+                        )
+                    else:
+                        payload = self.spi.stream(usb_batch, 63, 0)
+                        payload = _extract_mux63_payload(payload, channels)
+                    if len(payload) < nch * 2:
+                        continue
+                    yield StreamBatch(time.time(), payload, channels, PIPELINE_SKIP)
+                return
+
+            # Произвольный набор каналов: mux63 + выборка (медленнее)
+            while True:
+                if duration and (time.time() - start_time) >= duration:
+                    break
+                payload = self.spi.stream(usb_batch, 63, 0)
+                if len(payload) < MUX_FRAME_CHANNELS * 2:
+                    continue
+                compact = _extract_mux63_payload(payload, channels)
+                if not compact:
+                    continue
+                yield StreamBatch(time.time(), compact, channels, PIPELINE_SKIP)
+        except KeyboardInterrupt:
+            self._log("Регистрация прервана пользователем")
+        except Exception as e:
+            self._log(f"Ошибка в _record_channels_usb_v1: {e}")
             raise
 
     def close(self):
@@ -725,67 +1362,69 @@ class IntanRecorder:
         self.recording = False
         self.initialized = False
 
-        # Освобождаем SPI, если он был открыт recorder'ом.
+        if self.backend == "usb":
+            self.spi = self.transport
+            return
+
         try:
-            if self.spi is not None:
+            if self.spi is not None and not _is_usb_backend(self.spi):
                 self.spi.close()
         except Exception:
             pass
         finally:
             self.spi = None
 
-        # GPIO-питание не выключаем принудительно, чтобы не ломать общий сценарий
-        # совместной работы TCP/UDP серверов.
-
 
 class UDPRecorderServer:
     """UDP сервер для отправки данных регистрации клиентам"""
 
-    def __init__(self, recorder, udp_port=9001, verbose=False, shared_state=None):
+    def __init__(self, recorder, udp_port=9001, verbose=False):
         self.recorder = recorder
         self.udp_port = udp_port
         self.verbose = verbose
-        self.shared_state = shared_state or recorder.shared_state
         self.clients = set()  # Множество адресов клиентов (ip, port)
         self.lock = threading.Lock()
         self.running = False
         self.recording_thread = None
         self.recording_active = False  # Флаг активности регистрации
-        self.current_effective_sample_rate_hz = None
+        self._stream_sequence = 0
+        self._stream_global_frame_idx = 0
+        self._udp_send_queue = queue.Queue(maxsize=UDP_SEND_QUEUE_SIZE)
+        self._udp_send_drops = 0
+        self._stream_batch_drops = 0
+        self._udp_sender_threads: list[threading.Thread] = []
+        self._stream_packager_thread = None
+        self._stream_batch_queue: queue.Queue | None = (
+            queue.Queue(maxsize=STREAM_BATCH_QUEUE_SIZE) if STREAM_BATCH_QUEUE_SIZE > 0 else None
+        )
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1 МБ буфер отправки
+        sndbuf = 8 * 1024 * 1024 if INTAN_UDP_WIFI else 4 * 1024 * 1024
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+        except OSError:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)  # Low delay
         self.sock.bind(('0.0.0.0', self.udp_port))
         self.sock.settimeout(1.0)  # Таймаут для возможности проверки running
-        self.shared_state.add_event_listener(self._handle_shared_event)
 
     def _log(self, msg):
         if self.verbose:
             print(msg)
 
-    def _broadcast_text_message(self, message):
-        encoded = message.encode("utf-8")
-        with self.lock:
-            clients_copy = list(self.clients)
-        for client_addr in clients_copy:
-            try:
-                self.sock.sendto(encoded, client_addr)
-            except (socket.error, OSError):
-                continue
-
-    def _handle_shared_event(self, payload):
-        event = str(payload.get("event", "")).strip()
-        if not event:
-            return
-        operation = str(payload.get("operation", "")).strip()
-        suffix = f" operation={operation}" if operation else ""
-        self._broadcast_text_message(f"STATUS {event}{suffix}")
-
     def start_listening(self):
         """Запускает поток для приема регистраций клиентов"""
         self.running = True
+        alive = sum(1 for t in self._udp_sender_threads if t.is_alive())
+        for i in range(alive, UDP_SENDER_THREADS):
+            thread = threading.Thread(
+                target=self._udp_sender_loop,
+                daemon=True,
+                name=f"udp-sender-{i}",
+            )
+            thread.start()
+            self._udp_sender_threads.append(thread)
         listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         listener_thread.start()
         self._log(f"UDP сервер слушает на порту {self.udp_port}")
@@ -810,56 +1449,41 @@ class UDPRecorderServer:
                 elif msg.startswith("START_RECORDING"):
                     # Формат: START_RECORDING channels sample_rate [duration]
                     parts = msg.split()
-                    channels_str = parts[1] if len(parts) > 1 else "0-15"
+                    channels_str = parts[1] if len(parts) > 1 else "0-7"
                     sample_rate = int(parts[2]) if len(parts) > 2 else 40000
                     duration = float(parts[3]) if len(parts) > 3 else None
-                    
-                    self.start_recording(channels_str, sample_rate, duration)
-                    self.sock.sendto(b"RECORDING_STARTED", addr)
+
+                    try:
+                        self.start_recording(channels_str, sample_rate, duration)
+                    except Exception as e:
+                        self._log(f"Ошибка START_RECORDING: {e}")
+                        self.sock.sendto(f"RECORDING_ERROR {e}".encode("utf-8"), addr)
+                    else:
+                        self.sock.sendto(b"RECORDING_STARTED", addr)
                 elif msg == "STOP_RECORDING":
-                    self.stop_recording()
                     self.sock.sendto(b"RECORDING_STOPPED", addr)
+                    self.stop_recording()
             except socket.timeout:
                 continue
             except Exception as e:
                 self._log(f"Ошибка в listen_loop: {e}")
 
-    def _use_driver_streaming(self):
-        return bool(
-            self.recorder
-            and self.recorder.using_driver
-            and self.recorder.spi is not None
-            and hasattr(self.recorder.spi, "supports_streaming")
-            and self.recorder.spi.supports_streaming()
-        )
-
-    def start_recording(self, channels_str="0-15", sample_rate=40000, duration=None):
+    def start_recording(self, channels_str="0-7", sample_rate=40000, duration=None):
         """Запускает регистрацию и отправку данных"""
-        if self.recording_thread and self.recording_thread.is_alive():
-            self._log("Регистрация уже запущена")
-            return
-        
-        # Останавливаем предыдущую регистрацию, если есть
-        self.stop_recording()
-        
         # Проверяем, что recorder существует
         if not self.recorder:
             raise RuntimeError("recorder не инициализирован в UDPRecorderServer")
         
-        # Парсим и валидируем каналы RHS2116.
+        # Парсим каналы
         channels = []
         for part in channels_str.split(','):
             part = part.strip()
-            if not part:
-                continue
             if '-' in part:
                 start, end = map(int, part.split('-'))
                 channels.extend(range(start, end + 1))
             else:
                 channels.append(int(part))
-        channels = rhs2116_validate_channels(channels)
-        if not channels:
-            raise ValueError("Нужно указать хотя бы один канал в диапазоне 0..15")
+        channels = sorted(list(set(channels)))
         
         # Intan RHS2116 поддерживает до 40 kSamples/s на канал (714 kSamples/s общая)
         max_rate_per_channel = 40000
@@ -870,25 +1494,73 @@ class UDPRecorderServer:
         if len(channels) > 16:
             channels = channels[:16]
             self._log(f"⚠ Предупреждение: ограничиваем количество каналов до 16")
+
+        usb_v2 = False
+        if self.recorder.backend == "usb":
+            self.recorder.ensure_initialized()
+            usb_v2 = (
+                _is_usb_backend(self.recorder.spi)
+                and self.recorder.spi.firmware_version() == "v2"
+            )
+            sequential = (
+                len(channels) > 1
+                and channels == list(range(channels[0], channels[0] + len(channels)))
+            )
+            if usb_v2 and not (len(channels) == 1 or sequential):
+                raise ValueError(
+                    "USB V2 STM32 поддерживает real recording одного канала или "
+                    f"непрерывного диапазона каналов; запрошено {channels}"
+                )
+
+        # Останавливаем предыдущую регистрацию только после валидации нового запроса.
+        self.stop_recording()
+        if self.recording_thread and self.recording_thread.is_alive():
+            raise RuntimeError("предыдущая регистрация еще останавливается")
         
         # Вычисляем общую частоту ADC (частота на канал * количество каналов)
         # Это нужно для правильной настройки Register 0 (ADC buffer bias и MUX bias)
         num_channels = len(channels)
         total_adc_rate_ksps = (sample_rate * num_channels) / 1000.0  # в kS/s
+        total_adc_rate_ksps = min(float(USB_V2_FIRMWARE_ADC_KSPS), total_adc_rate_ksps)
         
-        with self.shared_state.chip_lock:
-            if self.recorder.initialized:
-                self._log(f"Настройка ADC для частоты {total_adc_rate_ksps:.1f} kS/s (каналов: {num_channels}, частота на канал: {sample_rate} Hz)")
-                self.recorder._initialize_for_recording(verbose=self.recorder.verbose, adc_sampling_rate_ksps=total_adc_rate_ksps)
-            else:
-                self.recorder.ensure_initialized()
-                self.recorder._initialize_for_recording(verbose=self.recorder.verbose, adc_sampling_rate_ksps=total_adc_rate_ksps)
-            if self._use_driver_streaming():
-                self.recorder.spi.configure_stream(channels, sample_rate)
+        # Переинициализируем чип с правильной частотой ADC, если нужно.
+        # USB V2 *_REAL stream сам вызывает INIT_RECORD(350) в прошивке (TIM-slot DMA).
+        if usb_v2:
+            self._log(
+                "USB V2: пропускаем ручной INIT_RECORD перед real stream; "
+                f"прошивка установит {USB_V2_FIRMWARE_ADC_KSPS} kS/s"
+            )
+        elif self.recorder.initialized:
+            # Проверяем, нужно ли переинициализировать с новой частотой
+            # Если частота изменилась значительно, переинициализируем
+            self._log(f"Настройка ADC для частоты {total_adc_rate_ksps:.1f} kS/s (каналов: {num_channels}, частота на канал: {sample_rate} Hz)")
+            self.recorder._initialize_for_recording(verbose=self.recorder.verbose, adc_sampling_rate_ksps=total_adc_rate_ksps)
+        else:
+            # Первая инициализация - используем вычисленную частоту
+            self.recorder.ensure_initialized()
+            # Переинициализируем с правильной частотой
+            self.recorder._initialize_for_recording(verbose=self.recorder.verbose, adc_sampling_rate_ksps=total_adc_rate_ksps)
         
-        self.current_effective_sample_rate_hz = sample_rate
+        self._stream_sequence = 0
+        self._stream_global_frame_idx = 0
+        self._usb_stream8_ok = None
+        self._usb_stream_range_ok = None
+        self._udp_send_drops = 0
+        self._stream_batch_drops = 0
+        if self._stream_batch_queue is not None:
+            while True:
+                try:
+                    self._stream_batch_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if self._stream_packager_thread is None or not self._stream_packager_thread.is_alive():
+                self._stream_packager_thread = threading.Thread(
+                    target=self._stream_packager_loop,
+                    daemon=True,
+                    name="udp-packager",
+                )
+                self._stream_packager_thread.start()
         self.recording_active = True
-        self.shared_state.set_recording_session(channels, sample_rate, duration, total_adc_rate_ksps)
         self.recording_thread = threading.Thread(
             target=self._recording_loop,
             args=(channels, sample_rate, duration),
@@ -897,84 +1569,8 @@ class UDPRecorderServer:
         self.recording_thread.start()
         self._log(f"Регистрация запущена: каналы {channels}, частота {sample_rate} Hz на канал (общая ADC: {total_adc_rate_ksps:.1f} kS/s)")
 
-    def _stream_recording_loop(self, channels, sample_rate, duration):
-        """Быстрый путь: драйвер формирует packetized stream, userspace только шлет UDP."""
-        start_time = time.time()
-        completed_naturally = False
-        packets_sent = 0
-        clients_copy = []
-
-        try:
-            self._log(
-                f"Запуск driver streaming loop: каналы={channels}, "
-                f"частота={sample_rate} Hz, длительность={duration}"
-            )
-            self.recorder.spi.start_stream()
-
-            while True:
-                if duration and (time.time() - start_time) >= duration:
-                    completed_naturally = True
-                    break
-                if not self.recording_active:
-                    break
-
-                packet = self.recorder.spi.read_stream_packet(timeout_ms=100)
-                if packet is None:
-                    continue
-
-                if len(clients_copy) == 0:
-                    with self.lock:
-                        clients_copy = list(self.clients)
-                elif len(self.clients) != len(clients_copy):
-                    with self.lock:
-                        clients_copy = list(self.clients)
-
-                if not clients_copy:
-                    continue
-
-                failed_clients = []
-                for client_addr in clients_copy:
-                    try:
-                        self.sock.sendto(packet["data"], client_addr)
-                        packets_sent += 1
-                    except (socket.error, OSError) as e:
-                        failed_clients.append(client_addr)
-                        if self.verbose:
-                            self._log(f"⚠ Ошибка отправки stream packet клиенту {client_addr}: {e}")
-
-                if failed_clients:
-                    with self.lock:
-                        for client_addr in failed_clients:
-                            self.clients.discard(client_addr)
-                        clients_copy = list(self.clients)
-
-            if completed_naturally:
-                if not clients_copy:
-                    with self.lock:
-                        clients_copy = list(self.clients)
-                for client_addr in clients_copy:
-                    try:
-                        self.sock.sendto(b"RECORDING_STOPPED", client_addr)
-                    except (socket.error, OSError):
-                        pass
-
-            self._log(f"✓ Driver streaming loop завершен. UDP packets sent: {packets_sent}")
-        finally:
-            try:
-                self.recorder.spi.stop_stream()
-            except Exception:
-                pass
-
     def _recording_loop(self, channels, sample_rate, duration):
         """Цикл регистрации и отправки данных"""
-        if self._use_driver_streaming():
-            try:
-                return self._stream_recording_loop(channels, sample_rate, duration)
-            finally:
-                self.recording_active = False
-                self.shared_state.clear_recording_session()
-                self._log("Driver streaming цикл завершен")
-
         try:
             self._log(f"Запуск _recording_loop: каналы={channels}, частота={sample_rate} Hz, длительность={duration}")
             
@@ -998,15 +1594,16 @@ class UDPRecorderServer:
             self._log(f"Начало чтения данных из record_channels...")
             sample_iter = iter(self.recorder.record_channels(channels, sample_rate, duration))
             sample_count = 0
-            completed_naturally = False
+            frame_dt = (1.0 / float(sample_rate)) if sample_rate > 0 else 0.0
+            ch_bytes = bytes(ch & 0xFF for ch in channels)
             
             while True:
+                if not self.recording_active:
+                    self._log("Регистрация остановлена по запросу")
+                    break
+
                 try:
-                    timestamp, raw_values, ch_list, pipeline_skip = next(sample_iter)
-                    sample_count += 1
-                    
-                    if sample_count == 1:
-                        self._log(f"✓ Первый sample: timestamp={timestamp:.6f}, raw={len(raw_values)}, pipeline_skip={pipeline_skip}")
+                    item = next(sample_iter)
                     
                     if not self.recording_active:
                         self._log("Регистрация остановлена по запросу")
@@ -1019,6 +1616,42 @@ class UDPRecorderServer:
                         with self.lock:
                             clients_copy = list(self.clients)
                     
+                    if isinstance(item, StreamBatch):
+                        if not clients_copy:
+                            continue
+                        payload = item.payload
+                        frame_bytes = channel_count * 2
+                        n_frames = len(payload) // frame_bytes
+                        if n_frames <= 0:
+                            continue
+                        if sample_count == 0:
+                            self._log(
+                                f"✓ Первый USB batch (v3): {n_frames} кадров × {channel_count} каналов, "
+                                f"{len(payload)} байт"
+                            )
+                        sample_count += n_frames
+                        if self._stream_batch_queue is not None:
+                            try:
+                                self._stream_batch_queue.put_nowait(
+                                    (item, tuple(clients_copy), channel_count, frame_dt)
+                                )
+                            except queue.Full:
+                                self._stream_batch_drops += 1
+                        else:
+                            self._send_usb_batch_udp(
+                                item,
+                                clients_copy,
+                                channel_count,
+                                frame_dt,
+                            )
+                        continue
+                    
+                    timestamp, raw_values, ch_list, pipeline_skip = item
+                    sample_count += 1
+                    
+                    if sample_count == 1:
+                        self._log(f"✓ Первый sample: timestamp={timestamp:.6f}, raw={len(raw_values)}, pipeline_skip={pipeline_skip}")
+                    
                     if not clients_copy:
                         if sample_count <= 10:
                             self._log(f"⚠ Нет зарегистрированных клиентов (sample #{sample_count})")
@@ -1027,14 +1660,12 @@ class UDPRecorderServer:
                     samples_buffer_append((timestamp, raw_values, ch_list, pipeline_skip))
                     
                     if len(samples_buffer) >= max_samples_per_packet:
-                        self._send_packet(samples_buffer, clients_copy)
+                        self._send_packet(samples_buffer, clients_copy, ch_bytes)
                         samples_buffer = []
                         samples_buffer_append = samples_buffer.append
                         
                 except StopIteration:
                     # Итератор завершился (нормальное завершение)
-                    if self.recording_active:
-                        completed_naturally = True
                     self._log(f"Итератор record_channels завершился. Всего samples: {sample_count}")
                     break
                 except Exception as e:
@@ -1045,19 +1676,18 @@ class UDPRecorderServer:
                 
             # Отправляем оставшиеся samples
             if samples_buffer:
-                self._send_packet(samples_buffer, clients_copy)
-
-            if completed_naturally:
-                if not clients_copy:
-                    with self.lock:
-                        clients_copy = list(self.clients)
-                for client_addr in clients_copy:
-                    try:
-                        self.sock.sendto(b"RECORDING_STOPPED", client_addr)
-                    except (socket.error, OSError):
-                        pass
+                self._send_packet(samples_buffer, clients_copy, ch_bytes)
                 
             self._log(f"✓ Регистрация завершена успешно. Всего samples: {sample_count}")
+            if self._udp_send_drops or self._stream_batch_drops:
+                print(
+                    f"[UDP] ⚠ drops: udp={self._udp_send_drops} "
+                    f"batch={self._stream_batch_drops}"
+                )
+                self._log(
+                    f"⚠ UDP drops: пакеты={self._udp_send_drops}, "
+                    f"usb_batch={self._stream_batch_drops}"
+                )
                 
         except Exception as e:
             import traceback
@@ -1065,10 +1695,206 @@ class UDPRecorderServer:
             self._log(f"Детали: {traceback.format_exc()}")
         finally:
             self.recording_active = False
-            self.shared_state.clear_recording_session()
             self._log("Цикл регистрации завершен")
     
-    def _send_packet(self, samples_buffer, clients_copy):
+    def _stream_packager_loop(self):
+        """USB batch → UDP пакеты в отдельном потоке (не блокирует чтение USB)."""
+        q = self._stream_batch_queue
+        if q is None:
+            return
+        while self.running:
+            try:
+                item, clients_copy, channel_count, frame_dt = q.get(timeout=0.5)
+            except queue.Empty:
+                if not self.recording_active:
+                    break
+                continue
+            if not self.recording_active and item is None:
+                break
+            self._send_usb_batch_udp(item, list(clients_copy), channel_count, frame_dt)
+
+    def _send_usb_batch_udp(self, batch, clients_copy, channel_count, frame_dt):
+        """UDP v4 (компактный) или v3 + очередь отправки (не блокирует USB)."""
+        payload = batch.payload
+        frame_bytes = channel_count * 2
+        n_frames = len(payload) // frame_bytes
+        if n_frames <= 0:
+            return
+
+        use_v4 = (
+            channel_count > 0
+            and batch.channels == list(range(batch.channels[0], batch.channels[0] + channel_count))
+        )
+        use_v6 = (
+            use_v4
+            and INTAN_UDP_USE_V6
+            and getattr(batch, "capture_ts_ns", 0) > 0
+        )
+        use_v5 = use_v4 and INTAN_UDP_USE_V5 and not use_v6
+        header_size = (
+            V6_HEADER_SIZE
+            if use_v6
+            else (V5_HEADER_SIZE if use_v5 else (V4_HEADER_SIZE if use_v4 else V3_HEADER_SIZE))
+        )
+        max_frames_per_packet = (MAX_UDP_DATAGRAM - header_size) // frame_bytes
+        max_frames_per_packet = max(1, max_frames_per_packet)
+
+        batch_ts_ns = int(batch.timestamp * 1_000_000_000)
+        frame_dt_ns = int(frame_dt * 1_000_000_000) if frame_dt > 0 else 0
+        ch_template = (
+            V3_CHANNEL_TEMPLATE
+            if channel_count == 16
+            else bytes(ch & 0xFF for ch in batch.channels)
+        )
+
+        packets: list[bytes] = []
+        clients_tuple = tuple(clients_copy)
+
+        for start in range(0, n_frames, max_frames_per_packet):
+            chunk_frames = min(max_frames_per_packet, n_frames - start)
+            chunk_len = chunk_frames * frame_bytes
+            packet = bytearray(header_size + chunk_len)
+            seq = self._stream_sequence
+            self._stream_sequence += 1
+
+            if use_v6:
+                mux_count = max(1, int(getattr(batch, "stream_mux_count", 0) or channel_count))
+                adc_rate_hz = int(getattr(batch, "adc_rate_hz", 0) or USB_V2_FIRMWARE_ADC_HZ)
+                capture_ts_ns = int(batch.capture_ts_ns)
+                per_ch_hz = adc_rate_hz / mux_count if mux_count > 0 else adc_rate_hz
+                if start > 0 and per_ch_hz > 0:
+                    capture_ts_ns += int(start * 1_000_000_000 / per_ch_hz)
+                struct.pack_into(
+                    "<IIHH",
+                    packet,
+                    0,
+                    INTAN_STREAM_V6_MAGIC,
+                    seq,
+                    channel_count,
+                    chunk_frames,
+                )
+                struct.pack_into("<I", packet, 12, self._stream_global_frame_idx)
+                struct.pack_into(
+                    "<I",
+                    packet,
+                    16,
+                    batch.hw_counter + start * channel_count,
+                )
+                struct.pack_into("<Q", packet, 20, capture_ts_ns)
+                struct.pack_into("<I", packet, 28, adc_rate_hz)
+                self._stream_global_frame_idx += chunk_frames
+            elif use_v5:
+                struct.pack_into(
+                    "<IIHH",
+                    packet,
+                    0,
+                    INTAN_STREAM_V5_MAGIC,
+                    seq,
+                    channel_count,
+                    chunk_frames,
+                )
+                struct.pack_into("<I", packet, 12, self._stream_global_frame_idx)
+                struct.pack_into(
+                    "<I",
+                    packet,
+                    16,
+                    batch.hw_counter + start * channel_count,
+                )
+                self._stream_global_frame_idx += chunk_frames
+            elif use_v4:
+                struct.pack_into(
+                    "<IIHH",
+                    packet,
+                    0,
+                    INTAN_STREAM_V4_MAGIC,
+                    seq,
+                    channel_count,
+                    chunk_frames,
+                )
+                struct.pack_into("<I", packet, 12, self._stream_global_frame_idx)
+                self._stream_global_frame_idx += chunk_frames
+            else:
+                ts_ns = batch_ts_ns + start * frame_dt_ns
+                struct.pack_into(
+                    "<IHHIQHHHH",
+                    packet,
+                    0,
+                    INTAN_STREAM_MAGIC,
+                    INTAN_STREAM_VERSION,
+                    V3_HEADER_SIZE,
+                    seq,
+                    ts_ns,
+                    channel_count,
+                    chunk_frames,
+                    0,
+                    0,
+                )
+                packet[28 : 28 + channel_count] = ch_template[:channel_count]
+                if channel_count < 16:
+                    packet[28 + channel_count : 44] = b"\x00" * (16 - channel_count)
+
+            packet[header_size:] = payload[
+                start * frame_bytes : start * frame_bytes + chunk_len
+            ]
+            packets.append(bytes(packet))
+
+        if packets:
+            self._enqueue_udp_packets(packets, clients_tuple)
+
+    def _enqueue_udp_packet(self, packet, clients_copy):
+        """Постановка одного пакета в очередь отправки."""
+        if not clients_copy:
+            return
+        self._enqueue_udp_packets(
+            [bytes(packet) if not isinstance(packet, bytes) else packet],
+            tuple(clients_copy),
+        )
+
+    def _enqueue_udp_packets(self, packets: list[bytes], clients_tuple: tuple):
+        """Пакетная постановка в очередь — меньше накладных на Wi‑Fi."""
+        if not packets or not clients_tuple:
+            return
+        try:
+            self._udp_send_queue.put_nowait((packets, clients_tuple))
+        except queue.Full:
+            self._udp_send_drops += len(packets)
+
+    def _udp_sender_loop(self):
+        """Фоновая отправка UDP — разгружает цикл регистрации."""
+        while self.running:
+            try:
+                batch = [self._udp_send_queue.get(timeout=0.5)]
+            except queue.Empty:
+                continue
+            for _ in range(UDP_SENDER_DRAIN_BATCHES - 1):
+                try:
+                    batch.append(self._udp_send_queue.get_nowait())
+                except queue.Empty:
+                    break
+            for packets, clients_copy in batch:
+                for packet in packets:
+                    self._send_raw_packet_nowait(packet, clients_copy)
+
+    def _send_raw_packet(self, packet, clients_copy):
+        self._enqueue_udp_packet(packet, clients_copy)
+
+    def _send_raw_packet_nowait(self, packet, clients_copy):
+        """Непосредственная отправка (только из потока udp-sender)."""
+        failed_clients = []
+        for client_addr in clients_copy:
+            try:
+                self.sock.sendto(packet, client_addr)
+            except (socket.error, OSError) as e:
+                failed_clients.append(client_addr)
+                if self.verbose:
+                    self._log(f"⚠ Ошибка отправки пакета клиенту {client_addr}: {e}")
+
+        if failed_clients:
+            with self.lock:
+                for client_addr in failed_clients:
+                    self.clients.discard(client_addr)
+
+    def _send_packet(self, samples_buffer, clients_copy, ch_bytes=None):
         """Отправляет пакет: формат с pipeline (1 tx/convert), смещение обрабатывается в GUI"""
         if not samples_buffer or not clients_copy:
             return
@@ -1076,55 +1902,50 @@ class UDPRecorderServer:
         sample_count = len(samples_buffer)
         packet = bytearray(5)
         packet[0] = 2  # версия формата: 2 = pipeline (1 tx/convert), смещение в GUI
-        struct.pack_into('<I', packet, 1, sample_count)
+        struct.pack_into('I', packet, 1, sample_count)
         
         for timestamp, raw_values, ch_list, pipeline_skip in samples_buffer:
             raw_count = len(raw_values)
             ch_count = len(ch_list)
-            sample_block_size = 8 + 2 + 2 + ch_count + 2 + raw_count * 2
-            sample_block = bytearray(sample_block_size)
-            struct.pack_into('<dHH', sample_block, 0, timestamp, pipeline_skip, ch_count)
-            for i, ch in enumerate(ch_list):
-                sample_block[12 + i] = ch & 0xFF
-            struct.pack_into('<H', sample_block, 12 + ch_count, raw_count)
+            base = 8 + 2 + 2
+            block_size = base + ch_count + 2 + raw_count * 2
+            sample_block = bytearray(block_size)
+            struct.pack_into('dHH', sample_block, 0, timestamp, pipeline_skip, ch_count)
+            if ch_bytes is not None and len(ch_bytes) == ch_count:
+                sample_block[base : base + ch_count] = ch_bytes
+            else:
+                for i, ch in enumerate(ch_list):
+                    sample_block[base + i] = ch & 0xFF
+            struct.pack_into('H', sample_block, base + ch_count, raw_count)
+            off = base + ch_count + 2
             for i, v in enumerate(raw_values):
-                struct.pack_into('<H', sample_block, 12 + ch_count + 2 + i * 2, v & 0xFFFF)
+                struct.pack_into('<H', sample_block, off + i * 2, v & 0xFFFF)
             packet += sample_block
         
-        failed_clients = []
-        packets_sent = 0
-        for client_addr in clients_copy:
-            try:
-                self.sock.sendto(packet, client_addr)
-                packets_sent += 1
-            except (socket.error, OSError) as e:
-                failed_clients.append(client_addr)
-                if self.verbose:
-                    self._log(f"⚠ Ошибка отправки пакета клиенту {client_addr}: {e}")
-        
-        if failed_clients:
-            with self.lock:
-                for client_addr in failed_clients:
-                    self.clients.discard(client_addr)
-                if failed_clients:
-                    clients_copy[:] = list(self.clients)
+        self._send_raw_packet(packet, clients_copy)
 
     def stop_recording(self):
         """Останавливает регистрацию"""
         if self.recording_active:
             self._log("Остановка регистрации...")
             self.recording_active = False
-            self.shared_state.clear_recording_session()
             try:
-                if self._use_driver_streaming():
-                    self.recorder.spi.stop_stream()
-            except Exception:
-                pass
+                spi = getattr(self.recorder, "spi", None)
+                if _is_usb_backend(spi) and hasattr(spi, "stop_stream"):
+                    spi.stop_stream()
+            except Exception as e:
+                self._log(f"⚠ Не удалось сразу остановить USB stream: {e}")
             # Ждем завершения потока (максимум 2 секунды)
             if self.recording_thread and self.recording_thread.is_alive():
                 self.recording_thread.join(timeout=2.0)
                 if self.recording_thread.is_alive():
                     self._log("⚠ Поток регистрации не завершился в течение 2 секунд")
+            if self._stream_batch_queue is not None:
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    if self._stream_batch_queue.empty():
+                        break
+                    time.sleep(0.05)
 
     def get_clients_count(self):
         """Возвращает количество зарегистрированных клиентов"""

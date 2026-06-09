@@ -71,7 +71,7 @@ python3 intan_server.py --backend usb --tcp-port 9000 --verbose
 
 Флаг **`--backend usb`** обязателен: SPI Intan на Pi **не используется**, все команды идут на STM32.
 
-> **Статус репозитория:** эталонный `msu-neuro-terminal-linux/services/server/intan_server.py` в git — legacy (`/dev/spidev`). USB-backend должен быть на Pi отдельно или добавлен в fork; контракт ниже — **то, что ожидает `intan_gui_new.py`**.
+> **Источник Pi-кода:** GitLab `neuro/msu-neuro-terminal-linux`, ветка **`dev_actual`** — `intan_server.py --backend usb`, `intan_usb_transport.py`, `intan_impedance.py`. Синхронизация в этот репозиторий: каталог `msu-neuro-terminal-linux/services/`.
 
 ### 2.4. systemd (пример)
 

@@ -44,13 +44,13 @@ Unit‑файл для systemd, описывающий сервис Intan TCP/UD
 
 ## Установка
 
-Unit‑файл не копируется вручную. Используется скрипт установки автозапуска:
+Unit‑файл не копируется вручную. Используется скрипт установки автозапуска (сам поднимает права):
 
 ```bash
-sudo services/autostart/install_autostart.sh
+bash services/autostart/install_autostart.sh
 ```
 
-Он читает шаблон из `services/deploy/systemd/intan-server.service`, подставляет актуальные пути и устанавливает в `/etc/systemd/system/`.
+Он читает шаблон из `services/deploy/systemd/intan-server.service`, подставляет актуальные пути и устанавливает в `/etc/systemd/system/`. См. [services/autostart/](../autostart/README.md).
 
 ---
 

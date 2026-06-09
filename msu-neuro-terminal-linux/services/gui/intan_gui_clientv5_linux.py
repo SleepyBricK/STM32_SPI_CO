@@ -11,7 +11,6 @@ TCP‑серверу на плате (intan_tcp_server.py).
 import json
 import math
 import os
-import queue
 import socket
 import struct
 import threading
@@ -71,9 +70,12 @@ def rhs2116_ac_uV(adc: int) -> float:
     return float(velec_uV)
 
 
-RECORDING_TEXT_PREVIEW_LIMIT = 2000
-RECORDING_PLOT_MAX_POINTS_PER_CHANNEL = 5000
-RECORDING_SPECTRUM_MIN_POINTS = 32
+# Конфигурация для псевдодифференциального EMG
+# Можно настроить через переменные окружения или константы
+EMG_CH_A = int(os.environ.get('EMG_CH_A', '0'))  # Канал A для дифференциала (по умолчанию 0)
+EMG_CH_B = int(os.environ.get('EMG_CH_B', '2'))  # Канал B для дифференциала (по умолчанию 2)
+EMG_USE_DIFFERENTIAL = os.environ.get('EMG_USE_DIFFERENTIAL', 'true').lower() == 'true'  # По умолчанию используем дифференциал
+
 
 class IntanTcpClient:
     """Клиент для общения с TCP‑сервером Intan."""
@@ -171,236 +173,23 @@ class IntanGuiApp(tk.Tk):
         
         self.client = IntanTcpClient()
         self.connected = False
+        self.last_impedance_data = None  # данные последнего измерения импеданса для экспорта CSV
 
         # UDP регистрация - инициализация переменных
         self.udp_sock = None
         self.udp_registered = False
         self.udp_listening = False
         self.udp_listen_thread = None
-        self.udp_control_messages = queue.Queue()
         self.recording_packet_count = 0
-        self.recording_values_received = 0
-        self.recording_samples_received = 0
-        self.recording_receive_started_at = None
         self.recording_graph_data = {}  # Данные для графика
-        self.recording_spectrum_data = {}  # Данные спектрального разложения
         self.recording_hex_data = []  # Сырые hex данные для последующего парсинга
         self.recording_active = False  # Флаг активной регистрации
-        self.recording_stop_processed = False  # Защита от двойной финализации остановки
-        self.recording_sample_rate = None  # Частота регистрации для вычисления point_time
-        self.recording_gap_events = []
-        self.recording_runtime_status = tk.StringVar(
-            value="Регистрация может работать вместе со стимуляцией, но во время reinit возможны короткие окна потери данных."
-        )
         
         # Конструктор паттернов
         self.pattern_blocks = []  # Список блоков паттерна
-
-        # Данные последнего измерения импеданса (для экспорта точек)
-        self._last_impedance_data = None
-        self.phase_test_results = []
+        
 
         self._create_widgets()
-
-    def _clear_udp_control_messages(self):
-        try:
-            while True:
-                self.udp_control_messages.get_nowait()
-        except queue.Empty:
-            return
-
-    def _push_udp_control_message(self, message):
-        try:
-            self.udp_control_messages.put_nowait(message)
-        except Exception:
-            pass
-
-    def _wait_for_udp_control_message(self, expected_message, timeout_s=2.0):
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            remaining = max(0.0, deadline - time.time())
-            try:
-                message = self.udp_control_messages.get(timeout=remaining)
-            except queue.Empty:
-                return None
-            if message == expected_message:
-                return message
-        return None
-
-    def _note_recording_gap_event(self, event_name, operation=""):
-        ts = time.time()
-        self.recording_gap_events.append((ts, event_name, operation))
-        operation_suffix = f" ({operation})" if operation else ""
-        if event_name == "stim_started":
-            self.recording_runtime_status.set(
-                "Идет стимуляция во время регистрации: возможна краткая деградация/пауза данных."
-            )
-            self.log(f"Статус Intan: началась стимуляция{operation_suffix}. Возможна краткая пауза регистрации.", "warning")
-        elif event_name == "recording_reinit_started":
-            self.recording_runtime_status.set(
-                "Intan возвращается в recording mode после стимуляции. Возможны пропуски данных."
-            )
-            self.log(f"Статус Intan: начато восстановление recording mode{operation_suffix}.", "warning")
-        elif event_name == "recording_reinit_done":
-            self.recording_runtime_status.set(
-                "Recording mode восстановлен после стимуляции."
-            )
-            self.log(f"Статус Intan: recording mode восстановлен{operation_suffix}.", "success")
-        elif event_name == "stim_finished":
-            self.recording_runtime_status.set(
-                "Стимуляция завершена; поток регистрации продолжает работу."
-            )
-            self.log(f"Статус Intan: стимуляция завершена{operation_suffix}.", "info")
-
-    def _count_values_in_packet(self, binary_data):
-        total_values = 0
-        total_samples = 0
-
-        if len(binary_data) < 4:
-            return total_values, total_samples
-
-        # Формат v3:
-        # magic:u32 + version:u16 + header_size:u16 + seq:u32 + timestamp_ns:u64
-        # + channel_count:u16 + sample_count:u16 + flags:u16 + reserved:u16
-        # + channels[16] + values[sample_count * channel_count]:u16
-        if len(binary_data) >= 44:
-            try:
-                magic, version, header_size, _, _, channel_count, sample_count, _, _ = struct.unpack_from(
-                    '<IHHIQHHHH',
-                    binary_data,
-                    0,
-                )
-            except struct.error:
-                magic = version = 0
-                header_size = 0
-                channel_count = 0
-                sample_count = 0
-            if magic == 0x334E5449 and version == 3:
-                if header_size < 44 or len(binary_data) < header_size:
-                    return 0, 0
-                value_count = channel_count * sample_count
-                if len(binary_data) < header_size + (value_count * 2):
-                    return 0, 0
-                return value_count, sample_count
-
-        # Формат v2:
-        # [ver=2][sample_count:u32] + samples
-        # sample = timestamp:f64 + pipeline_skip:u16 + ch_count:u16 + ch_list:u8[ch_count] + raw_count:u16 + raw:u16[raw_count]
-        if len(binary_data) >= 5 and binary_data[0] == 2:
-            try:
-                sample_count = struct.unpack_from('<I', binary_data, 1)[0]
-            except struct.error:
-                return 0, 0
-
-            offset = 5
-            for _ in range(sample_count):
-                if offset + 12 > len(binary_data):
-                    break
-                try:
-                    _, pipeline_skip, channel_count = struct.unpack_from('<dHH', binary_data, offset)
-                except struct.error:
-                    break
-                offset += 12
-
-                if offset + channel_count > len(binary_data):
-                    break
-                offset += channel_count
-
-                if offset + 2 > len(binary_data):
-                    break
-                try:
-                    raw_count = struct.unpack_from('<H', binary_data, offset)[0]
-                except struct.error:
-                    break
-                offset += 2
-
-                raw_bytes_len = raw_count * 2
-                if offset + raw_bytes_len > len(binary_data):
-                    break
-                offset += raw_bytes_len
-
-                total_values += min(channel_count, max(0, raw_count - pipeline_skip))
-                total_samples += 1
-
-            return total_values, total_samples
-
-        try:
-            sample_count = struct.unpack('I', binary_data[0:4])[0]
-        except struct.error:
-            return 0, 0
-
-        # Старый формат: несколько samples в одном пакете.
-        if 0 < sample_count <= 100:
-            offset = 4
-            for _ in range(sample_count):
-                if offset + 12 > len(binary_data):
-                    break
-                try:
-                    _timestamp = struct.unpack('d', binary_data[offset:offset+8])[0]
-                    offset += 8
-                    channel_count = struct.unpack('I', binary_data[offset:offset+4])[0]
-                    offset += 4
-                except struct.error:
-                    break
-
-                if offset + channel_count * 6 > len(binary_data):
-                    break
-                offset += channel_count * 6
-                total_values += channel_count
-                total_samples += 1
-
-            return total_values, total_samples
-
-        # Очень старый формат: один sample в пакете.
-        if len(binary_data) >= 12:
-            try:
-                channel_count = struct.unpack('I', binary_data[8:12])[0]
-            except struct.error:
-                return 0, 0
-            if 0 < channel_count <= 16:
-                return channel_count, 1
-
-        return 0, 0
-
-    def _finalize_recording_stop(self, source="server"):
-        if self.recording_stop_processed:
-            return
-
-        self.recording_stop_processed = True
-        self.recording_active = False
-        self.btn_start_recording.configure(state="normal" if self.udp_registered else "disabled")
-        self.btn_stop_recording.configure(state="disabled")
-
-        elapsed = 0.0
-        if self.recording_receive_started_at is not None:
-            elapsed = max(0.0, time.perf_counter() - self.recording_receive_started_at)
-        values_per_second = (self.recording_values_received / elapsed) if elapsed > 0 else 0.0
-
-        if len(self.recording_hex_data) > 0:
-            self.log(
-                f"Регистрация завершена ({source}). Начинаем автоматическую обработку {len(self.recording_hex_data)} пакетов...",
-                "info",
-            )
-            self.recording_stats_label.config(
-                text=(
-                    f"Обработка {len(self.recording_hex_data)} пакетов | "
-                    f"Значений: {self.recording_values_received} | "
-                    f"Значений/с: {values_per_second:.1f}"
-                )
-            )
-            if self.recording_gap_events:
-                self.recording_runtime_status.set(
-                    f"Регистрация завершена; отмечено окон переключения режима: {len(self.recording_gap_events)}."
-                )
-            else:
-                self.recording_runtime_status.set("Регистрация завершена без отмеченных окон переключения режима.")
-            threading.Thread(target=self._parse_hex_data_thread, daemon=True).start()
-        else:
-            self.log(f"Регистрация завершена ({source}), данных для обработки нет", "warning")
-            self.recording_stats_label.config(
-                text="Получено пакетов: 0 | Нет данных"
-            )
-            self.recording_runtime_status.set("Регистрация завершена без сохраненных данных.")
 
     def _setup_styles(self):
         """Настройка стилей для красивого интерфейса"""
@@ -502,10 +291,6 @@ class IntanGuiApp(tk.Tk):
         # Вкладка 7: Измерения (температура и импеданс)
         tab_measurements = ttk.Frame(notebook, padding=pad)
         notebook.add(tab_measurements, text="🌡️ Измерения")
-
-        # Вкладка 8: Фазовый тест импеданса
-        tab_phase = ttk.Frame(notebook, padding=pad)
-        notebook.add(tab_phase, text="🧪 Фаза")
 
         # ========== ВКЛАДКА 1: ОСНОВНОЕ ==========
         # Рамка основных команд
@@ -897,18 +682,18 @@ class IntanGuiApp(tk.Tk):
         # Пример паттерна по умолчанию
         default_pattern = """# Пример паттерна стимуляции канала 0
 # ВАЖНО: Настройка шага стимуляции и bias (обязательно!)
-WRITE 34 0x00E2  # Шаг 1 µA (диапазон ±255 µA)
-WRITE 35 0x00AA  # PBIAS/NBIAS для шага 1 µA
+WRITE 34 0x00E2 U  # Шаг 1 µA (диапазон ±255 µA)
+WRITE 35 0x00AA U  # PBIAS/NBIAS для шага 1 µA
 
 # Настройка токов стимуляции (формат 0x80XX, где XX - значение тока в µA)
-WRITE 64 0x8014  # Отрицательный ток 20 µA (канал 0)
-WRITE 96 0x8014  # Положительный ток 20 µA (канал 0)
+WRITE 64 0x8014 U  # Отрицательный ток 20 µA (канал 0)
+WRITE 96 0x8014 U  # Положительный ток 20 µA (канал 0)
 
 # Установка полярности (положительная для канала 0)
-WRITE 44 0x0001
+WRITE 44 0x0001 U
 # Включение стимуляции канала 0
 WRITE 42 0x0001 U
-# Задержка (10 одношаговых SPI transfer)
+# Задержка (10 раз READ 255)
 DELAY 10
 # Выключение стимуляции
 WRITE 42 0x0000 U
@@ -1183,28 +968,28 @@ WRITE 42 0x0000 U
 
         # Верхняя частота среза (fH) - Register 4-5
         ttk.Label(filter_frame, text="Верхняя частота (fH):").grid(row=0, column=0, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_fh_freq = tk.StringVar(value="7500")
+        self.var_fh_freq = tk.StringVar(value="500")
         fh_freq_entry = ttk.Entry(filter_frame, textvariable=self.var_fh_freq, width=10)
         fh_freq_entry.grid(row=0, column=1, sticky="w", padx=pad_small, pady=pad_small)
         ttk.Label(filter_frame, text="Hz").grid(row=0, column=2, sticky="w", padx=(0, pad_small), pady=pad_small)
 
         ttk.Label(filter_frame, text="Register 4 (hex):").grid(row=0, column=3, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_reg4 = tk.StringVar(value="0x0016")
+        self.var_reg4 = tk.StringVar(value="0x015E")
         ttk.Entry(filter_frame, textvariable=self.var_reg4, width=10).grid(row=0, column=4, sticky="w", padx=pad_small, pady=pad_small)
 
         ttk.Label(filter_frame, text="Register 5 (hex):").grid(row=0, column=5, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_reg5 = tk.StringVar(value="0x0017")
+        self.var_reg5 = tk.StringVar(value="0x01AB")
         ttk.Entry(filter_frame, textvariable=self.var_reg5, width=10).grid(row=0, column=6, sticky="w", padx=pad_small, pady=pad_small)
 
         # Нижняя частота среза (fL) - Register 6-7
         ttk.Label(filter_frame, text="Нижняя частота (fL):").grid(row=1, column=0, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_fl_freq = tk.StringVar(value="5")
+        self.var_fl_freq = tk.StringVar(value="20")
         fl_freq_entry = ttk.Entry(filter_frame, textvariable=self.var_fl_freq, width=10)
         fl_freq_entry.grid(row=1, column=1, sticky="w", padx=pad_small, pady=pad_small)
         ttk.Label(filter_frame, text="Hz").grid(row=1, column=2, sticky="w", padx=(0, pad_small), pady=pad_small)
 
         ttk.Label(filter_frame, text="Register 6 (hex):").grid(row=1, column=3, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_reg6 = tk.StringVar(value="0x00A8")
+        self.var_reg6 = tk.StringVar(value="0x0036")
         ttk.Entry(filter_frame, textvariable=self.var_reg6, width=10).grid(row=1, column=4, sticky="w", padx=pad_small, pady=pad_small)
 
         ttk.Label(filter_frame, text="Register 7 (hex):").grid(row=1, column=5, sticky="w", padx=pad_small, pady=pad_small)
@@ -1213,12 +998,12 @@ WRITE 42 0x0000 U
 
         # DSP HPF cutoff - Register 1
         ttk.Label(filter_frame, text="DSP HPF cutoff:").grid(row=2, column=0, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_dsp_cutoff = tk.StringVar(value="0")
+        self.var_dsp_cutoff = tk.StringVar(value="9")
         ttk.Entry(filter_frame, textvariable=self.var_dsp_cutoff, width=10).grid(row=2, column=1, sticky="w", padx=pad_small, pady=pad_small)
-        ttk.Label(filter_frame, text="(0-15)").grid(row=2, column=2, sticky="w", padx=(0, pad_small), pady=pad_small)
+        ttk.Label(filter_frame, text="(0-15, для f_sample≈1kHz: 8-10)").grid(row=2, column=2, sticky="w", padx=(0, pad_small), pady=pad_small)
 
         ttk.Label(filter_frame, text="Register 1 (hex):").grid(row=2, column=3, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_reg1 = tk.StringVar(value="0x051A")
+        self.var_reg1 = tk.StringVar(value="0x951A")
         ttk.Entry(filter_frame, textvariable=self.var_reg1, width=10).grid(row=2, column=4, sticky="w", padx=pad_small, pady=pad_small)
 
         # Кнопки
@@ -1228,16 +1013,16 @@ WRITE 42 0x0000 U
         )
         self.btn_apply_filters.grid(row=2, column=5, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
 
-        self.btn_auto_filters_wideband = ttk.Button(
-            filter_frame, text="Авто (широкополосно)", 
-            command=self.on_auto_filters_wideband, width=20
+        self.btn_auto_filters_emg = ttk.Button(
+            filter_frame, text="Авто (ЭМГ)", 
+            command=self.on_auto_filters_emg, width=15
         )
-        self.btn_auto_filters_wideband.grid(row=3, column=0, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
+        self.btn_auto_filters_emg.grid(row=3, column=0, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
 
         # Подсказка
         filter_hint = ttk.Label(
             filter_frame, 
-            text="Широкополосная запись: fH=7.5 kHz (Reg4=0x0016, Reg5=0x0017), fL=5 Hz (Reg6=0x00A8), Register 1=0x051A",
+            text="Рекомендации для ЭМГ: fH=500 Hz (Reg4=0x015E, Reg5=0x01AB), fL=20 Hz (Reg6=0x0036), DSP cutoff=9 (Reg1=0x951A)",
             font=('Arial', 8), foreground='gray'
         )
         filter_hint.grid(row=3, column=2, columnspan=5, sticky="w", padx=pad_small, pady=pad_small)
@@ -1270,15 +1055,6 @@ WRITE 42 0x0000 U
             stats_frame, text="Получено пакетов: 0 | Каналов: 0", style='Status.TLabel'
         )
         self.recording_stats_label.pack(side="left", padx=pad_small)
-
-        self.recording_runtime_label = ttk.Label(
-            recording_data_frame,
-            textvariable=self.recording_runtime_status,
-            style='Status.TLabel',
-            wraplength=900,
-            justify="left",
-        )
-        self.recording_runtime_label.pack(fill="x", pady=(0, pad_small))
 
         # Кнопки управления графиком
         graph_btn_frame = ttk.Frame(stats_frame)
@@ -1314,7 +1090,7 @@ WRITE 42 0x0000 U
         )
         self.btn_refresh_text.pack(side="left", padx=pad_small)
 
-        # Создаем Notebook для вкладок: график, спектр и текст
+        # Создаем Notebook для вкладок: график и текст
         recording_notebook = ttk.Notebook(recording_data_frame)
         recording_notebook.pack(fill="both", expand=True)
 
@@ -1322,17 +1098,13 @@ WRITE 42 0x0000 U
         graph_tab = ttk.Frame(recording_notebook)
         recording_notebook.add(graph_tab, text="📊 График")
 
-        # Вкладка 2: Спектр
-        spectrum_tab = ttk.Frame(recording_notebook)
-        recording_notebook.add(spectrum_tab, text="📈 Спектр")
-
-        # Вкладка 3: Текст
+        # Вкладка 2: Текст
         text_tab = ttk.Frame(recording_notebook)
         recording_notebook.add(text_tab, text="📝 Текст")
 
-        # Графики (если matplotlib доступен)
+        # График (если matplotlib доступен)
         if MATPLOTLIB_AVAILABLE:
-            # Создаем фигуру matplotlib для временной области
+            # Создаем фигуру matplotlib
             self.recording_figure = Figure(figsize=(10, 6), dpi=100)
             self.recording_ax = self.recording_figure.add_subplot(111)
             self.recording_ax.set_xlabel('Время (с)', fontsize=10)
@@ -1350,23 +1122,6 @@ WRITE 42 0x0000 U
             toolbar_frame.pack(side="top", fill="x")
             self.recording_toolbar = NavigationToolbar2Tk(self.recording_canvas, toolbar_frame)
             self.recording_toolbar.update()
-
-            # Создаем отдельную фигуру для спектрального разложения
-            self.recording_spectrum_figure = Figure(figsize=(10, 6), dpi=100)
-            self.recording_spectrum_ax = self.recording_spectrum_figure.add_subplot(111)
-            self.recording_spectrum_ax.set_xlabel('Частота (Гц)', fontsize=10)
-            self.recording_spectrum_ax.set_ylabel('Амплитуда, µВ', fontsize=10)
-            self.recording_spectrum_ax.set_title('Спектральное разложение данных Intan RHS2116', fontsize=12, fontweight='bold')
-            self.recording_spectrum_ax.grid(True, alpha=0.3)
-
-            self.recording_spectrum_canvas = FigureCanvasTkAgg(self.recording_spectrum_figure, spectrum_tab)
-            self.recording_spectrum_canvas.draw()
-            self.recording_spectrum_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
-
-            spectrum_toolbar_frame = ttk.Frame(spectrum_tab)
-            spectrum_toolbar_frame.pack(side="top", fill="x")
-            self.recording_spectrum_toolbar = NavigationToolbar2Tk(self.recording_spectrum_canvas, spectrum_toolbar_frame)
-            self.recording_spectrum_toolbar.update()
         else:
             # Если matplotlib недоступен, показываем сообщение
             no_graph_label = ttk.Label(
@@ -1375,13 +1130,6 @@ WRITE 42 0x0000 U
                 font=('Arial', 10), justify='center'
             )
             no_graph_label.pack(expand=True)
-
-            no_spectrum_label = ttk.Label(
-                spectrum_tab,
-                text="Для отображения спектра установите matplotlib:\npip install matplotlib",
-                font=('Arial', 10), justify='center'
-            )
-            no_spectrum_label.pack(expand=True)
 
         # Текстовое поле для отображения данных
         self.recording_data_text = scrolledtext.ScrolledText(
@@ -1454,7 +1202,7 @@ WRITE 42 0x0000 U
                 self.log(result_text, "info")
                 
                 # Показываем в отдельном окне с подробностями
-                result_window = tk.Toplevel(self.root)
+                result_window = tk.Toplevel(self)
                 result_window.title("Результат измерения тока")
                 result_window.geometry("400x200")
                 
@@ -1502,7 +1250,7 @@ WRITE 42 0x0000 U
 
         ttk.Label(impedance_frame, text="Усреднений:").grid(row=0, column=6, sticky="w", padx=pad_small, pady=pad_small)
         self.var_impedance_averages = tk.StringVar(value="10")
-        tk.Spinbox(impedance_frame, textvariable=self.var_impedance_averages, from_=1, to=1000, width=6).grid(
+        tk.Spinbox(impedance_frame, textvariable=self.var_impedance_averages, from_=1, to=200, width=5).grid(
             row=0, column=7, sticky="w", padx=pad_small, pady=pad_small
         )
 
@@ -1516,16 +1264,12 @@ WRITE 42 0x0000 U
             command=self.on_measure_impedance, state="disabled", style='Primary.TButton', width=20
         )
         self.btn_measure_impedance.grid(row=1, column=2, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
-        self.btn_measure_all_impedance = ttk.Button(
-            impedance_frame, text="📚 Измерить все каналы",
-            command=self.on_measure_all_impedances, state="disabled", width=20
+
+        self.btn_export_impedance_csv = ttk.Button(
+            impedance_frame, text="📁 Выгрузить CSV",
+            command=self.on_export_impedance_csv, state="disabled", width=15
         )
-        self.btn_measure_all_impedance.grid(row=1, column=6, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
-        self.btn_export_impedance = ttk.Button(
-            impedance_frame, text="💾 Экспорт точек",
-            command=self.on_export_impedance_points, state="disabled", width=16
-        )
-        self.btn_export_impedance.grid(row=1, column=4, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
+        self.btn_export_impedance_csv.grid(row=1, column=4, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
 
         self.impedance_value_label = ttk.Label(
             impedance_frame, text="Импеданс: --", font=('Arial', 12, 'bold')
@@ -1573,194 +1317,6 @@ WRITE 42 0x0000 U
             width=20,
         )
         btn_recovery_apply.grid(row=2, column=0, columnspan=2, sticky="w", padx=pad_small, pady=pad_small)
-
-        # ========== ВКЛАДКА 8: ФАЗОВЫЙ ТЕСТ ==========
-        phase_params_frame = ttk.LabelFrame(tab_phase, text="🧪 Параметры фазового теста", padding=pad)
-        phase_params_frame.pack(fill="x", pady=(0, pad))
-
-        ttk.Label(phase_params_frame, text="Канал (0–15):").grid(row=0, column=0, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_channel = tk.StringVar(value="0")
-        ttk.Entry(phase_params_frame, textvariable=self.var_phase_channel, width=6).grid(
-            row=0, column=1, sticky="w", padx=pad_small, pady=pad_small
-        )
-
-        ttk.Label(phase_params_frame, text="Шкала C:").grid(row=0, column=2, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_scale = tk.StringVar(value="1 pF")
-        phase_scale_combo = ttk.Combobox(phase_params_frame, textvariable=self.var_phase_scale, width=10, state="readonly")
-        phase_scale_combo["values"] = ("0.1 pF", "1 pF", "10 pF")
-        phase_scale_combo.grid(row=0, column=3, sticky="w", padx=pad_small, pady=pad_small)
-
-        ttk.Label(phase_params_frame, text="Частота (Hz):").grid(row=0, column=4, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_freq = tk.StringVar(value="1000")
-        ttk.Entry(phase_params_frame, textvariable=self.var_phase_freq, width=8).grid(
-            row=0, column=5, sticky="w", padx=pad_small, pady=pad_small
-        )
-
-        ttk.Label(phase_params_frame, text="Усреднений:").grid(row=0, column=6, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_averages = tk.StringVar(value="10")
-        tk.Spinbox(phase_params_frame, textvariable=self.var_phase_averages, from_=1, to=1000, width=6).grid(
-            row=0, column=7, sticky="w", padx=pad_small, pady=pad_small
-        )
-
-        ttk.Label(phase_params_frame, text="samples:").grid(row=1, column=0, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_samples = tk.StringVar(value="128")
-        tk.Spinbox(phase_params_frame, textvariable=self.var_phase_samples, from_=16, to=128, increment=16, width=6).grid(
-            row=1, column=1, sticky="w", padx=pad_small, pady=pad_small
-        )
-
-        ttk.Label(phase_params_frame, text="Повторов на частоту:").grid(row=1, column=2, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_repeats = tk.StringVar(value="5")
-        tk.Spinbox(phase_params_frame, textvariable=self.var_phase_repeats, from_=1, to=20, width=6).grid(
-            row=1, column=3, sticky="w", padx=pad_small, pady=pad_small
-        )
-
-        ttk.Label(phase_params_frame, text="Список частот:").grid(row=1, column=4, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_freq_list = tk.StringVar(value="100,300,1000,2000")
-        ttk.Entry(phase_params_frame, textvariable=self.var_phase_freq_list, width=20).grid(
-            row=1, column=5, columnspan=2, sticky="w", padx=pad_small, pady=pad_small
-        )
-
-        self.var_phase_auto_scale = tk.BooleanVar(value=False)
-        ttk.Checkbutton(phase_params_frame, text="Авто C", variable=self.var_phase_auto_scale).grid(
-            row=1, column=7, sticky="w", padx=pad_small, pady=pad_small
-        )
-
-        self.var_phase_safe = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            phase_params_frame,
-            text="Phase-safe (DSP cutoff=0)",
-            variable=self.var_phase_safe
-        ).grid(row=1, column=8, sticky="w", padx=pad_small, pady=pad_small)
-
-        ttk.Label(phase_params_frame, text="τ corr (µs):").grid(row=2, column=0, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_delay_correction_us = tk.StringVar(value="0")
-        ttk.Entry(phase_params_frame, textvariable=self.var_phase_delay_correction_us, width=8).grid(
-            row=2, column=1, sticky="w", padx=pad_small, pady=pad_small
-        )
-        ttk.Label(phase_params_frame, text="φ эталон (°):").grid(row=2, column=2, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_cal_target_deg = tk.StringVar(value="0")
-        ttk.Entry(phase_params_frame, textvariable=self.var_phase_cal_target_deg, width=8).grid(
-            row=2, column=3, sticky="w", padx=pad_small, pady=pad_small
-        )
-        ttk.Label(phase_params_frame, text="f калибр. (Hz):").grid(row=2, column=4, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_cal_frequency_hz = tk.StringVar(value="1000")
-        ttk.Entry(phase_params_frame, textvariable=self.var_phase_cal_frequency_hz, width=8).grid(
-            row=2, column=5, sticky="w", padx=pad_small, pady=pad_small
-        )
-        ttk.Label(
-            phase_params_frame,
-            text="Сначала сделайте sweep, затем перекалибруйте τcorr по raw phase и effective frequency",
-            font=('Arial', 8),
-            foreground='gray'
-        ).grid(row=2, column=6, columnspan=3, sticky="w", padx=pad_small, pady=pad_small)
-        ttk.Label(phase_params_frame, text="Δφ по частотам (°):").grid(row=3, column=0, sticky="w", padx=pad_small, pady=pad_small)
-        self.var_phase_frequency_offsets_deg = tk.StringVar(value="100:-32.56,300:1.81,1000:20.64,2000:44.68")
-        ttk.Entry(phase_params_frame, textvariable=self.var_phase_frequency_offsets_deg, width=48).grid(
-            row=3, column=1, columnspan=5, sticky="we", padx=pad_small, pady=pad_small
-        )
-        ttk.Label(
-            phase_params_frame,
-            text="Формат: 100:-32.56,300:1.81,... Применяется по запрошенной частоте.",
-            font=('Arial', 8),
-            foreground='gray'
-        ).grid(row=3, column=6, columnspan=3, sticky="w", padx=pad_small, pady=pad_small)
-
-        phase_btn_frame = ttk.Frame(tab_phase)
-        phase_btn_frame.pack(fill="x", pady=(0, pad))
-
-        self.btn_phase_single = ttk.Button(
-            phase_btn_frame, text="📐 Один фазовый замер",
-            command=self.on_phase_single_measurement, state="disabled", style='Primary.TButton', width=22
-        )
-        self.btn_phase_single.pack(side="left", padx=pad_small, pady=pad_small)
-
-        self.btn_phase_sweep = ttk.Button(
-            phase_btn_frame, text="📊 Прогон 100/300/1000/2000",
-            command=self.on_phase_frequency_sweep, state="disabled", width=26
-        )
-        self.btn_phase_sweep.pack(side="left", padx=pad_small, pady=pad_small)
-
-        self.btn_phase_export = ttk.Button(
-            phase_btn_frame, text="💾 Экспорт фазы CSV",
-            command=self.on_export_phase_results, state="disabled", width=20
-        )
-        self.btn_phase_export.pack(side="left", padx=pad_small, pady=pad_small)
-
-        self.btn_phase_preset = ttk.Button(
-            phase_btn_frame, text="⚙ Рекоменд. настройки",
-            command=self.on_phase_apply_recommended_preset, state="disabled", width=22
-        )
-        self.btn_phase_preset.pack(side="left", padx=pad_small, pady=pad_small)
-
-        self.btn_phase_1khz = ttk.Button(
-            phase_btn_frame, text="🎯 1 кГц × 10",
-            command=self.on_phase_run_1khz_repeat_test, state="disabled", width=16
-        )
-        self.btn_phase_1khz.pack(side="left", padx=pad_small, pady=pad_small)
-
-        self.btn_phase_recalibrate = ttk.Button(
-            phase_btn_frame, text="🧮 Перекалибровать τcorr",
-            command=self.on_phase_recalibrate_delay, state="disabled", width=24
-        )
-        self.btn_phase_recalibrate.pack(side="left", padx=pad_small, pady=pad_small)
-
-        self.phase_status_label = ttk.Label(
-            tab_phase,
-            text="Фазовый тест: --",
-            font=('Arial', 11, 'bold')
-        )
-        self.phase_status_label.pack(fill="x", pady=(0, pad_small))
-
-        ttk.Label(
-            tab_phase,
-            text="Рекомендуемый прогон: 5–10 повторов, частоты 100/300/1000/2000 Гц, отдельно перепроверить 1 кГц и смотреть разброс фазы между повторами.",
-            font=('Arial', 8), foreground='gray'
-        ).pack(anchor="w", pady=(0, pad_small))
-
-        self.phase_summary_label = ttk.Label(
-            tab_phase,
-            text="Сводка: выполните фазовый прогон для оценки устойчивости угла.",
-            font=('Arial', 9)
-        )
-        self.phase_summary_label.pack(fill="x", pady=(0, pad_small))
-
-        self.phase_interpretation_label = ttk.Label(
-            tab_phase,
-            text="Интерпретация: --",
-            font=('Arial', 9),
-            foreground='gray'
-        )
-        self.phase_interpretation_label.pack(fill="x", pady=(0, pad_small))
-
-        phase_content_frame = ttk.Frame(tab_phase)
-        phase_content_frame.pack(fill="both", expand=True)
-
-        phase_results_frame = ttk.LabelFrame(phase_content_frame, text="Результаты фазового теста", padding=pad)
-        phase_results_frame.pack(side="left", fill="both", expand=True, padx=(0, pad_small))
-
-        self.phase_results_text = scrolledtext.ScrolledText(
-            phase_results_frame, height=18, state="disabled", wrap=tk.WORD,
-            font=('Consolas', 9), bg='#f8f8f8', fg='#333333'
-        )
-        self.phase_results_text.pack(fill="both", expand=True)
-
-        phase_graph_frame = ttk.LabelFrame(phase_content_frame, text="Графики |Z|(f) и phase(f)", padding=pad)
-        phase_graph_frame.pack(side="left", fill="both", expand=True)
-
-        self.phase_canvas = None
-        if MATPLOTLIB_AVAILABLE:
-            self.phase_figure = Figure(figsize=(7.5, 5.5), dpi=100)
-            self.phase_ax_z = self.phase_figure.add_subplot(211)
-            self.phase_ax_phase = self.phase_figure.add_subplot(212)
-            self.phase_canvas = FigureCanvasTkAgg(self.phase_figure, phase_graph_frame)
-            self.phase_canvas.draw()
-            self.phase_canvas.get_tk_widget().pack(fill="both", expand=True)
-        else:
-            ttk.Label(
-                phase_graph_frame,
-                text="Matplotlib недоступен: графики фазового теста отключены.",
-                foreground="gray"
-            ).pack(anchor="w")
 
     # ----------------- Помощники GUI -----------------
 
@@ -1813,18 +1369,10 @@ WRITE 42 0x0000 U
         self.btn_pattern_run.configure(state=state)
         self.btn_read_temp.configure(state=state)
         self.btn_measure_impedance.configure(state=state)
-        self.btn_measure_all_impedance.configure(state=state)
-        self.btn_export_impedance.configure(state=state)
-        self.btn_phase_single.configure(state=state)
-        self.btn_phase_sweep.configure(state=state)
-        self.btn_phase_export.configure(state=state)
-        self.btn_phase_preset.configure(state=state)
-        self.btn_phase_1khz.configure(state=state)
-        self.btn_phase_recalibrate.configure(state=state)
         self.btn_check_intan.configure(state=state)
         self.btn_apply_adc_bias.configure(state=state)
         self.btn_apply_filters.configure(state=state)
-        self.btn_auto_filters_wideband.configure(state=state)
+        self.btn_auto_filters_emg.configure(state=state)
         self.update_status(connected)
 
     def on_clear_log(self):
@@ -1992,11 +1540,6 @@ WRITE 42 0x0000 U
             "inter_pulse_delay": inter_pulse_delay_ms / 1000.0,
             "repeat_count": repeat_count,
         }
-        if self.recording_active:
-            self.log(
-                "Стимуляция запущена во время активной регистрации. Сервер временно переключит Intan в stimulation mode, затем вернет recording mode.",
-                "warning",
-            )
         self._send_async(cmd, "pulse")
 
     def on_sawtooth(self):
@@ -2171,11 +1714,6 @@ WRITE 42 0x0000 U
             "cmd": "pattern_run",
             "repeat_count": repeat_count,
         }
-        if self.recording_active:
-            self.log(
-                "Паттерн запускается во время активной регистрации. Возможны короткие окна потери данных на время reinit Intan.",
-                "warning",
-            )
         self._send_async(cmd, f"pattern_run (повторений: {repeat_count})")
 
     def on_pattern_clear(self):
@@ -2346,7 +1884,7 @@ WRITE 42 0x0000 U
             elif cmd_type == "CLEAR":
                 text = "CLEAR"
             elif cmd_type == "DELAY":
-                text = f"DELAY {cmd['count']} (SPI step x{cmd['count']})"
+                text = f"DELAY {cmd['count']} (READ 255 x{cmd['count']})"
             elif cmd_type == "comment":
                 text = cmd.get('text', '')[:40]
             elif cmd_type == "error":
@@ -2394,7 +1932,7 @@ WRITE 42 0x0000 U
 
 • CLEAR - команда CLEAR для инициализации ADC
 
-• DELAY X - задержка (X одношаговых SPI transfer)
+• DELAY X - задержка (X раз READ 255)
 
 • # комментарий - строка комментария
 
@@ -2587,25 +2125,26 @@ WRITE 42 0x0000 U
             "notes": "Критически важно для качества оцифровки сигналов. Неправильные значения могут привести к нелинейности или артефактам. Используйте таблицу из даташита для выбора оптимальных значений."
         },
         1: {
-            "name": "DSP / Aux Configuration",
+            "name": "ADC Reference Bias",
             "type": "read-write",
-            "bits": 16,
-            "description": "Регистр режима тракта: DSP cutoff, auxiliary outputs, absmode/twoscomp и связанные флаги.",
-            "usage": "В recording/stimulation профиль задает Register 1 целиком. Для phase-safe нужно явно очищать bit 5 (absmode), bit 4 (DSPen) и bits 3:0 (DSP cutoff), а не трогать старшие биты."
+            "bits": 8,
+            "range": "0-255",
+            "description": "Настройка опорного смещения ADC.",
+            "usage": "Обычно устанавливается при инициализации."
         },
         2: {
-            "name": "Zcheck Control",
+            "name": "MUX Load",
             "type": "read-write",
-            "bits": 16,
-            "description": "Управление impedance check. Содержит Zcheck enable, Zcheck DAC power, выбор канала и scale (0.1/1/10 pF).",
-            "usage": "Используется только внутри impedance/phase режима и после измерения должен быть возвращен в 0x0000."
+            "bits": 8,
+            "range": "0-255",
+            "description": "Настройка нагрузки мультиплексора."
         },
         3: {
-            "name": "Zcheck DAC",
-            "type": "read-write",
+            "name": "Temperature Sensor",
+            "type": "read-only",
             "bits": 16,
-            "description": "8-битный DAC для возбуждения при impedance/phase measurement.",
-            "usage": "При измерении обновляется равномерно во времени для формирования синусоиды; вне Zcheck должен быть в нейтральном состоянии 0x0080."
+            "description": "Температурный датчик. Только для чтения.",
+            "usage": "READ 3  # Чтение температуры"
         },
         4: {
             "name": "ADC Auxiliary Input",
@@ -2658,11 +2197,17 @@ WRITE 42 0x0000 U
             "notes": "Triggered регистр - требует U flag = 1"
         },
         9: {
-            "name": "Reserved / Do Not Touch",
-            "type": "read-write",
+            "name": "Low-Gain Amplifier Power",
+            "type": "triggered",
             "bits": 16,
-            "description": "В текущем проектном контракте RHS2116 этот регистр не используется, так как управление питанием усилителей идет через R8 и R38.",
-            "usage": "Не менять без прямой ссылки на даташит RHS2116."
+            "format": "Битовая маска: бит 0 = канал 0, бит 1 = канал 1, ... бит 15 = канал 15",
+            "description": "Управление питанием низкоусиливающих (DC-coupled) усилителей для каждого канала.",
+            "usage": "1 = включить, 0 = выключить.",
+            "example": [
+                "WRITE 9 0xFFFF U  # Включить все каналы",
+                "WRITE 9 0x0001 U  # Включить только канал 0"
+            ],
+            "notes": "Triggered регистр - требует U flag = 1"
         },
         10: {
             "name": "Fast Settle",
@@ -2754,31 +2299,31 @@ WRITE 42 0x0000 U
             "description": "Настройка последовательного сопротивления для измерения импеданса."
         },
         32: {
-            "name": "Stimulator Global Unlock A",
-            "type": "read-write",
+            "name": "Stimulation Enable (Negative)",
+            "type": "triggered",
             "bits": 16,
-            "format": "Ожидаемое значение для разрешения стимуляторов: 0xAAAA",
-            "description": "Глобальный unlock stimulation path. Это не per-channel bitmask.",
-            "usage": "Для recording/impedance держится в 0x0000. Для stimulation включается вместе с R33=0x00FF.",
+            "format": "Битовая маска: бит 0 = канал 0, бит 1 = канал 1, ... бит 15 = канал 15",
+            "description": "Включение стимуляторов с отрицательной полярностью для каждого канала.",
+            "usage": "1 = включить стимулятор с отрицательной полярностью, 0 = выключить. Работает вместе с регистром 42.",
             "example": [
-                "WRITE 32 0x0000   # recording / safe-state",
-                "WRITE 32 0xAAAA   # unlock stimulation"
+                "WRITE 32 0x0001 U  # Включить отрицательную стимуляцию на канале 0",
+                "WRITE 32 0xFFFF U  # Включить на всех каналах"
             ],
-            "notes": "Не помечать как triggered. Канальные triggered-регистры коммитятся отдельно через U=1.",
+            "notes": "Triggered регистр - требует U flag = 1. Работает совместно с регистрами 33, 42, 44.",
             "related": [33, 42, 44]
         },
         33: {
-            "name": "Stimulator Global Unlock B",
-            "type": "read-write",
+            "name": "Stimulation Enable (Positive)",
+            "type": "triggered",
             "bits": 16,
-            "format": "Ожидаемое значение для разрешения стимуляторов: 0x00FF",
-            "description": "Вторая половина глобального unlock stimulation path. Это не per-channel bitmask.",
-            "usage": "Для recording/impedance держится в 0x0000. Для stimulation включается вместе с R32=0xAAAA.",
+            "format": "Битовая маска: бит 0 = канал 0, бит 1 = канал 1, ... бит 15 = канал 15",
+            "description": "Включение стимуляторов с положительной полярностью для каждого канала.",
+            "usage": "1 = включить стимулятор с положительной полярностью, 0 = выключить. Работает вместе с регистром 42.",
             "example": [
-                "WRITE 33 0x0000   # recording / safe-state",
-                "WRITE 33 0x00FF   # unlock stimulation"
+                "WRITE 33 0x0001 U  # Включить положительную стимуляцию на канале 0",
+                "WRITE 33 0xFFFF U  # Включить на всех каналах"
             ],
-            "notes": "Не помечать как triggered. Канальные triggered-регистры коммитятся отдельно через U=1.",
+            "notes": "Triggered регистр - требует U flag = 1. Работает совместно с регистрами 32, 42, 44.",
             "related": [32, 42, 44]
         },
         34: {
@@ -2833,16 +2378,17 @@ WRITE 42 0x0000 U
         },
         38: {
             "name": "DC-Coupled Amplifier Power",
-            "type": "read-write",
+            "type": "triggered",
             "bits": 16,
-            "format": "Для проекта всегда 0xFFFF",
-            "description": "Питание DC-coupled amplifier blocks. В проекте по инварианту всегда держится включенным.",
-            "usage": "Используйте 0xFFFF во всех режимах; отключение может дать нежелательное энергопотребление и расхождения между режимами.",
+            "format": "Битовая маска: бит 0 = канал 0, бит 1 = канал 1, ... бит 15 = канал 15",
+            "description": "Управление питанием DC-coupled (низкоусиливающих) усилителей для каждого канала.",
+            "usage": "1 = включить, 0 = выключить. DC-coupled усилители используются для мониторинга напряжения электродов во время стимуляции.",
             "example": [
-                "WRITE 38 0xFFFF"
+                "WRITE 38 0xFFFF U  # Включить все DC-coupled усилители",
+                "WRITE 38 0x0001 U  # Включить только канал 0"
             ],
-            "notes": "Не использовать R9 как замену этому регистру.",
-            "related": [8]
+            "notes": "Triggered регистр - требует U flag = 1. Важно для мониторинга во время стимуляции.",
+            "related": [9]
         },
         40: {
             "name": "Compliance Monitor",
@@ -3162,32 +2708,36 @@ WRITE 42 0x0000 U
                 self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self.udp_sock.bind(('0.0.0.0', listen_port))
                 self.udp_sock.settimeout(1.0)
-                self.start_udp_listening()
 
                 # Отправляем регистрацию
                 server_addr = (udp_host, udp_port)
-                self._clear_udp_control_messages()
                 self.udp_sock.sendto(b"REGISTER", server_addr)
                 self.log("Отправлена регистрация на UDP сервер", "info")
 
-                message = self._wait_for_udp_control_message("REGISTERED", timeout_s=2.0)
-                if message != "REGISTERED":
+                # Ждем подтверждение
+                try:
+                    data, addr = self.udp_sock.recvfrom(1024)
+                    if data == b"REGISTERED":
+                        self.udp_registered = True
+                        self.udp_status_label.config(
+                            text=f"● Зарегистрирован на {udp_host}:{udp_port}", 
+                            style='Success.TLabel'
+                        )
+                        self.btn_udp_register.configure(state="disabled")
+                        self.btn_udp_unregister.configure(state="normal")
+                        self.btn_start_recording.configure(state="normal")
+                        self.log(f"Успешно зарегистрирован на UDP сервере {addr}", "success")
+                        
+                        # Запускаем поток приема данных
+                        self.start_udp_listening()
+                    else:
+                        raise Exception(f"Неожиданный ответ: {data}")
+                except socket.timeout:
                     raise Exception("Таймаут ожидания подтверждения регистрации")
-
-                self.udp_registered = True
-                self.udp_status_label.config(
-                    text=f"● Зарегистрирован на {udp_host}:{udp_port}", 
-                    style='Success.TLabel'
-                )
-                self.btn_udp_register.configure(state="disabled")
-                self.btn_udp_unregister.configure(state="normal")
-                self.btn_start_recording.configure(state="normal")
-                self.log(f"Успешно зарегистрирован на UDP сервере {server_addr}", "success")
             except Exception as e:
                 self.log(f"Ошибка регистрации на UDP сервере: {e}", "error")
                 messagebox.showerror("Ошибка", f"Не удалось зарегистрироваться: {e}")
                 if self.udp_sock:
-                    self.udp_listening = False
                     self.udp_sock.close()
                     self.udp_sock = None
 
@@ -3206,7 +2756,6 @@ WRITE 42 0x0000 U
             self.udp_sock.sendto(b"UNREGISTER", server_addr)
             self.udp_registered = False
             self.udp_listening = False
-            self._clear_udp_control_messages()
             
             self.udp_status_label.config(
                 text="● Не зарегистрирован", 
@@ -3243,24 +2792,17 @@ WRITE 42 0x0000 U
                 # Проверяем, является ли это текстовым ответом от сервера
                 try:
                     text_response = data.decode('utf-8').strip()
-                    if text_response.startswith("STATUS "):
-                        payload = text_response[len("STATUS "):].strip()
-                        event_name = payload
-                        operation = ""
-                        if " operation=" in payload:
-                            event_name, operation = payload.split(" operation=", 1)
-                            event_name = event_name.strip()
-                            operation = operation.strip()
-                        self.after(0, lambda e=event_name, o=operation: self._note_recording_gap_event(e, o))
-                        continue
                     if text_response in ["REGISTERED", "UNREGISTERED", "RECORDING_STARTED", "RECORDING_STOPPED"]:
-                        self._push_udp_control_message(text_response)
                         # Это текстовый ответ, не бинарные данные
                         if text_response == "RECORDING_STARTED":
                             self.after(0, lambda: self.log("✓ Сервер подтвердил начало регистрации", "success"))
+                            # Убеждаемся, что флаг recording_active установлен
+                            if not self.recording_active:
+                                self.after(0, lambda: self.log("⚠ ВНИМАНИЕ: recording_active=False, но сервер начал регистрацию. Устанавливаем флаг.", "warning"))
+                                self.recording_active = True
                         elif text_response == "RECORDING_STOPPED":
                             self.after(0, lambda: self.log("✓ Сервер подтвердил остановку регистрации", "info"))
-                            self.after(0, lambda: self._finalize_recording_stop("сервер"))
+                            self.recording_active = False
                         continue  # Пропускаем текстовые ответы
                 except (UnicodeDecodeError, AttributeError):
                     # Это бинарные данные, продолжаем обработку
@@ -3277,9 +2819,6 @@ WRITE 42 0x0000 U
                             self.after(0, lambda: self.log(f"📦 Пакет #{self.recording_packet_count + 1}: размер={len(data)} байт, recording_active={self.recording_active}", "info"))
                         self.recording_hex_data.append(data)
                         self.recording_packet_count += 1
-                        values_in_packet, samples_in_packet = self._count_values_in_packet(data)
-                        self.recording_values_received += values_in_packet
-                        self.recording_samples_received += samples_in_packet
                         
                         # Диагностика: логируем первые несколько пакетов
                         if self.recording_packet_count <= 5:
@@ -3306,17 +2845,8 @@ WRITE 42 0x0000 U
         try:
             # Показываем количество сохраненных пакетов
             saved_count = len(self.recording_hex_data)
-            elapsed = 0.0
-            if self.recording_receive_started_at is not None:
-                elapsed = max(0.0, time.perf_counter() - self.recording_receive_started_at)
-            values_per_second = (self.recording_values_received / elapsed) if elapsed > 0 else 0.0
             self.recording_stats_label.config(
-                text=(
-                    f"Пакетов: {self.recording_packet_count} | "
-                    f"Сохранено: {saved_count} | "
-                    f"Значений: {self.recording_values_received} | "
-                    f"Значений/с: {values_per_second:.1f}"
-                )
+                text=f"Получено пакетов: {self.recording_packet_count} | Сохранено: {saved_count} | Данные сохраняются..."
             )
         except Exception:
             pass  # Игнорируем ошибки при обновлении GUI
@@ -3325,323 +2855,372 @@ WRITE 42 0x0000 U
         """Парсит сохраненные hex данные и строит график"""
         try:
             self.recording_graph_data = {}
-
+            
             if not self.recording_hex_data:
                 self.log("Нет данных для парсинга", "warning")
                 return
-
+            
             total_packets = len(self.recording_hex_data)
             self.log(f"Начинаем парсинг {total_packets} пакетов...", "info")
-
+            
+            if total_packets == 0:
+                self.log("Нет данных для парсинга", "warning")
+                return
+            
+            # Сначала парсим все данные в структурированный формат
             parsed_count = 0
             skipped_count = 0
             total_samples = 0
-            total_graph_points = 0
-            invalid_channels_logged = set()
+            invalid_channels_logged = set()  # Для логирования невалидных каналов
+            
+            first_values_logged = False
             first_adc_values = []
             first_uv_values = []
-            recording_start_time = getattr(self, 'recording_start_time', None)
-            sample_rate = self.recording_sample_rate if self.recording_sample_rate and self.recording_sample_rate > 0 else None
-            channel_times = [[] for _ in range(16)]
-            channel_point_times = [[] for _ in range(16)]
-            channel_values = [[] for _ in range(16)]
-            raw_struct_cache = {}
 
-            for binary_data in self.recording_hex_data:
-                if len(binary_data) >= 44:
-                    try:
-                        magic, version, header_size, sequence, timestamp_ns, channel_count, sample_count, flags, _ = struct.unpack_from(
-                            '<IHHIQHHHH',
-                            binary_data,
-                            0,
-                        )
-                    except struct.error:
-                        magic = version = 0
-                        header_size = 0
-                    if magic == 0x334E5449 and version == 3:
-                        if header_size < 44 or len(binary_data) < header_size:
-                            skipped_count += 1
-                            continue
-
-                        ch_list = list(binary_data[28:44][:channel_count])
-                        value_count = channel_count * sample_count
-                        values_offset = header_size
-                        values_bytes_len = value_count * 2
-                        if values_offset + values_bytes_len > len(binary_data):
-                            skipped_count += 1
-                            continue
-
-                        raw_struct = raw_struct_cache.get(value_count)
-                        if raw_struct is None:
-                            raw_struct = struct.Struct(f'<{value_count}H')
-                            raw_struct_cache[value_count] = raw_struct
-                        try:
-                            raw_values = raw_struct.unpack_from(binary_data, values_offset)
-                        except struct.error:
-                            skipped_count += 1
-                            continue
-
-                        timestamp = timestamp_ns / 1_000_000_000.0
-                        if not (0 <= timestamp <= 4102444800):
-                            skipped_count += 1
-                            continue
-
-                        if recording_start_time is None:
-                            recording_start_time = timestamp
-                        base_relative_time = timestamp - recording_start_time
-
-                        if parsed_count == 0 and total_samples == 0 and channel_count > 0:
-                            self.log(
-                                f"✓ Первый sample v3: seq={sequence}, channels={channel_count}, samples={sample_count}, flags=0x{flags:04X}",
-                                "info",
-                            )
-
-                        sample_dt = (1.0 / sample_rate) if sample_rate and sample_rate > 0 else 0.0
-                        for sample_idx in range(sample_count):
-                            relative_time = base_relative_time + (sample_idx * sample_dt)
-                            value_offset = sample_idx * channel_count
-                            for ch_idx, channel_num in enumerate(ch_list):
-                                adc_value_unsigned = raw_values[value_offset + ch_idx]
-                                if len(first_adc_values) < 10:
-                                    first_adc_values.append((channel_num, adc_value_unsigned))
-                                if 0 <= channel_num <= 15:
-                                    value_uv = float((adc_value_unsigned - 32768) * 0.195)
-                                    channel_times[channel_num].append(relative_time)
-                                    channel_point_times[channel_num].append(relative_time)
-                                    channel_values[channel_num].append(value_uv)
-                                    total_graph_points += 1
-                                    if len(first_uv_values) < 10:
-                                        first_uv_values.append((channel_num, value_uv))
-                                elif channel_num not in invalid_channels_logged and len(invalid_channels_logged) < 5:
-                                    self.log(f"⚠ Пропущен невалидный номер канала: {channel_num} (ожидается 0-15)", "warning")
-                                    invalid_channels_logged.add(channel_num)
-                            total_samples += 1
-
-                        parsed_count += 1
-                        continue
-
-                if len(binary_data) < 5 or binary_data[0] != 2:
+            for idx, binary_data in enumerate(self.recording_hex_data):
+                if len(binary_data) < 5:
                     skipped_count += 1
                     continue
-
+                
+                # Формат v2 (pipeline): ver=2, смещение обрабатывается в GUI
+                # [ver=1byte][sample_count=4] per sample: timestamp(8) + pipeline_skip(2) + ch_count(2) + raw_count(2) + raw_count×uint16
+                if binary_data[0] == 2:
+                    try:
+                        sample_count = struct.unpack('I', binary_data[1:5])[0]
+                    except struct.error:
+                        skipped_count += 1
+                        continue
+                    if sample_count == 0 or sample_count > 100:
+                        skipped_count += 1
+                        continue
+                    offset = 5
+                    for _ in range(sample_count):
+                        if offset + 14 > len(binary_data):
+                            break
+                        timestamp, pipeline_skip, ch_count = struct.unpack('dHH', binary_data[offset:offset+12])
+                        offset += 12
+                        if offset + ch_count + 2 > len(binary_data):
+                            break
+                        ch_list = list(binary_data[offset:offset + ch_count])
+                        offset += ch_count
+                        raw_count = struct.unpack('H', binary_data[offset:offset+2])[0]
+                        offset += 2
+                        if offset + raw_count * 2 > len(binary_data):
+                            break
+                        raw_values = struct.unpack(f'<{raw_count}H', binary_data[offset:offset + raw_count * 2])
+                        offset += raw_count * 2
+                        if not (0 <= timestamp <= 4102444800) or pipeline_skip >= raw_count or pipeline_skip + ch_count > raw_count:
+                            continue
+                        if not hasattr(self, 'recording_start_time'):
+                            self.recording_start_time = timestamp
+                        relative_time = timestamp - self.recording_start_time
+                        channel_data = {}
+                        for i in range(ch_count):
+                            ch_num = ch_list[i] if i < len(ch_list) else i
+                            adc_val = raw_values[pipeline_skip + i]
+                            if not first_values_logged and len(first_adc_values) < 10:
+                                first_adc_values.append((ch_num, adc_val))
+                            value_uv = rhs2116_ac_uV(adc_val)
+                            channel_data[ch_num] = value_uv
+                            if not first_values_logged and len(first_uv_values) < 10:
+                                first_uv_values.append((ch_num, value_uv))
+                        for channel, value_uv in channel_data.items():
+                            if channel not in self.recording_graph_data:
+                                self.recording_graph_data[channel] = {'time': [], 'values_uv': []}
+                            self.recording_graph_data[channel]['time'].append(relative_time)
+                            self.recording_graph_data[channel]['values_uv'].append(value_uv)
+                        if EMG_USE_DIFFERENTIAL and EMG_CH_A in channel_data and EMG_CH_B in channel_data:
+                            emg_uv = channel_data[EMG_CH_A] - channel_data[EMG_CH_B]
+                            if 'EMG' not in self.recording_graph_data:
+                                self.recording_graph_data['EMG'] = {'time': [], 'values_uv': []}
+                            self.recording_graph_data['EMG']['time'].append(relative_time)
+                            self.recording_graph_data['EMG']['values_uv'].append(emg_uv)
+                        parsed_count += 1
+                        total_samples += 1
+                    if total_samples > 0:
+                        first_values_logged = True
+                    continue
+                
+                # Формат v1: sample_count (4), затем для каждого sample:
+                #   timestamp (8), channel_count (4), channel_num (4) + ac_value (2) для каждого канала
                 try:
-                    sample_count = struct.unpack_from('<I', binary_data, 1)[0]
+                    sample_count = struct.unpack('I', binary_data[0:4])[0]
                 except struct.error:
                     skipped_count += 1
                     continue
-
-                offset = 5
+                
+                # Проверяем разумность sample_count (защита от поврежденных данных)
+                if sample_count == 0 or sample_count > 100:
+                    # Пробуем парсить как старый формат (один sample на пакет)
+                    if len(binary_data) >= 12:  # Минимум: timestamp (8) + channel_count (4)
+                        try:
+                            # Парсим как один sample (старый формат)
+                            timestamp = struct.unpack('d', binary_data[0:8])[0]
+                            if 0 <= timestamp <= 4102444800:  # Валидный timestamp
+                                channel_count = struct.unpack('I', binary_data[8:12])[0]
+                                if 0 < channel_count <= 16:  # Разумное количество каналов
+                                    # Парсим как старый формат
+                                    offset = 12
+                                    if not hasattr(self, 'recording_start_time'):
+                                        self.recording_start_time = timestamp
+                                    relative_time = timestamp - self.recording_start_time
+                                    
+                                    channel_data = {}
+                                    for i in range(channel_count):
+                                        if offset + 6 > len(binary_data):
+                                            break
+                                        try:
+                                            channel_num = struct.unpack('I', binary_data[offset:offset+4])[0]
+                                            # Читаем как unsigned 16-bit (0..65535) - это правильный формат для RHS2116
+                                            adc_value_unsigned = struct.unpack('H', binary_data[offset+4:offset+6])[0]
+                                            
+                                            if not first_values_logged and len(first_adc_values) < 10:
+                                                first_adc_values.append((channel_num, adc_value_unsigned))
+                                            
+                                            if 0 <= channel_num <= 15:
+                                                # Конвертируем ADC в микровольты используя правильную формулу
+                                                value_uv = rhs2116_ac_uV(adc_value_unsigned)
+                                                channel_data[channel_num] = value_uv
+                                                
+                                                if not first_values_logged and len(first_uv_values) < 10:
+                                                    first_uv_values.append((channel_num, value_uv))
+                                            offset += 6
+                                        except struct.error:
+                                            break
+                                    
+                                    # ВСЕГДА сохраняем отдельные каналы
+                                    for channel, value_uv in channel_data.items():
+                                        if channel not in self.recording_graph_data:
+                                            self.recording_graph_data[channel] = {'time': [], 'values_uv': []}
+                                        self.recording_graph_data[channel]['time'].append(relative_time)
+                                        # Значение уже в микровольтах после rhs2116_ac_uV
+                                        self.recording_graph_data[channel]['values_uv'].append(value_uv)
+                                    
+                                    # Дополнительно: если EMG режим включен и оба канала есть - вычисляем и сохраняем EMG
+                                    if EMG_USE_DIFFERENTIAL:
+                                        if EMG_CH_A in channel_data and EMG_CH_B in channel_data:
+                                            # Вычисляем псевдодифференциальный EMG
+                                            chA_uv = channel_data[EMG_CH_A]
+                                            chB_uv = channel_data[EMG_CH_B]
+                                            emg_uv = chA_uv - chB_uv
+                                            # Сохраняем как виртуальный канал "EMG"
+                                            if 'EMG' not in self.recording_graph_data:
+                                                self.recording_graph_data['EMG'] = {'time': [], 'values_uv': []}
+                                            self.recording_graph_data['EMG']['time'].append(relative_time)
+                                            self.recording_graph_data['EMG']['values_uv'].append(emg_uv)
+                                            
+                                            # Диагностика: логируем первые несколько вычислений дифференциала
+                                            if parsed_count == 0 and len(self.recording_graph_data['EMG']['values_uv']) == 1:
+                                                self.log(f"✓ Первый дифференциальный EMG: Ch{EMG_CH_A}({chA_uv:.2f} µV) - Ch{EMG_CH_B}({chB_uv:.2f} µV) = {emg_uv:.2f} µV", "info")
+                                        elif parsed_count == 0:
+                                            # Логируем только при первом sample, если каналы отсутствуют
+                                            missing = []
+                                            if EMG_CH_A not in channel_data:
+                                                missing.append(f"Ch{EMG_CH_A}")
+                                            if EMG_CH_B not in channel_data:
+                                                missing.append(f"Ch{EMG_CH_B}")
+                                            self.log(f"⚠ Дифференциальный EMG не может быть вычислен: отсутствуют каналы {', '.join(missing)}. Доступные каналы: {list(channel_data.keys())}", "warning")
+                                    
+                                    # Диагностика: логируем первые несколько сохранений
+                                    if parsed_count == 0 and len(channel_data) > 0:
+                                        self.log(f"✓ Первый sample: сохранено {len(channel_data)} каналов: {list(channel_data.keys())}", "info")
+                                    
+                                    parsed_count += 1
+                                    total_samples += 1
+                                    continue
+                        except (struct.error, ValueError):
+                            pass
+                    
+                    skipped_count += 1
+                    continue
+                
+                # Парсим каждый sample в пакете
+                offset = 4
                 packet_samples_parsed = 0
-
-                for _ in range(sample_count):
-                    if offset + 12 > len(binary_data):
+                
+                for sample_idx in range(sample_count):
+                    # Проверяем, что осталось достаточно данных
+                    if offset + 12 > len(binary_data):  # Минимум: timestamp (8) + channel_count (4)
                         break
-
+                    
                     try:
-                        timestamp, pipeline_skip, channel_count = struct.unpack_from('<dHH', binary_data, offset)
+                        timestamp = struct.unpack('d', binary_data[offset:offset+8])[0]
+                        offset += 8
+                        channel_count = struct.unpack('I', binary_data[offset:offset+4])[0]
+                        offset += 4
                     except struct.error:
                         break
-                    offset += 12
-
-                    if offset + channel_count > len(binary_data):
-                        break
-                    ch_list = binary_data[offset:offset + channel_count]
-                    offset += channel_count
-
-                    if offset + 2 > len(binary_data):
-                        break
-                    try:
-                        raw_count = struct.unpack_from('<H', binary_data, offset)[0]
-                    except struct.error:
-                        break
-                    offset += 2
-
-                    raw_bytes_len = raw_count * 2
-                    if offset + raw_bytes_len > len(binary_data):
-                        break
-
-                    raw_struct = raw_struct_cache.get(raw_count)
-                    if raw_struct is None:
-                        raw_struct = struct.Struct(f'<{raw_count}H')
-                        raw_struct_cache[raw_count] = raw_struct
-
-                    try:
-                        raw_values = raw_struct.unpack_from(binary_data, offset)
-                    except struct.error:
-                        break
-                    offset += raw_bytes_len
-
-                    if not (0 <= timestamp <= 4102444800):
+                    
+                    # Проверяем валидность timestamp (быстрая проверка)
+                    if not (0 <= timestamp <= 4102444800):  # 1970-2100 год
+                        # Пропускаем этот sample, но продолжаем парсить пакет
+                        # Нужно пропустить данные каналов этого sample
+                        if offset + channel_count * 6 <= len(binary_data):
+                            offset += channel_count * 6
                         continue
-
-                    if recording_start_time is None:
-                        recording_start_time = timestamp
-                    relative_time = timestamp - recording_start_time
-
-                    usable_count = min(channel_count, max(0, raw_count - pipeline_skip))
-                    if usable_count <= 0:
-                        continue
-
-                    point_dt = (1.0 / (sample_rate * usable_count)) if sample_rate else 0.0
-                    first_sample_channels = 0
-
-                    for i in range(usable_count):
-                        channel_num = ch_list[i]
-                        adc_value_unsigned = raw_values[pipeline_skip + i]
-
-                        if len(first_adc_values) < 10:
-                            first_adc_values.append((channel_num, adc_value_unsigned))
-
-                        if 0 <= channel_num <= 15:
-                            value_uv = float((adc_value_unsigned - 32768) * 0.195)
-                            channel_times[channel_num].append(relative_time)
-                            channel_point_times[channel_num].append(relative_time + i * point_dt)
-                            channel_values[channel_num].append(value_uv)
-                            total_graph_points += 1
-                            first_sample_channels += 1
-
-                            if len(first_uv_values) < 10:
-                                first_uv_values.append((channel_num, value_uv))
-                        elif channel_num not in invalid_channels_logged and len(invalid_channels_logged) < 5:
-                            self.log(f"⚠ Пропущен невалидный номер канала: {channel_num} (ожидается 0-15)", "warning")
-                            invalid_channels_logged.add(channel_num)
-
-                    if parsed_count == 0 and packet_samples_parsed == 0 and first_sample_channels > 0:
-                        self.log(
-                            f"✓ Первый sample v2: сохранено {first_sample_channels} каналов, "
-                            f"pipeline_skip={pipeline_skip}, raw_count={raw_count}",
-                            "info",
-                        )
-
+                    
+                    # Вычисляем относительное время (от начала регистрации)
+                    if not hasattr(self, 'recording_start_time'):
+                        self.recording_start_time = timestamp
+                    
+                    relative_time = timestamp - self.recording_start_time
+                    
+                    # Парсим данные каналов
+                    channel_data = {}
+                    for i in range(channel_count):
+                        if offset + 6 > len(binary_data):
+                            break
+                        try:
+                            channel_num = struct.unpack('I', binary_data[offset:offset+4])[0]
+                            # Читаем как unsigned 16-bit (0..65535) - это правильный формат для RHS2116
+                            adc_value_unsigned = struct.unpack('H', binary_data[offset+4:offset+6])[0]
+                            
+                            if not first_values_logged and len(first_adc_values) < 10:
+                                first_adc_values.append((channel_num, adc_value_unsigned))
+                            
+                            if 0 <= channel_num <= 15:
+                                # Конвертируем ADC в микровольты используя правильную формулу
+                                value_uv = rhs2116_ac_uV(adc_value_unsigned)
+                                channel_data[channel_num] = value_uv
+                                
+                                if not first_values_logged and len(first_uv_values) < 10:
+                                    first_uv_values.append((channel_num, value_uv))
+                            # Игнорируем невалидные номера каналов (логируем только первые несколько)
+                            elif channel_num not in invalid_channels_logged and len(invalid_channels_logged) < 5:
+                                self.log(f"⚠ Пропущен невалидный номер канала: {channel_num} (ожидается 0-15)", "warning")
+                                invalid_channels_logged.add(channel_num)
+                            
+                            offset += 6
+                        except struct.error:
+                            break
+                    
+                    # ВСЕГДА сохраняем отдельные каналы
+                    for channel, value_uv in channel_data.items():
+                        if channel not in self.recording_graph_data:
+                            self.recording_graph_data[channel] = {'time': [], 'values_uv': []}
+                        self.recording_graph_data[channel]['time'].append(relative_time)
+                        # Значение уже в микровольтах после rhs2116_ac_uV
+                        self.recording_graph_data[channel]['values_uv'].append(value_uv)
+                    
+                    # Дополнительно: если EMG режим включен и оба канала есть - вычисляем и сохраняем EMG
+                    if EMG_USE_DIFFERENTIAL:
+                        if EMG_CH_A in channel_data and EMG_CH_B in channel_data:
+                            # Вычисляем псевдодифференциальный EMG
+                            chA_uv = channel_data[EMG_CH_A]
+                            chB_uv = channel_data[EMG_CH_B]
+                            emg_uv = chA_uv - chB_uv
+                            # Сохраняем как виртуальный канал "EMG"
+                            if 'EMG' not in self.recording_graph_data:
+                                self.recording_graph_data['EMG'] = {'time': [], 'values_uv': []}
+                            self.recording_graph_data['EMG']['time'].append(relative_time)
+                            self.recording_graph_data['EMG']['values_uv'].append(emg_uv)
+                    
                     packet_samples_parsed += 1
                     total_samples += 1
-
+                
                 if packet_samples_parsed > 0:
                     parsed_count += 1
-                else:
-                    skipped_count += 1
-
-                if total_samples and total_samples % 10000 == 0:
-                    self.log(f"Обработано {total_samples} сэмплов из {parsed_count} пакетов, точек: {total_graph_points}", "info")
-
-            self.recording_graph_data = {
-                channel: {
-                    'time': channel_times[channel],
-                    'point_time': channel_point_times[channel],
-                    'values_uv': channel_values[channel],
-                }
-                for channel in range(16)
-                if channel_times[channel]
-            }
-            if recording_start_time is not None:
-                self.recording_start_time = recording_start_time
-
+                
+                # Логируем прогресс только периодически (минимум накладных расходов)
+                if total_samples % 1000 == 0:
+                    total_points_now = sum(len(data['time']) for data in self.recording_graph_data.values())
+                    self.log(f"Обработано {total_samples} сэмплов из {parsed_count} пакетов, точек: {total_points_now}", "info")
+            
+            # Подсчитываем общее количество точек по всем каналам
+            total_graph_points = sum(len(data['time']) for data in self.recording_graph_data.values())
+            
             if first_adc_values:
                 self.log("=== Sanity-check: Первые 10 raw ADC значений ===", "info")
                 for ch, adc_val in first_adc_values[:10]:
                     self.log(f"  Ch{ch}: ADC={adc_val} (0x{adc_val:04X})", "info")
+                    # Предупреждение о возможном клиппинге
                     if adc_val == 0 or adc_val == 65535:
                         self.log(f"  ⚠ ВНИМАНИЕ: Ch{ch} показывает клиппинг (0 или 65535)!", "warning")
-
+            
             if first_uv_values:
                 self.log("=== Sanity-check: Первые 10 значений после конвертации (µV) ===", "info")
                 for ch, uv_val in first_uv_values[:10]:
                     self.log(f"  Ch{ch}: {uv_val:8.2f} µV", "info")
-
+            
+            # Диагностика: проверяем статистику по каналам для выявления проблем с DC offset
+            if self.recording_graph_data:
+                self.log("=== Статистика по каналам (для диагностики DC offset) ===", "info")
+                for channel in sorted(self.recording_graph_data.keys(), key=lambda x: (isinstance(x, str), x)):
+                    data = self.recording_graph_data[channel]
+                    if len(data['values_uv']) > 0:
+                        values = np.array(data['values_uv'])
+                        mean_val = np.mean(values)
+                        std_val = np.std(values)
+                        min_val = np.min(values)
+                        max_val = np.max(values)
+                        channel_name = f"Ch{channel}" if isinstance(channel, int) else str(channel)
+                        self.log(f"  {channel_name}: mean={mean_val:8.2f} µV, std={std_val:8.2f} µV, range=[{min_val:8.2f}, {max_val:8.2f}] µV ({len(values)} точек)", "info")
+                        # Предупреждение о большом DC offset
+                        if abs(mean_val) > 1000:  # Если среднее больше 1 мВ
+                            self.log(f"  ⚠ ВНИМАНИЕ: {channel_name} имеет большой DC offset ({mean_val:.2f} µV)! Возможна проблема с конвертацией или аппаратными настройками.", "warning")
+            
             self.log(f"Парсинг завершен. Обработано {parsed_count} из {total_packets} пакетов ({total_samples} samples, пропущено: {skipped_count})", "success")
             self.log(f"Всего точек в графике: {total_graph_points} (каналов: {len(self.recording_graph_data)})", "info")
-
+            
+            # Информация о режиме EMG
+            if EMG_USE_DIFFERENTIAL:
+                self.log(f"Режим: Псевдодифференциальный EMG (Ch{EMG_CH_A} - Ch{EMG_CH_B})", "info")
+            else:
+                self.log("Режим: Отдельные каналы", "info")
+            
+            # Режим calibration/rest check (опционально, можно включить через переменную окружения)
+            if os.environ.get('EMG_CALIBRATION_CHECK', 'false').lower() == 'true':
+                self._perform_calibration_check()
+            
+            # Проверяем, сколько уникальных временных точек
+            all_times = set()
+            for channel_data in self.recording_graph_data.values():
+                all_times.update(channel_data['time'])
+            unique_times = len(all_times)
+            self.log(f"Уникальных временных точек: {unique_times}", "info")
+            
             if parsed_count < total_packets - skipped_count:
                 self.log(f"⚠ Предупреждение: не все пакеты были обработаны ({parsed_count}/{total_packets}, пропущено: {skipped_count})", "warning")
-
+            
+            if unique_times == 1 and total_graph_points > 1:
+                self.log("⚠ ВНИМАНИЕ: все точки имеют одинаковое время! Возможно, проблема с временными метками.", "warning")
+            
+            self.log(f"Вызов _update_recording_text_display из _parse_hex_data: {len(self.recording_graph_data)} каналов, {total_graph_points} точек", "info")
+            self._update_recording_text_display()
+            
             if total_graph_points == 0:
                 self.log("⚠ ОШИБКА: после парсинга нет точек для графика!", "error")
                 return
-
-            self._compute_recording_spectrum_data()
-
+            
+            # Только после успешного парсинга текста строим график
+            if MATPLOTLIB_AVAILABLE and self.recording_graph_data:
+                self._redraw_recording_graph()
+                self.log("График построен", "success")
+            elif not MATPLOTLIB_AVAILABLE:
+                self.log("Matplotlib недоступен, график не построен", "warning")
+            elif not self.recording_graph_data:
+                self.log("Нет данных для построения графика", "warning")
+            
         except Exception as e:
             self.log(f"Ошибка парсинга данных: {e}", "error")
             import traceback
             self.log(f"Детали ошибки: {traceback.format_exc()}", "error")
             messagebox.showerror("Ошибка", f"Не удалось обработать данные: {e}")
-
-    def _estimate_channel_sample_rate(self, channel_data):
-        """Оценивает эффективную частоту дискретизации конкретного канала."""
-        point_times = np.asarray(channel_data.get('point_time', channel_data.get('time', [])), dtype=float)
-        if point_times.size >= 2:
-            diffs = np.diff(point_times)
-            positive_diffs = diffs[diffs > 0]
-            if positive_diffs.size > 0:
-                median_dt = float(np.median(positive_diffs))
-                if median_dt > 0:
-                    return 1.0 / median_dt
-
-        if self.recording_sample_rate and self.recording_sample_rate > 0:
-            return float(self.recording_sample_rate)
-
-        return None
-
-    def _compute_recording_spectrum_data(self):
-        """Строит амплитудный спектр FFT для распарсенных каналов."""
-        self.recording_spectrum_data = {}
-
-        valid_channels = [
-            ch for ch in sorted(self.recording_graph_data.keys(), key=lambda x: (isinstance(x, str), x))
-            if isinstance(ch, int) and 0 <= ch <= 15
-        ]
-
-        for channel in valid_channels:
-            channel_data = self.recording_graph_data[channel]
-            values = np.asarray(channel_data.get('values_uv', []), dtype=float)
-            if values.size < RECORDING_SPECTRUM_MIN_POINTS:
-                continue
-
-            sample_rate = self._estimate_channel_sample_rate(channel_data)
-            if not sample_rate or sample_rate <= 0:
-                continue
-
-            centered_values = values - np.mean(values)
-            window = np.hanning(centered_values.size)
-            window_sum = float(np.sum(window))
-            if window_sum <= 0:
-                continue
-
-            spectrum = np.fft.rfft(centered_values * window)
-            freqs = np.fft.rfftfreq(centered_values.size, d=1.0 / sample_rate)
-            amplitude_uv = np.abs(spectrum) * (2.0 / window_sum)
-
-            if freqs.size < 2:
-                continue
-
-            self.recording_spectrum_data[channel] = {
-                'freqs_hz': freqs,
-                'amplitude_uv': amplitude_uv,
-                'sample_rate_hz': sample_rate,
-                'point_count': int(centered_values.size),
-            }
-
-        if self.recording_spectrum_data:
-            self.log(
-                f"Спектральное разложение рассчитано для {len(self.recording_spectrum_data)} каналов",
-                "info",
-            )
-        else:
-            self.log(
-                "Недостаточно данных для спектрального разложения. Нужно больше точек после регистрации.",
-                "warning",
-            )
     
     def _perform_calibration_check(self):
         """
-        Выполняет проверку baseline/покоя на первых 2 секундах данных.
+        Выполняет проверку калибровки/покоя на первых 2 секундах данных.
+        Ожидание: mean ~ 0 µV, RMS в покое порядка десятков µV.
         """
         try:
             self.log("=== Calibration/Rest Check ===", "info")
             
-            # Выбираем первый доступный канал для проверки.
+            # Выбираем канал для проверки (EMG если есть, иначе первый доступный)
             check_channel = None
-            if self.recording_graph_data:
+            if 'EMG' in self.recording_graph_data:
+                check_channel = 'EMG'
+                self.log("Проверка на канале: EMG (дифференциал)", "info")
+            elif self.recording_graph_data:
                 check_channel = list(self.recording_graph_data.keys())[0]
                 self.log(f"Проверка на канале: {check_channel}", "info")
             else:
@@ -3714,33 +3293,22 @@ WRITE 42 0x0000 U
             self.log(f"Вызов _update_recording_text_display: recording_graph_data = {len(self.recording_graph_data) if self.recording_graph_data else 0} каналов", "info")
             self.recording_data_text.configure(state="normal")
             self.recording_data_text.delete("1.0", tk.END)
-
+            
             if not self.recording_graph_data:
                 self.recording_data_text.insert("1.0", "Нет данных для отображения\nПопробуйте нажать кнопку '🔍 Построить график' после остановки регистрации.")
                 self.recording_data_text.configure(state="disabled")
                 self.log("⚠ recording_graph_data пуст в _update_recording_text_display", "warning")
                 return
-
-            valid_channels = [
-                ch for ch in sorted(self.recording_graph_data.keys(), key=lambda x: (isinstance(x, str), x))
-                if isinstance(ch, int) and 0 <= ch <= 15
-            ]
-            if not valid_channels:
-                self.recording_data_text.insert(
-                    "1.0",
-                    "Данные распарсены, но валидные каналы 0-15 отсутствуют.\n"
-                    f"Каналов в recording_graph_data: {len(self.recording_graph_data)}\n"
-                    "Проверьте логи на наличие ошибок парсинга.\n"
-                )
-                self.recording_data_text.configure(state="disabled")
-                self.log("⚠ Нет валидных каналов для отображения в текстовом виде", "warning")
-                return
-
-            reference_channel = max(valid_channels, key=lambda ch: len(self.recording_graph_data[ch]['time']))
-            reference_times = self.recording_graph_data[reference_channel]['time']
-            if not reference_times:
-                self.recording_data_text.insert(
-                    "1.0",
+            
+            # Используем уже распарсенные данные из recording_graph_data
+            # Собираем все временные метки и значения для отображения
+            all_timestamps = set()
+            for channel_data in self.recording_graph_data.values():
+                if 'time' in channel_data and channel_data['time']:
+                    all_timestamps.update(channel_data['time'])
+            
+            if not all_timestamps:
+                self.recording_data_text.insert("1.0", 
                     "Данные распарсены, но временные метки отсутствуют.\n"
                     f"Каналов в recording_graph_data: {len(self.recording_graph_data)}\n"
                     "Проверьте логи на наличие ошибок парсинга.\n"
@@ -3748,55 +3316,70 @@ WRITE 42 0x0000 U
                 self.recording_data_text.configure(state="disabled")
                 self.log("⚠ Нет временных меток для отображения", "warning")
                 return
-
-            start_time = getattr(self, 'recording_start_time', 0)
-            timestamps_to_show = reference_times[:RECORDING_TEXT_PREVIEW_LIMIT]
-            channel_positions = {channel: 0 for channel in valid_channels}
-            lines = []
-
+            
+            # Сортируем временные метки - показываем ВСЕ точки
+            sorted_timestamps = sorted(all_timestamps)
+            timestamps_to_show = sorted_timestamps  # Показываем все точки
+            
+            # Восстанавливаем абсолютное время из относительного
+            if hasattr(self, 'recording_start_time'):
+                start_time = self.recording_start_time
+            else:
+                start_time = 0
+            
+            point_count = 0
             for rel_time in timestamps_to_show:
                 abs_time = start_time + rel_time
                 time_str = datetime.fromtimestamp(abs_time).strftime("%H:%M:%S.%f")[:-3]
-                row_parts = [f"[{time_str}]"]
-
+                
+                data_str = f"[{time_str}] "
+                # Собираем значения всех валидных каналов (0-15) и виртуального канала "EMG" для этого момента времени
+                # ВАЖНО: используем key для сортировки смешанных типов (int и str)
+                valid_channels = [ch for ch in sorted(self.recording_graph_data.keys(), key=lambda x: (isinstance(x, str), x)) 
+                                 if (isinstance(ch, int) and 0 <= ch <= 15) or ch == 'EMG']
                 for channel in valid_channels:
                     channel_data = self.recording_graph_data[channel]
-                    times = channel_data['time']
-                    values_uv = channel_data['values_uv']
-                    pos = channel_positions[channel]
-
-                    while pos < len(times) and times[pos] < rel_time:
-                        pos += 1
-
-                    if pos < len(times) and abs(times[pos] - rel_time) < 1e-12:
-                        row_parts.append(f"Ch{channel}:{values_uv[pos]:8.2f} µV")
-                    else:
-                        row_parts.append(f"Ch{channel}:        -")
-
-                    channel_positions[channel] = pos
-
-                lines.append(" ".join(row_parts))
-
-            output_chunks = ["\n".join(lines)]
-            if len(reference_times) > RECORDING_TEXT_PREVIEW_LIMIT:
-                output_chunks.append(
-                    f"\n\nПоказаны первые {RECORDING_TEXT_PREVIEW_LIMIT} временных точек из {len(reference_times)}. "
-                    "Полные данные доступны на графике и при экспорте в CSV."
-                )
-
-            valid_channels_count = len(valid_channels)
+                    # Находим индекс этого времени в массиве времени канала
+                    try:
+                        time_idx = channel_data['time'].index(rel_time)
+                        value_uv = channel_data['values_uv'][time_idx]
+                        # Для виртуального канала "EMG" используем другое форматирование
+                        if channel == 'EMG':
+                            data_str += f"EMG:{value_uv:8.2f} µV "
+                        else:
+                            data_str += f"Ch{channel}:{value_uv:8.2f} µV "
+                    except (ValueError, IndexError):
+                        # Если для этого канала нет данных в этот момент времени
+                        if channel == 'EMG':
+                            data_str += f"EMG:        - "
+                        else:
+                            data_str += f"Ch{channel}:        - "
+                
+                data_str += "\n"
+                self.recording_data_text.insert("end", data_str)
+                point_count += 1
+            
+            # Все точки уже показаны, сообщение не нужно
+            
+            # Добавляем статистику (валидные каналы 0-15 и виртуальный канал "EMG")
+            valid_channels_count = len([ch for ch in self.recording_graph_data.keys() 
+                                       if isinstance(ch, int) and 0 <= ch <= 15])
+            emg_channel_present = 'EMG' in self.recording_graph_data
             total_channels = len(self.recording_graph_data)
-            total_points = len(reference_times)
-            output_chunks.append("\n\n=== Статистика ===")
-            output_chunks.append(f"Валидных каналов (0-15): {valid_channels_count}")
-            if total_channels != valid_channels_count:
-                output_chunks.append(f"Всего каналов (включая невалидные): {total_channels}")
-            output_chunks.append(f"Временных точек опорного канала: {total_points}")
-            output_chunks.append(f"Пакетов обработано: {len(self.recording_hex_data)}")
-            output_chunks.append("\n=== Статистика по каналам ===")
-
+            total_points = len(sorted_timestamps)
+            self.recording_data_text.insert("end", f"\n=== Статистика ===\n")
+            self.recording_data_text.insert("end", f"Валидных каналов (0-15): {valid_channels_count}\n")
+            if emg_channel_present:
+                self.recording_data_text.insert("end", f"Виртуальный канал EMG: присутствует\n")
+            if total_channels != valid_channels_count + (1 if emg_channel_present else 0):
+                self.recording_data_text.insert("end", f"Всего каналов (включая невалидные): {total_channels}\n")
+            self.recording_data_text.insert("end", f"Всего точек: {total_points}\n")
+            self.recording_data_text.insert("end", f"Пакетов обработано: {len(self.recording_hex_data)}\n")
+            
+            # Добавляем статистику по каналам (среднее, RMS)
+            self.recording_data_text.insert("end", f"\n=== Статистика по каналам ===\n")
             for channel in sorted(self.recording_graph_data.keys(), key=lambda x: (isinstance(x, str), x)):
-                if isinstance(channel, int) and 0 <= channel <= 15:
+                if (isinstance(channel, int) and 0 <= channel <= 15) or channel == 'EMG':
                     channel_data = self.recording_graph_data[channel]
                     if len(channel_data['values_uv']) > 0:
                         values = np.array(channel_data['values_uv'])
@@ -3804,31 +3387,15 @@ WRITE 42 0x0000 U
                         std_val = np.std(values)
                         min_val = np.min(values)
                         max_val = np.max(values)
-                        channel_name = f"Ch{channel}"
-                        output_chunks.append(
+                        channel_name = f"Ch{channel}" if isinstance(channel, int) else "EMG"
+                        self.recording_data_text.insert("end", 
                             f"{channel_name}: mean={mean_val:8.2f} µV, std={std_val:8.2f} µV, "
-                            f"range=[{min_val:8.2f}, {max_val:8.2f}] µV"
-                        )
-
-            if self.recording_spectrum_data:
-                output_chunks.append("\n=== Доминирующие частоты ===")
-                for channel in sorted(self.recording_spectrum_data.keys()):
-                    spectrum_data = self.recording_spectrum_data[channel]
-                    freqs = spectrum_data['freqs_hz']
-                    amplitudes = spectrum_data['amplitude_uv']
-                    if len(freqs) < 2 or len(amplitudes) < 2:
-                        continue
-
-                    dominant_idx = 1 + int(np.argmax(amplitudes[1:]))
-                    output_chunks.append(
-                        f"Ch{channel}: {freqs[dominant_idx]:8.2f} Гц, амплитуда {amplitudes[dominant_idx]:8.2f} µV"
-                    )
-
-            self.recording_data_text.insert("1.0", "\n".join(output_chunks))
+                            f"range=[{min_val:8.2f}, {max_val:8.2f}] µV\n")
+            
             self.recording_data_text.see("1.0")
             self.recording_data_text.configure(state="disabled")
-
-            self.log(f"Текстовое поле обновлено: показано {len(timestamps_to_show)} точек", "info")
+            
+            self.log(f"Текстовое поле обновлено: показано {point_count} точек", "info")
         except Exception as e:
             self.log(f"Ошибка обновления текстового поля: {e}", "error")
             import traceback
@@ -3841,10 +3408,11 @@ WRITE 42 0x0000 U
             if not MATPLOTLIB_AVAILABLE:
                 return
             
-            # Фильтруем валидные каналы: числовые 0-15
+            # Фильтруем валидные каналы: числовые (0-15) и виртуальный канал "EMG"
             valid_channels = {}
             for ch, data in self.recording_graph_data.items():
-                if isinstance(ch, int) and 0 <= ch <= 15:
+                # Принимаем числовые каналы 0-15 и виртуальный канал "EMG"
+                if (isinstance(ch, int) and 0 <= ch <= 15) or ch == 'EMG':
                     valid_channels[ch] = data
             
             if len(valid_channels) == 0:
@@ -3873,74 +3441,57 @@ WRITE 42 0x0000 U
             colors = plt.cm.tab20(range(16))  # 16 разных цветов для каналов
             plotted_channels = 0
             plotted_points = 0
-            sampled_points = 0
-            y_min = None
-            y_max = None
-            x_min = None
-            x_max = None
             
             for channel in sorted(valid_channels.keys(), key=lambda x: (isinstance(x, str), x)):
                 data = valid_channels[channel]
-                plot_times = data.get('point_time', data['time'])
-                plot_values = data['values_uv']
-                point_count = len(plot_times)
-                if point_count > 0:
-                    color = colors[channel % len(colors)]
-                    label = f'Ch{channel} ({point_count} точек)'
-
-                    if point_count > RECORDING_PLOT_MAX_POINTS_PER_CHANNEL:
-                        sample_indices = np.linspace(
-                            0,
-                            point_count - 1,
-                            RECORDING_PLOT_MAX_POINTS_PER_CHANNEL,
-                            dtype=int,
-                        )
-                        plot_times_sampled = [plot_times[i] for i in sample_indices]
-                        plot_values_sampled = [plot_values[i] for i in sample_indices]
+                if len(data['time']) > 0:
+                    # Для числовых каналов используем цвет по номеру, для EMG - специальный цвет
+                    if isinstance(channel, int):
+                        color = colors[channel % len(colors)]
+                        label = f'Ch{channel} ({len(data["time"])} точек)'
                     else:
-                        plot_times_sampled = plot_times
-                        plot_values_sampled = plot_values
-
-                    local_y_min = min(plot_values)
-                    local_y_max = max(plot_values)
-                    local_x_min = plot_times[0]
-                    local_x_max = plot_times[-1]
-                    y_min = local_y_min if y_min is None else min(y_min, local_y_min)
-                    y_max = local_y_max if y_max is None else max(y_max, local_y_max)
-                    x_min = local_x_min if x_min is None else min(x_min, local_x_min)
-                    x_max = local_x_max if x_max is None else max(x_max, local_x_max)
+                        color = 'red'  # Красный для EMG
+                        label = f'{channel} ({len(data["time"])} точек)'
                     
                     self.recording_ax.plot(
-                        plot_times_sampled,
-                        plot_values_sampled,
+                        data['time'], 
+                        data['values_uv'], 
                         label=label,
                         color=color,
                         linewidth=0.5,
                         alpha=0.7
                     )
                     plotted_channels += 1
-                    plotted_points += point_count
-                    sampled_points += len(plot_times_sampled)
+                    plotted_points += len(data['time'])
             
-            self.log(
-                f"Построен график: {plotted_channels} каналов, "
-                f"{sampled_points}/{plotted_points} точек после даунсэмплинга",
-                "info"
-            )
-
-            if y_min is not None and y_max is not None:
+            self.log(f"Построен график: {plotted_channels} каналов, {plotted_points} точек", "info")
+            
+            # Автоматическое масштабирование осей для лучшей видимости
+            # Вычисляем общий диапазон всех данных
+            all_values = []
+            all_times = []
+            for data in valid_channels.values():
+                if len(data['values_uv']) > 0:
+                    all_values.extend(data['values_uv'])
+                    all_times.extend(data['time'])
+            
+            if all_values:
                 # Масштабируем Y-ось с небольшим запасом (10%)
+                y_min = min(all_values)
+                y_max = max(all_values)
                 y_range = y_max - y_min
                 if y_range > 0:
                     y_margin = y_range * 0.1  # 10% запас
                     self.recording_ax.set_ylim(y_min - y_margin, y_max + y_margin)
                 else:
                     # Если все значения одинаковы, устанавливаем небольшой диапазон вокруг значения
-                    center = y_min
+                    center = all_values[0]
                     self.recording_ax.set_ylim(center - 100, center + 100)
                 
                 # Масштабируем X-ось
-                if x_min is not None and x_max is not None:
+                if all_times:
+                    x_min = min(all_times)
+                    x_max = max(all_times)
                     x_range = x_max - x_min
                     if x_range > 0:
                         x_margin = x_range * 0.02  # 2% запас
@@ -3959,124 +3510,18 @@ WRITE 42 0x0000 U
         except Exception as e:
             pass  # Игнорируем ошибки
 
-    def _redraw_recording_spectrum(self):
-        """Перерисовывает спектральное разложение регистрации."""
-        try:
-            if not MATPLOTLIB_AVAILABLE or not hasattr(self, 'recording_spectrum_ax'):
-                return
-
-            self.recording_spectrum_ax.clear()
-            self.recording_spectrum_ax.set_xlabel('Частота (Гц)', fontsize=10)
-            self.recording_spectrum_ax.set_ylabel('Амплитуда, µВ', fontsize=10)
-            self.recording_spectrum_ax.set_title('Спектральное разложение данных Intan RHS2116', fontsize=12, fontweight='bold')
-            self.recording_spectrum_ax.grid(True, alpha=0.3)
-
-            if not self.recording_spectrum_data:
-                self.recording_spectrum_ax.text(
-                    0.5,
-                    0.5,
-                    'Недостаточно данных для спектрального разложения',
-                    transform=self.recording_spectrum_ax.transAxes,
-                    ha='center',
-                    va='center',
-                    fontsize=11,
-                    color='gray',
-                )
-                self.recording_spectrum_canvas.draw()
-                return
-
-            colors = plt.cm.tab20(range(16))
-            plotted_channels = 0
-            sampled_points = 0
-            max_freq = 0.0
-            max_amp = 0.0
-
-            for channel in sorted(self.recording_spectrum_data.keys()):
-                spectrum_data = self.recording_spectrum_data[channel]
-                freqs = spectrum_data['freqs_hz']
-                amplitudes = spectrum_data['amplitude_uv']
-                point_count = len(freqs)
-                if point_count < 2:
-                    continue
-
-                if point_count > RECORDING_PLOT_MAX_POINTS_PER_CHANNEL:
-                    sample_indices = np.linspace(
-                        0,
-                        point_count - 1,
-                        RECORDING_PLOT_MAX_POINTS_PER_CHANNEL,
-                        dtype=int,
-                    )
-                    freqs_to_plot = freqs[sample_indices]
-                    amplitudes_to_plot = amplitudes[sample_indices]
-                else:
-                    freqs_to_plot = freqs
-                    amplitudes_to_plot = amplitudes
-
-                color = colors[channel % len(colors)]
-                label = (
-                    f"Ch{channel} "
-                    f"(Fs={spectrum_data['sample_rate_hz']:.1f} Гц, N={spectrum_data['point_count']})"
-                )
-                self.recording_spectrum_ax.plot(
-                    freqs_to_plot,
-                    amplitudes_to_plot,
-                    label=label,
-                    color=color,
-                    linewidth=0.8,
-                    alpha=0.8,
-                )
-                plotted_channels += 1
-                sampled_points += len(freqs_to_plot)
-                max_freq = max(max_freq, float(freqs[-1]))
-                max_amp = max(max_amp, float(np.max(amplitudes_to_plot)))
-
-            if plotted_channels == 0:
-                self.recording_spectrum_ax.text(
-                    0.5,
-                    0.5,
-                    'Спектр не удалось построить',
-                    transform=self.recording_spectrum_ax.transAxes,
-                    ha='center',
-                    va='center',
-                    fontsize=11,
-                    color='gray',
-                )
-            else:
-                self.recording_spectrum_ax.set_xlim(0, max_freq if max_freq > 0 else 1)
-                self.recording_spectrum_ax.set_ylim(0, max_amp * 1.1 if max_amp > 0 else 1)
-                if plotted_channels <= 8:
-                    self.recording_spectrum_ax.legend(loc='upper right', fontsize=8, ncol=1)
-
-            self.recording_spectrum_canvas.draw()
-            self.log(
-                f"Построен спектр: {plotted_channels} каналов, {sampled_points} спектральных точек",
-                "info",
-            )
-        except Exception:
-            pass
-
     def on_clear_graph(self):
         """Очищает график и данные"""
-        self.recording_graph_data = {}
-        self.recording_spectrum_data = {}
-        if hasattr(self, 'recording_start_time'):
-            delattr(self, 'recording_start_time')
-
         if MATPLOTLIB_AVAILABLE:
+            self.recording_graph_data = {}
+            if hasattr(self, 'recording_start_time'):
+                delattr(self, 'recording_start_time')
             self.recording_ax.clear()
             self.recording_ax.set_xlabel('Время (с)', fontsize=10)
             self.recording_ax.set_ylabel('Напряжение, µВ', fontsize=10)
             self.recording_ax.set_title('Регистрация данных Intan RHS2116 (масштаб: µВ)', fontsize=12, fontweight='bold')
             self.recording_ax.grid(True, alpha=0.3)
             self.recording_canvas.draw()
-
-            if hasattr(self, 'recording_spectrum_ax'):
-                self.recording_spectrum_ax.clear()
-                self.recording_spectrum_ax.set_xlabel('Частота (Гц)', fontsize=10)
-                self.recording_spectrum_ax.set_ylabel('Амплитуда, µВ', fontsize=10)
-                self.recording_spectrum_ax.set_title('Спектральное разложение данных Intan RHS2116', fontsize=12, fontweight='bold')
-                self.recording_spectrum_ax.grid(True, alpha=0.3)
-                self.recording_spectrum_canvas.draw()
         
         # Очищаем текстовое поле
         self.recording_data_text.configure(state="normal")
@@ -4085,9 +3530,6 @@ WRITE 42 0x0000 U
         
         # Очищаем все данные
         self.recording_packet_count = 0
-        self.recording_values_received = 0
-        self.recording_samples_received = 0
-        self.recording_receive_started_at = None
         self.recording_hex_data = []
         self.recording_stats_label.config(text="Получено пакетов: 0 | Каналов: 0")
         self.log("График и данные очищены", "info")
@@ -4111,13 +3553,10 @@ WRITE 42 0x0000 U
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 
-                # ВАЖНО: у точек теперь может быть свой point_time для каждого канала,
-                # поэтому выгружаем время и значение отдельно по каждому каналу.
+                # Заголовок
+                # ВАЖНО: используем key для сортировки смешанных типов (int и str)
                 channels = sorted(self.recording_graph_data.keys(), key=lambda x: (isinstance(x, str), x))
-                header = ['Индекс точки']
-                for ch in channels:
-                    channel_name = f'Канал {ch}' if isinstance(ch, int) else str(ch)
-                    header.extend([f'{channel_name} время (с)', f'{channel_name} (µВ)'])
+                header = ['Время (с)'] + [f'Канал {ch} (µВ)' if isinstance(ch, int) else f'{ch} (µВ)' for ch in channels]
                 writer.writerow(header)
                 
                 # Находим максимальную длину данных
@@ -4125,17 +3564,17 @@ WRITE 42 0x0000 U
                 
                 # Записываем данные
                 for i in range(max_len):
-                    row = [i]
+                    row = []
+                    # Время из первого канала (все каналы должны иметь одинаковое время)
+                    if channels and i < len(self.recording_graph_data[channels[0]]['time']):
+                        row.append(self.recording_graph_data[channels[0]]['time'][i])
+                    else:
+                        row.append('')
                     
                     for ch in channels:
-                        channel_data = self.recording_graph_data[ch]
-                        point_times = channel_data.get('point_time', channel_data['time'])
-                        if i < len(channel_data['values_uv']):
-                            time_value = point_times[i] if i < len(point_times) else ''
-                            row.append(time_value)
-                            row.append(channel_data['values_uv'][i])
+                        if i < len(self.recording_graph_data[ch]['values_uv']):
+                            row.append(self.recording_graph_data[ch]['values_uv'][i])
                         else:
-                            row.append('')
                             row.append('')
                     
                     writer.writerow(row)
@@ -4190,14 +3629,11 @@ WRITE 42 0x0000 U
             
             # Обновляем текстовое поле и статистику после обработки
             self._update_recording_text_display()
-            if MATPLOTLIB_AVAILABLE and self.recording_graph_data:
-                self._redraw_recording_graph()
-                self._redraw_recording_spectrum()
             self.recording_stats_label.config(
-                text=f"Обработано пакетов: {len(self.recording_hex_data)} | График и спектр построены"
+                text=f"Обработано пакетов: {len(self.recording_hex_data)} | График построен"
             )
             
-            messagebox.showinfo("Успех", f"График и спектр успешно построены!\nОбработано пакетов: {len(self.recording_hex_data)}")
+            messagebox.showinfo("Успех", f"График успешно построен!\nОбработано пакетов: {len(self.recording_hex_data)}")
         except Exception as e:
             self.log(f"Ошибка при построении графика: {e}", "error")
             messagebox.showerror("Ошибка", f"Не удалось построить график: {e}")
@@ -4271,42 +3707,39 @@ WRITE 42 0x0000 U
             udp_host = self.var_udp_host.get().strip()
             udp_port = int(self.var_udp_port.get().strip())
             server_addr = (udp_host, udp_port)
-
+            
+            self.udp_sock.sendto(cmd.encode('utf-8'), server_addr)
+            self.log(f"Отправлена команда начала регистрации: {cmd} на {server_addr}", "info")
+            
+            # Ждем подтверждение от сервера (с таймаутом)
+            try:
+                self.udp_sock.settimeout(2.0)
+                response, addr = self.udp_sock.recvfrom(1024)
+                response_text = response.decode('utf-8').strip()
+                if response_text == "RECORDING_STARTED":
+                    self.log("✓ Сервер подтвердил начало регистрации", "success")
+                else:
+                    self.log(f"⚠ Неожиданный ответ от сервера: {response_text}", "warning")
+            except socket.timeout:
+                self.log("⚠ Таймаут ожидания подтверждения от сервера (возможно, сервер не запущен или не отвечает)", "warning")
+            except Exception as e:
+                self.log(f"⚠ Ошибка при получении подтверждения: {e}", "warning")
+            finally:
+                self.udp_sock.settimeout(1.0)  # Возвращаем таймаут для приема данных
+            
             self.btn_start_recording.configure(state="disabled")
             self.btn_stop_recording.configure(state="normal")
             self.recording_packet_count = 0
-            self.recording_values_received = 0
-            self.recording_samples_received = 0
-            self.recording_receive_started_at = time.perf_counter()
-
-            # Очищаем предыдущие данные ДО старта, чтобы не смешивать с новым потоком.
+            
+            # ВАЖНО: сначала очищаем данные, потом устанавливаем флаг
+            # Очищаем предыдущие данные
             self.recording_hex_data = []
             self.recording_graph_data = {}
-            self.recording_spectrum_data = {}
-            self.recording_gap_events = []
-            self.recording_sample_rate = sample_rate
-            self.recording_runtime_status.set(
-                "Регистрация активна. Стимуляция разрешена, но во время переключения режима Intan возможны краткие окна потери данных."
-            )
             if hasattr(self, 'recording_start_time'):
                 delattr(self, 'recording_start_time')
-
-            self._clear_udp_control_messages()
-            self.recording_stop_processed = False
+            
+            # Устанавливаем флаг активной регистрации ПОСЛЕ очистки данных
             self.recording_active = True
-            self.udp_sock.sendto(cmd.encode('utf-8'), server_addr)
-            self.log(f"Отправлена команда начала регистрации: {cmd} на {server_addr}", "info")
-
-            ack = self._wait_for_udp_control_message("RECORDING_STARTED", timeout_s=2.0)
-            if ack == "RECORDING_STARTED":
-                self.log("✓ Сервер подтвердил начало регистрации", "success")
-            else:
-                self.log(
-                    "⚠ Таймаут ожидания подтверждения от сервера; оставляю прием данных активным, "
-                    "так как поток мог стартовать раньше ответа.",
-                    "warning",
-                )
-
             self.log(f"Регистрация начата. recording_active={self.recording_active}, hex_data очищен (размер: {len(self.recording_hex_data)})", "info")
             
             # Очищаем поле данных и график
@@ -4322,14 +3755,6 @@ WRITE 42 0x0000 U
                 self.recording_ax.set_title('Регистрация данных Intan RHS2116 (ожидание данных...)', fontsize=12, fontweight='bold')
                 self.recording_ax.grid(True, alpha=0.3)
                 self.recording_canvas.draw()
-
-                if hasattr(self, 'recording_spectrum_ax'):
-                    self.recording_spectrum_ax.clear()
-                    self.recording_spectrum_ax.set_xlabel('Частота (Гц)', fontsize=10)
-                    self.recording_spectrum_ax.set_ylabel('Амплитуда, µВ', fontsize=10)
-                    self.recording_spectrum_ax.set_title('Спектральное разложение данных Intan RHS2116 (ожидание данных...)', fontsize=12, fontweight='bold')
-                    self.recording_spectrum_ax.grid(True, alpha=0.3)
-                    self.recording_spectrum_canvas.draw()
             
         except ValueError as e:
             messagebox.showerror("Ошибка", f"Неверное значение параметра: {e}")
@@ -4349,7 +3774,26 @@ WRITE 42 0x0000 U
             
             self.udp_sock.sendto(b"STOP_RECORDING", server_addr)
             self.log("Отправлена команда остановки регистрации", "info")
-            self._finalize_recording_stop("локальная команда stop")
+            
+            # Останавливаем запись данных
+            self.recording_active = False
+            
+            self.btn_start_recording.configure(state="normal")
+            self.btn_stop_recording.configure(state="disabled")
+            
+            # Парсим данные и строим график автоматически после остановки
+            if len(self.recording_hex_data) > 0:
+                self.log(f"Начинаем автоматическую обработку {len(self.recording_hex_data)} пакетов...", "info")
+                self.recording_stats_label.config(
+                    text=f"Обработка {len(self.recording_hex_data)} пакетов..."
+                )
+                # Запускаем парсинг в отдельном потоке, чтобы не блокировать GUI
+                threading.Thread(target=self._parse_hex_data_thread, daemon=True).start()
+            else:
+                self.log("Нет данных для обработки", "warning")
+                self.recording_stats_label.config(
+                    text="Получено пакетов: 0 | Нет данных"
+                )
         except Exception as e:
             self.log(f"Ошибка отправки команды остановки: {e}", "error")
 
@@ -4369,12 +3813,6 @@ WRITE 42 0x0000 U
                     if self.recording_graph_data:
                         self.log(f"Обновление текстового поля: найдено {len(self.recording_graph_data)} каналов", "info")
                         self._update_recording_text_display()
-                        if MATPLOTLIB_AVAILABLE:
-                            self._redraw_recording_graph()
-                            self._redraw_recording_spectrum()
-                            self.log("График и спектр построены", "success")
-                        else:
-                            self.log("Matplotlib недоступен, график не построен", "warning")
                     else:
                         self.log("⚠ recording_graph_data пуст, текстовое поле не обновлено", "warning")
                         self.recording_data_text.configure(state="normal")
@@ -4383,7 +3821,7 @@ WRITE 42 0x0000 U
                         self.recording_data_text.configure(state="disabled")
                     
                     self.recording_stats_label.config(
-                        text=f"Обработано пакетов: {len(self.recording_hex_data)} | График и спектр построены"
+                        text=f"Обработано пакетов: {len(self.recording_hex_data)} | График построен"
                     )
                 except Exception as e:
                     self.log(f"Ошибка обновления UI после парсинга: {e}", "error")
@@ -4430,67 +3868,150 @@ WRITE 42 0x0000 U
             if freq_hz <= 0:
                 messagebox.showerror("Ошибка", "Частота должна быть > 0")
                 return
-            scale_map = {"0.1 pF", "1 pF", "10 pF"}
+            scale_map = {"0.1 pF": (0, 0.1e-12, "0.1 pF"), "1 pF": (1, 1e-12, "1 pF"), "10 pF": (3, 10e-12, "10 pF")}
             if scale_str not in scale_map:
                 messagebox.showerror("Ошибка", "Шкала: 0.1 pF, 1 pF или 10 pF")
                 return
-            num_averages = max(1, min(1000, int(self.var_impedance_averages.get().strip() or 1)))
+            scale_bits, C_farad, _ = scale_map[scale_str]
+            num_averages = max(1, min(200, int(self.var_impedance_averages.get().strip() or 1)))
             auto_scale = bool(self.var_impedance_auto_scale.get())
         except ValueError as e:
             messagebox.showerror("Ошибка", f"Неверные значения: {e}")
             return
 
-        def _format_result(z_ohm, std_z, n_valid, scale_str, v_amp_uv, phase_deg=0.0, likely_floating=False):
-            if likely_floating:
-                text = f"Импеданс канала {ch}: канал в воздухе (V_amp={v_amp_uv:.1f} µV < 15 µV, не считаем Z)"
-            elif z_ohm >= 1e6:
-                text = f"Импеданс канала {ch}: {z_ohm/1e6:.2f} ± {std_z/1e6:.2f} MΩ, фаза {phase_deg:.1f}° (n={n_valid}, C={scale_str})"
-            elif z_ohm >= 1e3:
-                text = f"Импеданс канала {ch}: {z_ohm/1e3:.1f} ± {std_z/1e3:.1f} кΩ, фаза {phase_deg:.1f}° (n={n_valid}, C={scale_str})"
-            else:
-                text = f"Импеданс канала {ch}: {z_ohm:.0f} ± {std_z:.0f} Ω, фаза {phase_deg:.1f}° (n={n_valid}, C={scale_str})"
-            if std_z > 2 * max(z_ohm, 1) and not likely_floating:
-                text += "  ⚠ нестабильно"
-            warn = []
-            if v_amp_uv > 4000:
-                warn.append("⚠ Насыщение: V_amp>{:.1f} mV — меньшая C".format(v_amp_uv / 1000))
-            z_par_ohm = 1.0 / (2 * math.pi * freq_hz * 10e-12)
-            if z_ohm > 500e3 and z_ohm < z_par_ohm * 0.9:
-                warn.append("⚠ C~10 pF (Z_C≈{:.1f} MΩ)".format(z_par_ohm / 1e6))
-            if warn:
-                text += "  " + " | ".join(warn)
-            return text
+        V_DAC_AMP = 0.6125
+        BEST_AMPLITUDE_UV = 250.0
+        C_PARASITIC = 10e-12
+
+        def _do_single_measurement(sb, cf, scale_name):
+            self.client.send_line("CLEAR")
+            self.client.send_line("WRITE 2 0x0040 U=0 M=0")
+            self.client.send_line("WRITE 3 0x0080 U=0 M=0")
+            reg2 = (ch << 8) | (1 << 6) | (sb << 3) | 1
+            self.client.send_line(f"WRITE 2 0x{reg2:04X} U=0 M=0")
+            N = 64
+            dac_vals = [max(0, min(255, int(128 + 127 * math.sin(2 * math.pi * i / N)))) for i in range(N)]
+            adc_list = []
+            for i in range(N):
+                self.client.send_line(f"WRITE 3 0x{dac_vals[i]:04X} U=0 M=0")
+                r = self.client.send_line(f"CONVERT {ch} U=0 M=0 D=0 H=0")
+                m = re.search(r"0x([0-9A-Fa-f]+)", r)
+                if m:
+                    resp32 = int(m.group(1), 16)
+                    adc_list.append((resp32 >> 16) & 0xFFFF)
+            self.client.send_line(f"WRITE 2 0x{reg2 & 0xFFFE:04X} U=0 M=0")
+            if len(adc_list) < N:
+                raise RuntimeError("Недостаточно отсчётов ADC")
+            values_uv = [rhs2116_ac_uV(adc) for adc in adc_list[:N]]
+            mean_uv = sum(values_uv) / len(values_uv)
+            values_ac = [x - mean_uv for x in values_uv]
+            v_rms_uv = (sum(x * x for x in values_ac) / len(values_ac)) ** 0.5
+            v_amp_uv = v_rms_uv * (2 ** 0.5) if v_rms_uv > 0 else 0
+            I_amp = 2 * math.pi * freq_hz * cf * V_DAC_AMP
+            z_ohm = (v_amp_uv * 1e-6 / I_amp) if I_amp > 0 else 0.0
+            return z_ohm, v_amp_uv, scale_name
+
+        def _factor_out_parallel_capacitance(z_mag, f_hz, c_par):
+            """Коррекция паразитной ёмкости (упрощённо для R-электрода). RHD2000: factorOutParallelCapacitance."""
+            if z_mag < 1000:
+                return z_mag
+            w = 2 * math.pi * f_hz
+            denom = 1.0 - (w * c_par * z_mag) ** 2
+            if denom <= 0.05:
+                return z_mag
+            return z_mag / math.sqrt(denom)
 
         def worker():
             try:
-                timeout_s = max(30.0, min(180.0, 10.0 + num_averages * 0.12))
-                self.after(0, lambda: self.log("Быстрый замер (batched driver)...", "info"))
-                resp = self.client.send_command({
-                    "cmd": "measure_impedance_fast",
-                    "channel": ch,
-                    "frequency": freq_hz,
-                    "scale": scale_str,
-                    "num_averages": num_averages,
-                    "num_samples": 64,
-                    "auto_scale": auto_scale,
-                    "include_points": True,
-                }, timeout=timeout_s)
-                if resp.get("status") != "ok" or "impedance_ohm" not in resp:
-                    raise RuntimeError(resp.get("error", "measure_impedance_fast не вернул результат"))
+                scales_to_use = list(scale_map.items()) if auto_scale else [(scale_str, scale_map[scale_str])]
+                if auto_scale:
+                    self.after(0, lambda: self.log("Авто C: выбор шкалы по 250 µV (2 пробы на шкалу)...", "info"))
+                    best_scale = None
+                    best_dist = 1e99
+                    AUTO_PROBES = 2  # несколько проб снижают случайный выбор шкалы из-за шума
+                    for sstr, (sb, cf, sname) in scales_to_use:
+                        v_probes = []
+                        for _ in range(AUTO_PROBES):
+                            _, v, _ = _do_single_measurement(sb, cf, sname)
+                            v_probes.append(v)
+                            time.sleep(0.2)
+                        v_median = sorted(v_probes)[len(v_probes) // 2]
+                        dist = abs(math.log(max(1, v_median) / BEST_AMPLITUDE_UV))
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_scale = (sb, cf, sname)
+                        time.sleep(0.2)
+                    scale_bits, C_farad, chosen_scale_str = best_scale
+                    self.after(0, lambda: self.log(f"Выбрана шкала {chosen_scale_str} (V_amp≈{BEST_AMPLITUDE_UV} µV)", "info"))
+                else:
+                    scale_bits, C_farad, chosen_scale_str = scale_map[scale_str]
 
-                z_ohm = resp["impedance_ohm"]
-                std_z = resp.get("std_dev_ohm", 0)
-                n_valid = resp.get("num_valid", 0)
-                scale_str_res = resp.get("scale", scale_str)
-                v_amp_uv = resp.get("v_amp_uv", 0)
-                phase_deg = resp.get("phase_deg", 0.0)
-                likely_floating = resp.get("likely_floating", False)
-                self._last_impedance_data = {
-                    "channel": ch, "frequency": freq_hz, "scale": scale_str_res,
-                    "impedance_ohm": z_ohm, "std_dev_ohm": std_z, "num_valid": n_valid, "v_amp_uv": v_amp_uv, "phase_deg": phase_deg,
-                    "points": resp.get("points", []), "valid_z": resp.get("valid_z", []),
+                self.after(0, lambda: self.log(f"Импеданс: {num_averages} измерений (C={chosen_scale_str})...", "info"))
+                z_list, z_raw_list, v_list = [], [], []
+                V_AMP_MIN = 5.0
+                for i in range(num_averages):
+                    z_ohm, v_amp_uv, _ = _do_single_measurement(scale_bits, C_farad, chosen_scale_str)
+                    if v_amp_uv >= V_AMP_MIN:
+                        z_corr = _factor_out_parallel_capacitance(z_ohm, freq_hz, C_PARASITIC)
+                        z_list.append(z_corr)
+                        z_raw_list.append(z_ohm)
+                        v_list.append(v_amp_uv)
+                    if i < num_averages - 1:
+                        time.sleep(0.5)  # пауза между замерами (было 5 сек — избыточно для AC)
+                if len(z_list) < 2:
+                    raise RuntimeError("Недостаточно валидных измерений (V_amp < {} µV — шум?)".format(V_AMP_MIN))
+
+                # Отсечение выбросов по MAD: |z - median| > k*MAD считаем выбросом
+                MAD_K = 2.5
+                z_sorted = sorted(z_list)
+                n = len(z_sorted)
+                med = z_sorted[n // 2]
+                mad = sorted(abs(x - med) for x in z_list)[n // 2] if n > 0 else 0
+                mad_scale = 1.4826 * mad if mad > 0 else 0
+                threshold = MAD_K * mad_scale if mad_scale > 0 else float("inf")
+                filtered = [(z, zr, v) for z, zr, v in zip(z_list, z_raw_list, v_list)
+                            if abs(z - med) <= threshold]
+                n_rejected = len(z_list) - len(filtered)
+                if len(filtered) >= 2:
+                    z_list = [x[0] for x in filtered]
+                    z_raw_list = [x[1] for x in filtered]
+                    v_list = [x[2] for x in filtered]
+                    if n_rejected > 0:
+                        self.after(0, lambda: self.log(f"Выбросы: отброшено {n_rejected} из {n_rejected + len(filtered)} измерений (MAD×{MAD_K})", "info"))
+
+                z_sorted = sorted(z_list)
+                n = len(z_sorted)
+                z_ohm = z_sorted[n // 2]
+                v_amp_uv = sum(v_list) / len(v_list) if v_list else 0
+                mad = sorted(abs(x - z_ohm) for x in z_list)[n // 2] if n > 0 else 0
+                std_z = 1.4826 * mad if n > 1 else 0
+                n_valid = len(z_list)
+                if z_ohm >= 1e6:
+                    text = f"Импеданс канала {ch}: {z_ohm/1e6:.2f} ± {std_z/1e6:.2f} MΩ (n={n_valid}, C={chosen_scale_str})"
+                elif z_ohm >= 1e3:
+                    text = f"Импеданс канала {ch}: {z_ohm/1e3:.1f} ± {std_z/1e3:.1f} кΩ (n={n_valid}, C={chosen_scale_str})"
+                else:
+                    text = f"Импеданс канала {ch}: {z_ohm:.0f} ± {std_z:.0f} Ω (n={n_valid}, C={chosen_scale_str})"
+                if std_z > 2 * max(z_ohm, 1):
+                    text += "  ⚠ нестабильно"
+                warn = []
+                if v_amp_uv > 4000:
+                    warn.append("⚠ Насыщение: V_amp>{:.1f} mV — меньшая C".format(v_amp_uv / 1000))
+                z_par_ohm = 1.0 / (2 * math.pi * freq_hz * 10e-12)
+                if z_ohm > 500e3 and z_ohm < z_par_ohm * 0.9:
+                    warn.append("⚠ C~10 pF (Z_C≈{:.1f} MΩ)".format(z_par_ohm / 1e6))
+                if warn:
+                    text += "  " + " | ".join(warn)
+                # Сохраняем данные для экспорта CSV
+                self.last_impedance_data = {
+                    "params": {"channel": ch, "frequency_hz": freq_hz, "scale": chosen_scale_str,
+                               "num_averages": num_averages, "timestamp": datetime.now().isoformat()},
+                    "raw_measurements": [{"nom": i + 1, "z_raw": z_raw_list[i], "z_corr": z_list[i],
+                                         "V_amp": v_list[i]} for i in range(len(z_list))],
+                    "statistics": {"z_median_ohm": z_ohm, "z_std_ohm": std_z, "n_valid": n_valid,
+                                  "v_amp_mean_uv": v_amp_uv}
                 }
-                text = _format_result(z_ohm, std_z, n_valid, scale_str_res, v_amp_uv, phase_deg, likely_floating)
+                self.after(0, lambda: self.btn_export_impedance_csv.configure(state="normal"))
                 self.after(0, lambda: self.impedance_value_label.config(text=text))
                 self.after(0, lambda: self.log(text, "success"))
             except Exception as e:
@@ -4499,815 +4020,45 @@ WRITE 42 0x0000 U
                 self.after(0, lambda err=e: messagebox.showerror("Ошибка", str(err)))
         threading.Thread(target=worker, daemon=True).start()
 
-    def on_measure_all_impedances(self):
-        """Последовательно измеряет импеданс на всех каналах 0-15 через быстрый путь сервера."""
-        try:
-            freq_hz = float(self.var_impedance_freq.get().strip())
-            scale_str = self.var_impedance_scale.get().strip()
-            if freq_hz <= 0:
-                messagebox.showerror("Ошибка", "Частота должна быть > 0")
-                return
-            scale_map = {"0.1 pF": (0, 0.1e-12, "0.1 pF"), "1 pF": (1, 1e-12, "1 pF"), "10 pF": (3, 10e-12, "10 pF")}
-            if scale_str not in scale_map:
-                messagebox.showerror("Ошибка", "Шкала: 0.1 pF, 1 pF или 10 pF")
-                return
-            num_averages = max(1, min(1000, int(self.var_impedance_averages.get().strip() or 1)))
-            auto_scale = bool(self.var_impedance_auto_scale.get())
-        except ValueError as e:
-            messagebox.showerror("Ошибка", f"Неверные значения: {e}")
+    def on_export_impedance_csv(self):
+        """Выгружает данные последнего измерения импеданса в CSV файл."""
+        if not self.last_impedance_data:
+            messagebox.showinfo("Экспорт", "Нет данных для экспорта. Сначала выполните измерение импеданса.")
             return
-
-        def _format_short(ch, resp):
-            if resp.get("likely_floating", False):
-                return f"{ch}: воздух"
-            z_ohm = resp.get("impedance_ohm", 0.0)
-            phase_deg = resp.get("phase_deg", 0.0)
-            if z_ohm >= 1e6:
-                return f"{ch}: {z_ohm/1e6:.2f} MΩ / {phase_deg:.1f}°"
-            if z_ohm >= 1e3:
-                return f"{ch}: {z_ohm/1e3:.1f} кΩ / {phase_deg:.1f}°"
-            return f"{ch}: {z_ohm:.0f} Ω / {phase_deg:.1f}°"
-
-        def worker():
-            results = []
-            try:
-                timeout_s = max(30.0, min(180.0, 10.0 + num_averages * 0.12))
-                self.after(0, lambda: self.log("Запуск последовательного измерения импеданса по каналам 0-15...", "info"))
-                for ch in range(16):
-                    self.after(0, lambda ch=ch: self.impedance_value_label.config(text=f"Измерение импеданса: канал {ch}..."))
-                    resp = self.client.send_command({
-                        "cmd": "measure_impedance_fast",
-                        "channel": ch,
-                        "frequency": freq_hz,
-                        "scale": scale_str,
-                        "num_averages": num_averages,
-                        "num_samples": 64,
-                        "auto_scale": auto_scale,
-                        "include_points": True,
-                    }, timeout=timeout_s)
-
-                    if resp.get("status") == "ok" and "impedance_ohm" in resp:
-                        self._last_impedance_data = {
-                            "channel": ch,
-                            "frequency": freq_hz,
-                            "scale": resp.get("scale", scale_str),
-                            "impedance_ohm": resp.get("impedance_ohm", 0),
-                            "std_dev_ohm": resp.get("std_dev_ohm", 0),
-                            "num_valid": resp.get("num_valid", 0),
-                            "v_amp_uv": resp.get("v_amp_uv", 0),
-                            "phase_deg": resp.get("phase_deg", 0.0),
-                            "points": resp.get("points", []),
-                            "valid_z": resp.get("valid_z", []),
-                        }
-                        short = _format_short(ch, resp)
-                        results.append(short)
-                        self.after(0, lambda s=short: self.log(f"Импеданс {s}", "success"))
-                    else:
-                        err = resp.get("error", "неизвестная ошибка")
-                        results.append(f"{ch}: ошибка")
-                        self.after(0, lambda ch=ch, err=err: self.log(f"Канал {ch}: ошибка измерения импеданса: {err}", "error"))
-
-                summary = " | ".join(results)
-                self.after(0, lambda: self.impedance_value_label.config(text=f"Все каналы: {summary}"))
-                self.after(0, lambda: self.log("Последовательное измерение всех каналов завершено.", "success"))
-            except Exception as e:
-                self.after(0, lambda err=e: self.log(f"Ошибка измерения импеданса по всем каналам: {err}", "error"))
-                self.after(0, lambda err=e: self.impedance_value_label.config(text=f"Ошибка: {err}"))
-                self.after(0, lambda err=e: messagebox.showerror("Ошибка", str(err)))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _phase_append_result_text(self, text):
-        self.phase_results_text.configure(state="normal")
-        self.phase_results_text.insert("end", text + "\n")
-        self.phase_results_text.see("end")
-        self.phase_results_text.configure(state="disabled")
-
-    def _phase_clear_result_text(self):
-        self.phase_results_text.configure(state="normal")
-        self.phase_results_text.delete("1.0", tk.END)
-        self.phase_results_text.configure(state="disabled")
-
-    def _phase_set_preset(self, *, freq_hz=None, freq_list=None, repeats=None, samples=None, num_averages=None,
-                          auto_scale=None, phase_safe=None):
-        if freq_hz is not None:
-            self.var_phase_freq.set(str(freq_hz))
-        if freq_list is not None:
-            self.var_phase_freq_list.set(freq_list)
-        if repeats is not None:
-            self.var_phase_repeats.set(str(repeats))
-        if samples is not None:
-            self.var_phase_samples.set(str(samples))
-        if num_averages is not None:
-            self.var_phase_averages.set(str(num_averages))
-        if auto_scale is not None:
-            self.var_phase_auto_scale.set(bool(auto_scale))
-        if phase_safe is not None:
-            self.var_phase_safe.set(bool(phase_safe))
-
-    def on_phase_apply_recommended_preset(self):
-        """Рекомендуемые настройки для устойчивого инженерного прогона фазы."""
-        self._phase_set_preset(
-            freq_hz=1000,
-            freq_list="100,300,1000,2000",
-            repeats=5,
-            samples=128,
-            num_averages=10,
-            auto_scale=False,
-            phase_safe=True,
-        )
-        self.phase_status_label.config(text="Фазовый тест: применены рекомендованные настройки")
-        self.phase_interpretation_label.config(
-            text="Интерпретация: базовый протокол установлен. Phase-safe включён, для строгой проверки увеличьте повторы до 10."
-        )
-
-    def on_phase_run_1khz_repeat_test(self):
-        """Быстрый тест устойчивости на 1 кГц с 10 повторами."""
-        self._phase_set_preset(
-            freq_hz=1000,
-            freq_list="1000",
-            repeats=10,
-            samples=128,
-            num_averages=10,
-            auto_scale=False,
-            phase_safe=True,
-        )
-        self.on_phase_frequency_sweep()
-
-    def _phase_interpretation_text(self, phase_mean_deg, phase_std_deg, z_mean_ohm=None):
-        if phase_std_deg >= 20.0:
-            stability = "Фаза сильно гуляет: методика ещё нестабильна."
-        elif phase_std_deg >= 10.0:
-            stability = "Фаза измеряется, но разброс ещё великоват для уверенного инженерного вывода."
-        else:
-            stability = "Фаза выглядит устойчивой."
-
-        if phase_mean_deg > -20.0:
-            nature = "Нагрузка преимущественно резистивная."
-        elif phase_mean_deg > -60.0:
-            nature = "Нагрузка смешанная RC, заметный резистивный вклад."
-        elif phase_mean_deg > -85.0:
-            nature = "Нагрузка преимущественно ёмкостная."
-        else:
-            nature = "Нагрузка близка к идеальной ёмкостной."
-
-        magnitude = ""
-        if z_mean_ohm is not None:
-            if z_mean_ohm >= 1e6:
-                magnitude = f" | |Z|≈{z_mean_ohm/1e6:.2f} MΩ."
-            elif z_mean_ohm >= 1e3:
-                magnitude = f" | |Z|≈{z_mean_ohm/1e3:.1f} кΩ."
-            else:
-                magnitude = f" | |Z|≈{z_mean_ohm:.0f} Ω."
-
-        return f"{stability} {nature}{magnitude}"
-
-    def _phase_update_summary_and_plot(self):
-        if not self.phase_test_results:
-            self.phase_summary_label.config(text="Сводка: нет данных фазового теста.")
-            self.phase_interpretation_label.config(text="Интерпретация: --")
-            if self.phase_canvas:
-                self.phase_ax_z.clear()
-                self.phase_ax_phase.clear()
-                self.phase_ax_z.set_title("|Z|(f)")
-                self.phase_ax_phase.set_title("phase(f)")
-                self.phase_canvas.draw()
-            return
-
-        if len(self.phase_test_results) == 1 and self.phase_test_results[0].get("repeat_count", 0) == 1:
-            block = self.phase_test_results[0]
-            summary = block.get("summary", {})
-            run0 = block.get("runs", [{}])[0] if block.get("runs") else {}
-            self.phase_summary_label.config(
-                text=(
-                    f"Сводка: канал {block.get('channel', 0)}, {block.get('frequency', 0):.0f} Гц, "
-                    f"|Z|={summary.get('z_mean_ohm', 0):.2f} Ω, "
-                    f"phase raw/corrected={summary.get('phase_raw_mean_deg', 0):.2f}°/"
-                    f"{summary.get('phase_mean_deg', 0):.2f}°. "
-                    f"{self._phase_frequency_diag_text(run0)}"
-                )
-            )
-            self.phase_interpretation_label.config(
-                text=f"Интерпретация: {self._phase_interpretation_text(summary.get('phase_mean_deg', 0.0), summary.get('phase_std_deg', 0.0), summary.get('z_mean_ohm', 0.0))}"
-            )
-        else:
-            phase_stds = [block.get("summary", {}).get("phase_std_deg", 0.0) for block in self.phase_test_results]
-            freq_errors_pct = []
-            for block in self.phase_test_results:
-                for run in block.get("runs", []):
-                    freq_errors_pct.append(abs(float(run.get("frequency_error_pct", 0.0) or 0.0)))
-            worst_phase_std = max(phase_stds) if phase_stds else 0.0
-            worst_freq_error_pct = max(freq_errors_pct) if freq_errors_pct else 0.0
-            stability = "устойчива" if worst_phase_std < 10.0 else "неустойчива"
-            one_khz_block = next((b for b in self.phase_test_results if abs(b.get("frequency", 0.0) - 1000.0) < 1e-9), None)
-            ref_block = one_khz_block or self.phase_test_results[len(self.phase_test_results) // 2]
-            ref_summary = ref_block.get("summary", {})
-            self.phase_summary_label.config(
-                text=(
-                    f"Сводка: частот {len(self.phase_test_results)}, максимальный разброс фазы {worst_phase_std:.2f}°, "
-                    f"макс. |Δf|={worst_freq_error_pct:.2f}%. Оценка: фаза {stability}. "
-                    f"Для инженерного результата лучше держать разброс < 10°."
-                )
-            )
-            self.phase_interpretation_label.config(
-                text=(
-                    f"Интерпретация: опорная частота {ref_block.get('frequency', 0):.0f} Гц. "
-                    f"{self._phase_interpretation_text(ref_summary.get('phase_mean_deg', 0.0), ref_summary.get('phase_std_deg', 0.0), ref_summary.get('z_mean_ohm', 0.0))}"
-                )
-            )
-
-        if not self.phase_canvas:
-            return
-
-        self.phase_ax_z.clear()
-        self.phase_ax_phase.clear()
-
-        freqs = [block.get("frequency", 0.0) for block in self.phase_test_results]
-        z_means = [block.get("summary", {}).get("z_mean_ohm", 0.0) for block in self.phase_test_results]
-        z_stds = [block.get("summary", {}).get("z_std_ohm", 0.0) for block in self.phase_test_results]
-        phase_means = [block.get("summary", {}).get("phase_mean_deg", 0.0) for block in self.phase_test_results]
-        phase_stds = [block.get("summary", {}).get("phase_std_deg", 0.0) for block in self.phase_test_results]
-
-        self.phase_ax_z.errorbar(freqs, z_means, yerr=z_stds, fmt='o-', capsize=4, color='tab:blue', label='|Z| mean ± std')
-        self.phase_ax_z.set_title("|Z|(f)")
-        self.phase_ax_z.set_xlabel("Частота (Hz)")
-        self.phase_ax_z.set_ylabel("|Z| (Ω)")
-        self.phase_ax_z.grid(True, alpha=0.3)
-        if any(z > 0 for z in z_means):
-            self.phase_ax_z.set_xscale('log')
-        self.phase_ax_z.legend(loc='best', fontsize=8)
-
-        self.phase_ax_phase.errorbar(freqs, phase_means, yerr=phase_stds, fmt='o-', capsize=4, color='tab:orange', label='phase corrected mean ± std')
-        self.phase_ax_phase.axhline(0.0, color='gray', linestyle='--', linewidth=1, alpha=0.8, label='0°')
-        self.phase_ax_phase.axhline(-90.0, color='tab:green', linestyle=':', linewidth=1, alpha=0.8, label='-90°')
-        self.phase_ax_phase.set_title("phase(f)")
-        self.phase_ax_phase.set_xlabel("Частота (Hz)")
-        self.phase_ax_phase.set_ylabel("Фаза (°)")
-        self.phase_ax_phase.grid(True, alpha=0.3)
-        if any(f > 0 for f in freqs):
-            self.phase_ax_phase.set_xscale('log')
-        self.phase_ax_phase.legend(loc='best', fontsize=8)
-
-        self.phase_figure.tight_layout()
-        self.phase_canvas.draw()
-
-    def _phase_frequency_diag_text(self, run):
-        requested = float(run.get("requested_frequency_hz", run.get("frequency", 0.0)) or 0.0)
-        effective = float(run.get("effective_frequency_hz", requested) or 0.0)
-        error_hz = float(run.get("frequency_error_hz", effective - requested))
-        if requested:
-            error_pct = float(run.get("frequency_error_pct", (error_hz / requested) * 100.0))
-        else:
-            error_pct = 0.0
-        ratio = (effective / requested) if requested else 0.0
-        return (
-            f"f_req={requested:.2f} Hz, f_eff={effective:.2f} Hz, "
-            f"Δf={error_hz:+.2f} Hz ({error_pct:+.2f}%), ratio={ratio:.4f}"
-        )
-
-    def _phase_sampling_diag_text(self, run):
-        samples_per_period = run.get("samples_per_period", "")
-        actual_num_samples = run.get("actual_num_samples", "")
-        return f"samples_per_period={samples_per_period}, actual_num_samples={actual_num_samples}"
-
-    def _normalize_phase_deg(self, phase_deg):
-        phase = float(phase_deg)
-        while phase <= -180.0:
-            phase += 360.0
-        while phase > 180.0:
-            phase -= 360.0
-        return phase
-
-    def _phase_apply_delay_correction(self, run, tau_corr_us):
-        raw_phase = float(run.get("phase_deg", 0.0) or 0.0)
-        effective = float(run.get("effective_frequency_hz", run.get("requested_frequency_hz", run.get("frequency", 0.0))) or 0.0)
-        tau_us = float(tau_corr_us or 0.0)
-        correction_deg = 360.0 * effective * (tau_us * 1e-6)
-        requested = float(run.get("requested_frequency_hz", run.get("frequency", 0.0)) or 0.0)
-        freq_map = run.get("phase_frequency_offsets_deg_map", {}) or {}
-        freq_key = int(round(requested)) if requested else None
-        freq_correction_deg = float(freq_map.get(freq_key, 0.0)) if freq_key is not None else 0.0
-        total_correction_deg = correction_deg + freq_correction_deg
-        corrected = self._normalize_phase_deg(raw_phase + total_correction_deg)
-        return {
-            "phase_raw_deg": raw_phase,
-            "phase_delay_correction_us": tau_us,
-            "phase_delay_correction_deg": correction_deg,
-            "phase_frequency_correction_deg": freq_correction_deg,
-            "phase_total_correction_deg": total_correction_deg,
-            "phase_corrected_deg": corrected,
-        }
-
-    def _parse_phase_frequency_offsets_deg(self):
-        raw = (self.var_phase_frequency_offsets_deg.get() or "").strip()
-        if not raw:
-            return {}
-        result = {}
-        for chunk in raw.replace(";", ",").split(","):
-            item = chunk.strip()
-            if not item:
-                continue
-            if ":" not in item:
-                raise ValueError(f"Неверный элемент таблицы поправок: {item}")
-            freq_text, deg_text = item.split(":", 1)
-            freq = int(round(float(freq_text.strip())))
-            result[freq] = float(deg_text.strip())
-        return result
-
-    def _phase_build_summary(self, runs, tau_corr_us):
-        if not runs:
-            return {
-                "z_mean_ohm": 0.0,
-                "z_std_ohm": 0.0,
-                "phase_mean_deg": 0.0,
-                "phase_std_deg": 0.0,
-                "phase_raw_mean_deg": 0.0,
-                "phase_raw_std_deg": 0.0,
-                "freq_requested_hz": 0.0,
-                "freq_effective_hz": 0.0,
-                "freq_error_hz": 0.0,
-                "freq_error_pct": 0.0,
-                "samples_per_period_mean": 0.0,
-                "actual_num_samples_mean": 0.0,
-                "phase_delay_correction_us": float(tau_corr_us or 0.0),
-                "phase_frequency_correction_deg": 0.0,
-                "phase_total_correction_deg": 0.0,
-            }
-
-        z_values = [r.get("impedance_ohm", 0.0) for r in runs]
-        phase_values = [r.get("phase_corrected_deg", r.get("phase_deg", 0.0)) for r in runs]
-        phase_raw_values = [r.get("phase_raw_deg", r.get("phase_deg", 0.0)) for r in runs]
-        z_mean = sum(z_values) / len(z_values)
-        z_std = (sum((z - z_mean) ** 2 for z in z_values) / len(z_values)) ** 0.5
-        phase_mean, phase_std = self._phase_circular_stats(phase_values)
-        phase_raw_mean, phase_raw_std = self._phase_circular_stats(phase_raw_values)
-        return {
-            "z_mean_ohm": z_mean,
-            "z_std_ohm": z_std,
-            "phase_mean_deg": phase_mean,
-            "phase_std_deg": phase_std,
-            "phase_raw_mean_deg": phase_raw_mean,
-            "phase_raw_std_deg": phase_raw_std,
-            "freq_requested_hz": sum(r.get("requested_frequency_hz", r.get("frequency", 0.0)) for r in runs) / len(runs),
-            "freq_effective_hz": sum(r.get("effective_frequency_hz", r.get("frequency", 0.0)) for r in runs) / len(runs),
-            "freq_error_hz": sum(r.get("frequency_error_hz", 0.0) for r in runs) / len(runs),
-            "freq_error_pct": sum(r.get("frequency_error_pct", 0.0) for r in runs) / len(runs),
-            "samples_per_period_mean": sum(r.get("samples_per_period", 0.0) for r in runs) / len(runs),
-            "actual_num_samples_mean": sum(r.get("actual_num_samples", 0.0) for r in runs) / len(runs),
-            "phase_delay_correction_us": float(tau_corr_us or 0.0),
-            "phase_frequency_correction_deg": sum(r.get("phase_frequency_correction_deg", 0.0) for r in runs) / len(runs),
-            "phase_total_correction_deg": sum(r.get("phase_total_correction_deg", 0.0) for r in runs) / len(runs),
-        }
-
-    def _phase_recompute_results_with_tau(self, tau_corr_us):
-        for block in self.phase_test_results:
-            runs = block.get("runs", [])
-            for run in runs:
-                run.update(self._phase_apply_delay_correction(run, tau_corr_us))
-            block["summary"] = self._phase_build_summary(runs, tau_corr_us)
-
-    def on_phase_recalibrate_delay(self):
-        if not self.phase_test_results:
-            messagebox.showinfo("Нет данных", "Сначала выполните фазовый sweep или одиночный замер.")
-            return
-        try:
-            target_phase_deg = float(self.var_phase_cal_target_deg.get().strip() or 0.0)
-            calib_freq_hz = float(self.var_phase_cal_frequency_hz.get().strip() or 0.0)
-            if calib_freq_hz <= 0:
-                raise ValueError("Частота калибровки должна быть > 0")
-        except ValueError as e:
-            messagebox.showerror("Ошибка", f"Неверные параметры калибровки: {e}")
-            return
-
-        block = min(self.phase_test_results, key=lambda item: abs(float(item.get("frequency", 0.0)) - calib_freq_hz))
-        summary = block.get("summary", {})
-        raw_phase_deg = float(summary.get("phase_raw_mean_deg", summary.get("phase_mean_deg", 0.0)) or 0.0)
-        effective_freq_hz = float(summary.get("freq_effective_hz", block.get("frequency", 0.0)) or 0.0)
-        if effective_freq_hz <= 0.0:
-            messagebox.showerror("Ошибка", "Для выбранной точки effective frequency не определена.")
-            return
-
-        delta_phase_deg = self._normalize_phase_deg(target_phase_deg - raw_phase_deg)
-        tau_corr_us = (delta_phase_deg / (360.0 * effective_freq_hz)) * 1e6
-        self.var_phase_delay_correction_us.set(f"{tau_corr_us:.2f}")
-        self._phase_recompute_results_with_tau(tau_corr_us)
-        self._phase_append_result_text(
-            f"\nτcorr перекалиброван по точке {block.get('frequency', 0.0):.0f} Hz "
-            f"(f_eff={effective_freq_hz:.2f} Hz, φ_raw={raw_phase_deg:.2f}°, φ_эталон={target_phase_deg:.2f}°) "
-            f"-> τcorr={tau_corr_us:.2f} µs"
-        )
-        self.phase_status_label.config(text=f"Фазовый тест: τcorr перекалиброван на {tau_corr_us:.2f} µs")
-        self._phase_update_summary_and_plot()
-
-    def _parse_phase_settings(self, require_sweep=False):
-        try:
-            channel = int(self.var_phase_channel.get().strip())
-            freq_hz = float(self.var_phase_freq.get().strip())
-            scale_str = self.var_phase_scale.get().strip()
-            num_averages = max(1, min(1000, int(self.var_phase_averages.get().strip() or 1)))
-            num_samples = max(16, min(128, int(self.var_phase_samples.get().strip() or 128)))
-            repeats = max(1, min(20, int(self.var_phase_repeats.get().strip() or 1)))
-            auto_scale = bool(self.var_phase_auto_scale.get())
-            phase_safe = bool(self.var_phase_safe.get())
-            phase_delay_correction_us = float(self.var_phase_delay_correction_us.get().strip() or 0.0)
-            phase_frequency_offsets_deg = self._parse_phase_frequency_offsets_deg()
-            if not (0 <= channel <= 15):
-                raise ValueError("Канал должен быть 0–15")
-            if freq_hz <= 0:
-                raise ValueError("Частота должна быть > 0")
-            if scale_str not in ("0.1 pF", "1 pF", "10 pF"):
-                raise ValueError("Шкала: 0.1 pF, 1 pF или 10 pF")
-            freq_list = [freq_hz]
-            if require_sweep:
-                raw = self.var_phase_freq_list.get().replace(";", ",")
-                freq_list = [float(x.strip()) for x in raw.split(",") if x.strip()]
-                if not freq_list:
-                    raise ValueError("Укажите хотя бы одну частоту")
-                for f in freq_list:
-                    if f <= 0:
-                        raise ValueError("Все частоты должны быть > 0")
-            return {
-                "channel": channel,
-                "freq_hz": freq_hz,
-                "scale": scale_str,
-                "num_averages": num_averages,
-                "num_samples": num_samples,
-                "repeats": repeats,
-                "auto_scale": auto_scale,
-                "phase_safe": phase_safe,
-                "phase_delay_correction_us": phase_delay_correction_us,
-                "phase_frequency_offsets_deg": phase_frequency_offsets_deg,
-                "freq_list": freq_list,
-            }
-        except ValueError as e:
-            messagebox.showerror("Ошибка", f"Неверные параметры фазового теста: {e}")
-            return None
-
-    def _phase_measurement_timeout_s(self, frequency, num_averages, num_samples):
-        freq_hz = max(float(frequency or 0.0), 1.0)
-        # Keep GUI timeout aligned with calibrated driver profiles so paced
-        # low-frequency measurements do not fail client-side before the
-        # ioctl returns.
-        spp_hint = {
-            100.0: 8.0,
-            300.0: 32.0,
-            1000.0: 11.0,
-            2000.0: 5.0,
-        }.get(float(freq_hz))
-        if spp_hint is None:
-            spp_hint = max(6.0, round(11500.0 / freq_hz))
-        expected_s = (max(1, int(num_averages)) * max(1, int(num_samples))) / (freq_hz * spp_hint)
-        return max(30.0, min(180.0, 12.0 + expected_s * 1.8))
-
-    def _phase_send_measurement(self, channel, frequency, scale, num_averages, num_samples, auto_scale, phase_safe):
-        return self.client.send_command({
-            "cmd": "measure_impedance_fast",
-            "channel": channel,
-            "frequency": frequency,
-            "scale": scale,
-            "num_averages": num_averages,
-            "num_samples": num_samples,
-            "auto_scale": auto_scale,
-            "phase_safe": phase_safe,
-            "include_points": True,
-        }, timeout=self._phase_measurement_timeout_s(frequency, num_averages, num_samples))
-
-    def _phase_circular_stats(self, angles_deg):
-        if not angles_deg:
-            return 0.0, 0.0
-        mean_rad = math.atan2(
-            sum(math.sin(math.radians(a)) for a in angles_deg),
-            sum(math.cos(math.radians(a)) for a in angles_deg),
-        )
-        mean_deg = math.degrees(mean_rad)
-        diffs = [((a - mean_deg + 180.0) % 360.0) - 180.0 for a in angles_deg]
-        std_deg = (sum(d * d for d in diffs) / len(diffs)) ** 0.5
-        return mean_deg, std_deg
-
-    def on_phase_single_measurement(self):
-        """Один детальный фазовый замер на выбранной частоте."""
-        settings = self._parse_phase_settings(require_sweep=False)
-        if not settings:
-            return
-
-        def worker():
-            try:
-                self.after(0, self._phase_clear_result_text)
-                self.after(0, lambda: self.phase_status_label.config(text="Фазовый тест: выполняется одиночный замер..."))
-                resp = self._phase_send_measurement(
-                    settings["channel"],
-                    settings["freq_hz"],
-                    settings["scale"],
-                    settings["num_averages"],
-                    settings["num_samples"],
-                    settings["auto_scale"],
-                    settings["phase_safe"],
-                )
-                if resp.get("status") != "ok" or "impedance_ohm" not in resp:
-                    raise RuntimeError(resp.get("error", "Не удалось выполнить фазовый замер"))
-                resp["phase_frequency_offsets_deg_map"] = settings["phase_frequency_offsets_deg"]
-                resp.update(self._phase_apply_delay_correction(resp, settings["phase_delay_correction_us"]))
-
-                self.phase_test_results = [{
-                    "channel": settings["channel"],
-                    "frequency": settings["freq_hz"],
-                    "repeat_count": 1,
-                    "runs": [resp],
-                    "summary": self._phase_build_summary([resp], settings["phase_delay_correction_us"]),
-                }]
-
-                lines = [
-                    f"Канал: {settings['channel']}",
-                    f"Частота: {settings['freq_hz']} Hz",
-                    f"Шкала: {resp.get('scale', settings['scale'])}",
-                    f"Phase-safe: {'ON' if resp.get('phase_safe', {}).get('enabled') else 'OFF'}",
-                    f"Диагностика частоты: {self._phase_frequency_diag_text(resp)}",
-                    f"Диагностика семплирования: {self._phase_sampling_diag_text(resp)}",
-                    f"|Z|: {resp.get('impedance_ohm', 0.0):.2f} Ω",
-                    f"Фаза raw/corrected: {resp.get('phase_raw_deg', resp.get('phase_deg', 0.0)):.2f}° / {resp.get('phase_corrected_deg', resp.get('phase_deg', 0.0)):.2f}°",
-                    f"Фазовая поправка: τ={resp.get('phase_delay_correction_us', settings['phase_delay_correction_us']):.2f} µs, "
-                    f"Δφτ={resp.get('phase_delay_correction_deg', 0.0):+.2f}°, "
-                    f"Δφf={resp.get('phase_frequency_correction_deg', 0.0):+.2f}°, "
-                    f"ΔφΣ={resp.get('phase_total_correction_deg', 0.0):+.2f}°",
-                    f"V_amp: {resp.get('v_amp_uv', 0.0):.2f} µV",
-                    f"Валидных повторов внутри замера: {resp.get('num_valid', 0)}",
-                ]
-                if resp.get("phase_safe", {}).get("enabled"):
-                    phase_safe_info = resp.get("phase_safe", {})
-                    lines.append(
-                        "Register 1: "
-                        f"0x{phase_safe_info.get('reg1_before', 0):04X} -> "
-                        f"0x{phase_safe_info.get('reg1_applied', 0):04X} "
-                        f"(DSPen {phase_safe_info.get('dsp_enabled_before', 0)} -> "
-                        f"{phase_safe_info.get('dsp_enabled_applied', 0)}, "
-                        f"absmode {phase_safe_info.get('absmode_before', 0)} -> "
-                        f"{phase_safe_info.get('absmode_applied', 0)}, "
-                        f"DSP cutoff {phase_safe_info.get('dsp_cutoff_before', 0)} -> "
-                        f"{phase_safe_info.get('dsp_cutoff_applied', 0)})"
-                    )
-                if resp.get("likely_floating", False):
-                    lines.append("Предупреждение: канал выглядит как висящий в воздухе.")
-                lines.append(
-                    "Интерпретация: " + self._phase_interpretation_text(
-                        resp.get('phase_corrected_deg', resp.get('phase_deg', 0.0)), 0.0, resp.get('impedance_ohm', 0.0)
-                    )
-                )
-                self.after(0, lambda: self.phase_status_label.config(text="Фазовый тест: одиночный замер завершён"))
-                self.after(0, lambda: self._phase_append_result_text("\n".join(lines)))
-                self.after(0, self._phase_update_summary_and_plot)
-            except Exception as e:
-                self.after(0, lambda err=e: self.phase_status_label.config(text=f"Фазовый тест: ошибка - {err}"))
-                self.after(0, lambda err=e: self._phase_append_result_text(f"Ошибка одиночного фазового замера: {err}"))
-                self.after(0, lambda err=e: messagebox.showerror("Ошибка", str(err)))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def on_phase_frequency_sweep(self):
-        """Прогон по нескольким частотам с повторными измерениями для оценки стабильности фазы."""
-        settings = self._parse_phase_settings(require_sweep=True)
-        if not settings:
-            return
-
-        def worker():
-            collected = []
-            try:
-                self.after(0, self._phase_clear_result_text)
-                self.after(0, lambda: self.phase_status_label.config(text="Фазовый тест: идёт прогон по частотам..."))
-                self.after(0, lambda: self._phase_append_result_text(
-                    f"Канал {settings['channel']}, шкала {settings['scale']}, samples={settings['num_samples']}, "
-                    f"усреднений={settings['num_averages']}, повторов={settings['repeats']}, "
-                    f"phase-safe={'ON' if settings['phase_safe'] else 'OFF'}, "
-                    f"τcorr={settings['phase_delay_correction_us']:.2f} µs"
-                ))
-                for freq in settings["freq_list"]:
-                    runs = []
-                    self.after(0, lambda freq=freq: self._phase_append_result_text(f"\n=== Частота {freq:.0f} Hz ==="))
-                    for rep in range(settings["repeats"]):
-                        self.after(0, lambda freq=freq, rep=rep: self.phase_status_label.config(
-                            text=f"Фазовый тест: {freq:.0f} Hz, повтор {rep + 1}/{settings['repeats']}"
-                        ))
-                        resp = self._phase_send_measurement(
-                            settings["channel"],
-                            freq,
-                            settings["scale"],
-                            settings["num_averages"],
-                            settings["num_samples"],
-                            settings["auto_scale"],
-                            settings["phase_safe"],
-                        )
-                        if resp.get("status") != "ok" or "impedance_ohm" not in resp:
-                            raise RuntimeError(f"{freq:.0f} Hz: {resp.get('error', 'ошибка измерения')}")
-                        resp["phase_frequency_offsets_deg_map"] = settings["phase_frequency_offsets_deg"]
-                        resp.update(self._phase_apply_delay_correction(resp, settings["phase_delay_correction_us"]))
-                        runs.append(resp)
-                        self.after(0, lambda resp=resp, rep=rep: self._phase_append_result_text(
-                            f"Повтор {rep + 1}: |Z|={resp.get('impedance_ohm', 0.0):.2f} Ω, "
-                            f"фаза raw/corrected={resp.get('phase_raw_deg', resp.get('phase_deg', 0.0)):.2f}°/"
-                            f"{resp.get('phase_corrected_deg', resp.get('phase_deg', 0.0)):.2f}°, "
-                            f"V_amp={resp.get('v_amp_uv', 0.0):.2f} µV, "
-                            f"phase-safe={'ON' if resp.get('phase_safe', {}).get('enabled') else 'OFF'}, "
-                            f"τcorr={resp.get('phase_delay_correction_us', settings['phase_delay_correction_us']):.2f} µs, "
-                            f"Δφτ={resp.get('phase_delay_correction_deg', 0.0):+.2f}°, "
-                            f"Δφf={resp.get('phase_frequency_correction_deg', 0.0):+.2f}°, "
-                            f"ΔφΣ={resp.get('phase_total_correction_deg', 0.0):+.2f}°, "
-                            f"{self._phase_frequency_diag_text(resp)}, "
-                            f"{self._phase_sampling_diag_text(resp)}"
-                        ))
-
-                    summary = self._phase_build_summary(runs, settings["phase_delay_correction_us"])
-                    collected.append({
-                        "channel": settings["channel"],
-                        "frequency": freq,
-                        "repeat_count": settings["repeats"],
-                        "runs": runs,
-                        "summary": summary,
-                    })
-                    self.after(0, lambda summary=summary: self._phase_append_result_text(
-                        f"Итог: |Z|={summary['z_mean_ohm']:.2f} ± {summary['z_std_ohm']:.2f} Ω, "
-                        f"фаза raw/corrected={summary['phase_raw_mean_deg']:.2f} ± {summary['phase_raw_std_deg']:.2f}° / "
-                        f"{summary['phase_mean_deg']:.2f} ± {summary['phase_std_deg']:.2f}°, "
-                        f"f_req={summary['freq_requested_hz']:.2f} Hz, "
-                        f"f_eff={summary['freq_effective_hz']:.2f} Hz, "
-                        f"Δf={summary['freq_error_hz']:+.2f} Hz ({summary['freq_error_pct']:+.2f}%), "
-                        f"spp≈{summary['samples_per_period_mean']:.2f}, "
-                        f"N≈{summary['actual_num_samples_mean']:.2f}, "
-                        f"τcorr={summary['phase_delay_correction_us']:.2f} µs, "
-                        f"Δφf≈{summary['phase_frequency_correction_deg']:+.2f}°, "
-                        f"ΔφΣ≈{summary['phase_total_correction_deg']:+.2f}°"
-                    ))
-                    self.after(0, lambda summary=summary: self._phase_append_result_text(
-                        "Интерпретация: " + self._phase_interpretation_text(
-                            summary['phase_mean_deg'], summary['phase_std_deg'], summary['z_mean_ohm']
-                        )
-                    ))
-                    if summary["phase_std_deg"] >= 10.0:
-                        self.after(0, lambda freq=freq, summary=summary: self._phase_append_result_text(
-                            f"⚠ {freq:.0f} Hz: разброс фазы {summary['phase_std_deg']:.2f}° — результат пока нестабилен."
-                        ))
-                    else:
-                        self.after(0, lambda freq=freq, summary=summary: self._phase_append_result_text(
-                            f"✓ {freq:.0f} Hz: разброс фазы {summary['phase_std_deg']:.2f}° — результат выглядит устойчивым."
-                        ))
-
-                self.phase_test_results = collected
-                self.after(0, lambda: self.phase_status_label.config(text="Фазовый тест: прогон завершён"))
-                self.after(0, lambda: self._phase_append_result_text(
-                    "\nРекомендация: для инженерной опоры отдельно смотрите 1 кГц и добивайтесь малого разброса между повторами."
-                ))
-                self.after(0, self._phase_update_summary_and_plot)
-            except Exception as e:
-                self.after(0, lambda err=e: self.phase_status_label.config(text=f"Фазовый тест: ошибка - {err}"))
-                self.after(0, lambda err=e: self._phase_append_result_text(f"\nОшибка фазового прогона: {err}"))
-                self.after(0, lambda err=e: messagebox.showerror("Ошибка", str(err)))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def on_export_phase_results(self):
-        """Экспортирует результаты фазового теста в CSV."""
-        if not self.phase_test_results:
-            messagebox.showinfo("", "Сначала выполните фазовый тест.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            title="Экспорт результатов фазового теста",
+        filename = filedialog.asksaveasfilename(
+            title="Сохранить импеданс в CSV",
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
-            initialfile="phase_test_results.csv",
+            initialfile=f"impedance_ch{self.last_impedance_data['params'].get('channel', 0)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         )
-        if not path:
+        if not filename:
             return
-
         try:
-            with open(path, "w", encoding="utf-8", newline="") as f:
+            data = self.last_impedance_data
+            with open(filename, "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f, delimiter=";")
-                writer.writerow([
-                    "channel", "frequency_hz", "repeat_idx", "scale", "impedance_ohm",
-                    "std_dev_ohm", "phase_raw_deg", "phase_corrected_deg", "phase_delay_correction_us", "phase_delay_correction_deg",
-                    "phase_frequency_correction_deg", "phase_total_correction_deg",
-                    "v_amp_uv", "num_valid", "likely_floating",
-                    "requested_frequency_hz", "effective_frequency_hz", "frequency_error_hz", "frequency_error_pct",
-                    "samples_per_period", "actual_num_samples",
-                    "phase_safe", "reg1_before", "reg1_applied", "dsp_cutoff_before", "dsp_cutoff_applied"
-                ])
-                for block in self.phase_test_results:
-                    for idx, run in enumerate(block.get("runs", []), 1):
-                        phase_safe_info = run.get("phase_safe", {})
-                        writer.writerow([
-                            block.get("channel", 0),
-                            block.get("frequency", 0),
-                            idx,
-                            run.get("scale", ""),
-                            run.get("impedance_ohm", 0),
-                            run.get("std_dev_ohm", 0),
-                            run.get("phase_raw_deg", run.get("phase_deg", 0)),
-                            run.get("phase_corrected_deg", run.get("phase_deg", 0)),
-                            run.get("phase_delay_correction_us", ""),
-                            run.get("phase_delay_correction_deg", ""),
-                            run.get("phase_frequency_correction_deg", ""),
-                            run.get("phase_total_correction_deg", ""),
-                            run.get("v_amp_uv", 0),
-                            run.get("num_valid", 0),
-                            int(bool(run.get("likely_floating", False))),
-                            run.get("requested_frequency_hz", run.get("frequency", 0)),
-                            run.get("effective_frequency_hz", ""),
-                            run.get("frequency_error_hz", ""),
-                            run.get("frequency_error_pct", ""),
-                            run.get("samples_per_period", ""),
-                            run.get("actual_num_samples", ""),
-                            int(bool(phase_safe_info.get("enabled", False))),
-                            phase_safe_info.get("reg1_before", ""),
-                            phase_safe_info.get("reg1_applied", ""),
-                            phase_safe_info.get("dsp_cutoff_before", ""),
-                            phase_safe_info.get("dsp_cutoff_applied", ""),
-                        ])
-                    summary = block.get("summary", {})
-                    writer.writerow([
-                        block.get("channel", 0),
-                        block.get("frequency", 0),
-                        "summary",
-                        "",
-                        summary.get("z_mean_ohm", 0),
-                        summary.get("z_std_ohm", 0),
-                        summary.get("phase_raw_mean_deg", 0),
-                        summary.get("phase_mean_deg", 0),
-                        summary.get("phase_delay_correction_us", ""),
-                        "",
-                        summary.get("phase_frequency_correction_deg", ""),
-                        summary.get("phase_total_correction_deg", ""),
-                        "",
-                        "",
-                        "",
-                        summary.get("freq_requested_hz", ""),
-                        summary.get("freq_effective_hz", ""),
-                        summary.get("freq_error_hz", ""),
-                        summary.get("freq_error_pct", ""),
-                        summary.get("samples_per_period_mean", ""),
-                        summary.get("actual_num_samples_mean", ""),
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                    ])
-            self.log(f"Результаты фазового теста экспортированы: {path}", "success")
-            messagebox.showinfo("Успех", f"Результаты фазового теста экспортированы в:\n{path}")
+                writer.writerow(["--- PARAMETRY IZMERENIYA ---"])
+                for k, v in data["params"].items():
+                    writer.writerow([k, v])
+                writer.writerow([])
+                writer.writerow(["--- KAZHDYY OTDELNYY ZAMER do usredneniya ---"])
+                writer.writerow(["nom_zamera", "z_raw", "z_corr", "V_amp"])
+                for m in data["raw_measurements"]:
+                    writer.writerow([m["nom"], m["z_raw"], m["z_corr"], m["V_amp"]])
+                writer.writerow([])
+                writer.writerow(["--- STATISTIKA POSLE USREDNENIYA ---"])
+                for k, v in data["statistics"].items():
+                    writer.writerow([k, v])
+                writer.writerow([])
+                writer.writerow(["--- SPISOK VALIDNYH ZNAMENIY voshli v raschet ---"])
+                writer.writerow(["nom", "z_corr"])
+                for i, z in enumerate(data["raw_measurements"], 1):
+                    writer.writerow([i, z["z_corr"]])
+            self.log(f"Импеданс сохранён: {filename}", "success")
+            messagebox.showinfo("Экспорт", f"Данные сохранены в\n{filename}")
         except Exception as e:
-            self.log(f"Ошибка экспорта фазового теста: {e}", "error")
-            messagebox.showerror("Ошибка", str(e))
-
-    def on_export_impedance_points(self):
-        """Экспортирует точки последнего измерения импеданса в CSV для просмотра в impedance_csv_viewer."""
-        if not self._last_impedance_data:
-            messagebox.showinfo("", "Сначала выполните измерение импеданса.")
-            return
-        d = self._last_impedance_data
-        path = filedialog.asksaveasfilename(
-            title="Экспорт точек импеданса",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
-            initialfile=f"impedance_ch{d.get('channel', 0)}_{d.get('scale', '1pF').replace(' ', '')}.csv",
-        )
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                w = lambda s: f.write(s + "\n")
-                w("# Экспорт точек импеданса RHS2116 (совместимо с impedance_csv_viewer)")
-                w("")
-                w("--- PARAMETRY IZMERENIYA ---")
-                w("parametr;znachenie")
-                w(f"channel;{d.get('channel', 0)}")
-                w(f"frequency;{d.get('frequency', 1000)}")
-                w(f"scale;{d.get('scale', '1 pF')}")
-                w(f"num_averages;{d.get('num_valid', 0)}")
-                w("")
-                w("--- KAZHDYY OTDELNYY ZAMER do usredneniya ---")
-                w("nom_zamera;z_raw;z_corr;V_amp;V_rms;phase_deg")
-                for p in d.get("points", []):
-                    nom = p.get("nom", 0)
-                    zr = p.get("z_raw", 0)
-                    zc = p.get("z_corr", 0)
-                    vamp = p.get("V_amp", 0)
-                    vrms = p.get("V_rms", vamp / (2 ** 0.5) if vamp else 0)
-                    phase_deg = p.get("phase_deg", 0)
-                    w(f"{nom};{zr};{zc};{vamp};{vrms};{phase_deg}")
-                w("")
-                w("--- STATISTIKA POSLE USREDNENIYA ---")
-                w("pokazatel;znachenie")
-                w(f"impedance_ohm;{d.get('impedance_ohm', 0)}")
-                w(f"std_dev_ohm;{d.get('std_dev_ohm', 0)}")
-                w(f"v_amp_uv;{d.get('v_amp_uv', 0)}")
-                w(f"phase_deg;{d.get('phase_deg', 0)}")
-                w("")
-                w("--- SPISOK VALIDNYH ZNAMENIY voshli v raschet ---")
-                w("nom;z_ohm")
-                for i, z in enumerate(d.get("valid_z", []), 1):
-                    w(f"{i};{z}")
-            self.log(f"Точки экспортированы: {path}", "success")
-            messagebox.showinfo("Успех", f"Экспортировано {len(d.get('points', []))} точек в:\n{path}")
-        except Exception as e:
-            self.log(f"Ошибка экспорта: {e}", "error")
-            messagebox.showerror("Ошибка", str(e))
+            self.log(f"Ошибка экспорта CSV: {e}", "error")
+            messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}")
 
     def _get_adc_bias_from_table(self, adc_rate_ksps):
         """
@@ -5407,18 +4158,19 @@ WRITE 42 0x0000 U
             self.log(f"Ошибка применения настроек ADC: {e}", "error")
             messagebox.showerror("Ошибка", f"Не удалось применить настройки ADC: {e}")
 
-    def on_auto_filters_wideband(self):
-        """Автоматически устанавливает значения фильтров для широкополосной записи"""
+    def on_auto_filters_emg(self):
+        """Автоматически устанавливает значения фильтров для ЭМГ"""
         try:
-            self.var_fh_freq.set("7500")
-            self.var_reg4.set("0x0016")
-            self.var_reg5.set("0x0017")
-            self.var_fl_freq.set("5")
-            self.var_reg6.set("0x00A8")
+            # Рекомендуемые значения для ЭМГ
+            self.var_fh_freq.set("500")
+            self.var_reg4.set("0x015E")
+            self.var_reg5.set("0x01AB")
+            self.var_fl_freq.set("20")
+            self.var_reg6.set("0x0036")
             self.var_reg7.set("0x000A")
-            self.var_dsp_cutoff.set("0")
-            self.var_reg1.set("0x051A")
-            self.log("Автоматически установлены значения фильтров для широкополосной записи", "info")
+            self.var_dsp_cutoff.set("9")
+            self.var_reg1.set("0x951A")
+            self.log("Автоматически установлены значения фильтров для ЭМГ", "info")
         except Exception as e:
             self.log(f"Ошибка установки фильтров: {e}", "error")
 
@@ -5444,12 +4196,12 @@ WRITE 42 0x0000 U
             if not (0 <= dsp_cutoff <= 15):
                 raise ValueError("DSP cutoff должен быть в диапазоне 0-15")
             
-            # RHS2116 Register 1: bit 4 = DSPen, bits 3:0 = DSP cutoff.
-            reg1_dsp_cutoff = reg1 & 0xF
+            # Проверяем, что Register 1 соответствует DSP cutoff
+            # Register 1: биты [15:12] = DSP cutoff
+            reg1_dsp_cutoff = (reg1 >> 12) & 0xF
             if reg1_dsp_cutoff != dsp_cutoff:
-                # Если пользователь задает DSP cutoff вручную, включаем DSP и
-                # обновляем только младшие биты RHS2116 Register 1.
-                reg1 = (reg1 & ~0x001F) | 0x0010 | (dsp_cutoff & 0xF)
+                # Обновляем Register 1 с правильным DSP cutoff
+                reg1 = (reg1 & 0x0FFF) | (dsp_cutoff << 12)
                 self.var_reg1.set(f"0x{reg1:04X}")
                 self.log(f"Обновлен Register 1 для DSP cutoff={dsp_cutoff}: 0x{reg1:04X}", "info")
             
@@ -5549,13 +4301,13 @@ WRITE 35 0x00AA U  # PBIAS/NBIAS для шага 1 µA
 
 # Настройка токов стимуляции (формат 0x80XX, где XX - значение тока в µA)
 WRITE 64 0x8014 U  # Отрицательный ток 20 µA (канал 0)
-WRITE 96 0x8014  # Положительный ток 20 µA (канал 0)
+WRITE 96 0x8014 U  # Положительный ток 20 µA (канал 0)
 
 # Установка полярности (положительная для канала 0)
-WRITE 44 0x0001
+WRITE 44 0x0001 U
 # Включение стимуляции канала 0
 WRITE 42 0x0001 U
-# Задержка (10 одношаговых SPI transfer)
+# Задержка (10 раз READ 255)
 DELAY 10
 # Выключение стимуляции
 WRITE 42 0x0000 U
@@ -5715,7 +4467,7 @@ WRITE 42 0x0000 U
             channel_var.trace('w', lambda *args, b=block, v=channel_var: self.update_block_data(b, "channel", v.get()))
             
         elif block["type"] == "delay":
-            ttk.Label(content_frame, text="Количество одношаговых SPI transfer:").grid(row=0, column=0, sticky="w", padx=2, pady=2)
+            ttk.Label(content_frame, text="Количество циклов READ 255:").grid(row=0, column=0, sticky="w", padx=2, pady=2)
             count_var = tk.StringVar(value=str(block["data"]["count"]))
             count_entry = ttk.Entry(content_frame, textvariable=count_var, width=8)
             count_entry.grid(row=0, column=1, sticky="w", padx=2, pady=2)
@@ -6114,12 +4866,12 @@ WRITE 42 0x0000 U
         
         # Добавляем Register 34 (step size) в начало, если блока нет
         if not has_step_size_block:
-            commands.append("WRITE 34 0x00E2  # Шаг 1 µA (по умолчанию)")
+            commands.append("WRITE 34 0x00E2 U  # Шаг 1 µA (по умолчанию)")
         else:
-            commands.append(f"WRITE 34 {step_size_hex}  # Шаг {step_size_ua} µA")
+            commands.append(f"WRITE 34 {step_size_hex} U  # Шаг {step_size_ua} µA")
         
         # Register 35 (bias) - зависит от шага, но пока используем стандартное значение для шага 1 µA
-        commands.append("WRITE 35 0x00AA  # PBIAS/NBIAS для шага 1 µA")
+        commands.append("WRITE 35 0x00AA U  # PBIAS/NBIAS для шага 1 µA")
         
         for block in self.pattern_blocks:
             if block["type"] == "step_size":
@@ -6156,16 +4908,16 @@ WRITE 42 0x0000 U
                 # Формат: 0x8000 | (reg_value & 0xFF) где 0x80 = trim = 128 (без подстройки)
                 if neg_current_ua > 0:
                     reg_value = 0x8000 | (neg_reg_value & 0xFF)  # 0x80 = trim (128), биты [7:0] = ток
-                    commands.append(f"WRITE {64 + channel} 0x{reg_value:04X}  # {neg_current_ua} µA (шаг {step_size_ua} µA)")
+                    commands.append(f"WRITE {64 + channel} 0x{reg_value:04X} U  # {neg_current_ua} µA (шаг {step_size_ua} µA)")
                 if pos_current_ua > 0:
                     reg_value = 0x8000 | (pos_reg_value & 0xFF)  # 0x80 = trim (128), биты [7:0] = ток
-                    commands.append(f"WRITE {96 + channel} 0x{reg_value:04X}  # {pos_current_ua} µA (шаг {step_size_ua} µA)")
+                    commands.append(f"WRITE {96 + channel} 0x{reg_value:04X} U  # {pos_current_ua} µA (шаг {step_size_ua} µA)")
             elif block["type"] == "polarity":
                 channel = block["data"].get("channel", 0)
                 positive = block["data"].get("positive", True)
                 # Регистр 44: битовая маска, бит channel = 1 для положительной
                 polarity_mask = (1 << channel) if positive else 0x0000
-                commands.append(f"WRITE 44 0x{polarity_mask:04X}")
+                commands.append(f"WRITE 44 0x{polarity_mask:04X} U")
             elif block["type"] == "enable":
                 channel = block["data"].get("channel", 0)
                 # Регистр 42: битовая маска, бит channel = 1 для включения
