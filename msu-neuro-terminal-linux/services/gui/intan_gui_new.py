@@ -2256,9 +2256,39 @@ class IntanGuiApp(tk.Tk):
         self._send_async({"cmd": "stop"}, "stop")
 
     STM32_PATTERN_MAX_SLOTS = 1024
+    # Один 32-bit SPI slot @ 25 MHz (как intan_usb_transport.intan_spi_slots_to_us).
+    _INTAN_SPI_SCK_HZ = 25_000_000
 
     @classmethod
-    def _pattern_lines_for_load(cls, prep_lines, pattern_cmd_lines):
+    def _legacy_delay_count_to_us(cls, delay_count: int) -> int:
+        """DELAY N (legacy) → µs: N × (32 bit / 25 MHz), не шаги Orange Pi delay_step."""
+        if delay_count <= 0:
+            return 0
+        hz = cls._INTAN_SPI_SCK_HZ
+        return max(1, (delay_count * 32 * 1_000_000 + hz - 1) // hz)
+
+    @staticmethod
+    def _pattern_ends_with_r42_safety_off(cmd_lines) -> bool:
+        if not cmd_lines:
+            return False
+        parts = cmd_lines[-1].split("#", 1)[0].strip().split()
+        if len(parts) < 4 or parts[0].upper() != "PATTERN_ADD_WRITE":
+            return False
+        try:
+            return int(parts[1], 0) == 42 and int(parts[2], 0) == 0
+        except ValueError:
+            return False
+
+    @classmethod
+    def _finalize_pattern_load_lines(cls, load_lines):
+        """Убирает паузу после последнего OFF (лишний хвост на осцилле)."""
+        out = [ln.split("#", 1)[0].strip() for ln in load_lines if ln.split("#", 1)[0].strip()]
+        while out and out[-1].upper().startswith("PATTERN_ADD_DELAY"):
+            out.pop()
+        return out
+
+    @classmethod
+    def _pattern_lines_for_load(cls, prep_lines, pattern_cmd_lines, *, finalize=True):
         """Команды для pattern_load (прошивка STM32, без meta-команд)."""
         skip = {
             "INIT_STIM", "CLEAR_COMP", "PATTERN_RUN", "READ",
@@ -2276,19 +2306,26 @@ class IntanGuiApp(tk.Tk):
             if cmd_type == "DELAY_US" and len(parts) >= 2:
                 out.append(f"PATTERN_ADD_DELAY_US {parts[1]}")
                 continue
+            if cmd_type == "DELAY" and len(parts) >= 2:
+                delay_us = cls._legacy_delay_count_to_us(int(parts[1], 0))
+                if delay_us > 0:
+                    out.append(f"PATTERN_ADD_DELAY_US {delay_us}")
+                continue
             if cmd_type == "WRITE" and len(parts) >= 3:
                 out.append(cmd)
                 continue
             if cmd_type in (
                 "PATTERN_ADD_RAW", "PATTERN_ADD_DELAY_US", "PATTERN_ADD_DELAY_CYC",
-                "DELAY",
+                "PATTERN_ADD_WRITE", "PATTERN_ADD_READ",
             ):
                 out.append(cmd)
+        if finalize:
+            out = cls._finalize_pattern_load_lines(out)
         return out
 
     @classmethod
     def estimate_stm32_pattern_slots(cls, load_lines, include_server_safety_off=True):
-        """Оценка слотов RAM по правилам intan_pattern.c."""
+        """Оценка слотов RAM по правилам intan_pattern.c и load_pattern() на Pi."""
         slots = spi = delays = 0
         triple_spi = {
             "PATTERN_ADD_WRITE", "PATTERN_ADD_READ", "PATTERN_ADD_CONVERT",
@@ -2302,13 +2339,18 @@ class IntanGuiApp(tk.Tk):
             if cmd_type in ("PATTERN_ADD_RAW", "WRITE"):
                 slots += 1
                 spi += 1
-            elif cmd_type in ("PATTERN_ADD_DELAY_US", "DELAY_US", "DELAY", "PATTERN_ADD_DELAY_CYC"):
-                slots += 1
-                delays += 1
+            elif cmd_type in ("PATTERN_ADD_DELAY_US", "DELAY_US", "PATTERN_ADD_DELAY_CYC"):
+                if len(parts) >= 2 and int(parts[1], 0) > 0:
+                    slots += 1
+                    delays += 1
+            elif cmd_type == "DELAY":
+                if len(parts) >= 2 and cls._legacy_delay_count_to_us(int(parts[1], 0)) > 0:
+                    slots += 1
+                    delays += 1
             elif cmd_type in triple_spi:
                 slots += 3
                 spi += 3
-        if include_server_safety_off:
+        if include_server_safety_off and not cls._pattern_ends_with_r42_safety_off(load_lines):
             slots += 3
             spi += 3
         return slots, spi, delays
@@ -2351,12 +2393,12 @@ class IntanGuiApp(tk.Tk):
             return
 
         prep_lines, pattern_cmd_lines, _post = self._parse_pattern_script(pattern_lines)
-        load_lines = self._pattern_lines_for_load(prep_lines, pattern_cmd_lines)
+        load_lines = self._pattern_lines_for_load(prep_lines, pattern_cmd_lines, finalize=True)
         if not load_lines and self.pattern_blocks:
             self.generate_pattern_from_blocks()
             pattern_lines = self._get_pattern_lines_from_editor()
             prep_lines, pattern_cmd_lines, _post = self._parse_pattern_script(pattern_lines)
-            load_lines = self._pattern_lines_for_load(prep_lines, pattern_cmd_lines)
+            load_lines = self._pattern_lines_for_load(prep_lines, pattern_cmd_lines, finalize=True)
         if not load_lines:
             messagebox.showerror(
                 "Ошибка",
@@ -2379,9 +2421,15 @@ class IntanGuiApp(tk.Tk):
                 count = self._pattern_load_sync(prep_lines, pattern_cmd_lines)
                 self.log(
                     f"✓ Паттерн загружен: {count} слотов в STM32 "
-                    f"(оценка ~{slot_est}: spi≈{spi_est}, delays≈{delay_est})",
+                    f"(оценка GUI ~{slot_est}: spi≈{spi_est}, delays≈{delay_est})",
                     "success",
                 )
+                if abs(count - slot_est) > 0:
+                    self.log(
+                        f"ℹ commands_count от Pi={count}, оценка GUI={slot_est} "
+                        f"(+3 = auto safety R42 OFF на сервере, если нет в паттерне)",
+                        "info",
+                    )
                 self.pattern_status_label.config(
                     text=f"● Паттерн загружен (~{slot_est} слотов)",
                     style="Success.TLabel",
@@ -2558,6 +2606,18 @@ class IntanGuiApp(tk.Tk):
                         commands.append({"type": "PATTERN_ADD_DELAY_US", "line": i+1, "delay_us": delay_us})
                     except:
                         commands.append({"type": "error", "line": i+1, "text": line})
+            elif cmd_type == "PATTERN_ADD_WRITE":
+                if len(parts) >= 3:
+                    try:
+                        reg = int(parts[1], 0)
+                        value = int(parts[2], 0)
+                        u_flag = int(parts[3], 0) if len(parts) >= 4 else 0
+                        commands.append({
+                            "type": "PATTERN_ADD_WRITE", "line": i+1,
+                            "reg": reg, "value": value, "u": bool(u_flag),
+                        })
+                    except:
+                        commands.append({"type": "error", "line": i+1, "text": line})
             elif cmd_type in ("PATTERN_CLEAR", "PATTERN_STATUS", "PATTERN_RUN", "INIT_STIM", "CLEAR_COMP"):
                 commands.append({"type": "meta", "line": i+1, "cmd": cmd_type})
             else:
@@ -2623,7 +2683,7 @@ class IntanGuiApp(tk.Tk):
             elif cmd_type == "DELAY_US":
                 text = f"DELAY_US {cmd['delay_us']} µs"
             elif cmd_type == "DELAY":
-                text = f"DELAY {cmd['count']} (устар., ~{cmd['count'] * 1280 // 1000} µs)"
+                text = f"DELAY {cmd['count']} → ~{self._legacy_delay_count_to_us(cmd['count'])} µs (legacy SPI-slot, не ms)"
             elif cmd_type == "PATTERN_ADD_RAW":
                 text = f"RAW 0x{cmd['word']:08X}"
             elif cmd_type == "PATTERN_ADD_DELAY_US":
@@ -2707,12 +2767,20 @@ class IntanGuiApp(tk.Tk):
                     load_lines.append(f"PATTERN_ADD_RAW 0x{c['word']:08X}")
                 elif c.get("type") == "PATTERN_ADD_DELAY_US":
                     load_lines.append(f"PATTERN_ADD_DELAY_US {c['delay_us']}")
+                elif c.get("type") == "PATTERN_ADD_WRITE":
+                    u = 1 if c.get("u") else 0
+                    load_lines.append(f"PATTERN_ADD_WRITE {c['reg']} 0x{c['value']:04X} {u} 0")
                 elif c.get("type") == "WRITE":
                     u = " U" if c.get("u") else ""
                     m = " M" if c.get("m") else ""
                     load_lines.append(f"WRITE {c['reg']} 0x{c['value']:04X}{u}{m}")
                 elif c.get("type") == "DELAY_US":
                     load_lines.append(f"PATTERN_ADD_DELAY_US {c['delay_us']}")
+                elif c.get("type") == "DELAY":
+                    delay_us = self._legacy_delay_count_to_us(c["count"])
+                    if delay_us > 0:
+                        load_lines.append(f"PATTERN_ADD_DELAY_US {delay_us}")
+            load_lines = self._finalize_pattern_load_lines(load_lines)
             slots_est, spi_est, delays_est = self.estimate_stm32_pattern_slots(load_lines)
             raw_42_on = sum(
                 1 for c in commands
@@ -2732,10 +2800,13 @@ class IntanGuiApp(tk.Tk):
             if delay_us_count > 0:
                 hints += f"  • DELAY_US (legacy): {delay_us_count}\n"
             if delay_legacy_count > 0:
-                hints += f"  • DELAY (устар.): {delay_legacy_count}\n"
+                hints += (
+                    f"  • DELAY (legacy): {delay_legacy_count} "
+                    f"→ PATTERN_ADD_DELAY_US (N×1.28 µs, не шаги Pi v5)\n"
+                )
             if raw_42_on > 0:
                 hints += f"  • Импульсов (оценка): {raw_42_on}\n"
-            hints += f"  • Слотов≈{slots_est} (spi≈{spi_est}, delays≈{delays_est}, max {self.STM32_PATTERN_MAX_SLOTS})\n"
+            hints += f"  • Слотов≈{slots_est} (spi≈{spi_est}, delays≈{delays_est}, +3 safety если нет PATTERN_ADD_WRITE 42 0)\n"
             if slots_est > self.STM32_PATTERN_MAX_SLOTS:
                 hints += f"\n⚠️ Превышен лимит {self.STM32_PATTERN_MAX_SLOTS} слотов!\n"
             if comment_count > 0:
@@ -5752,7 +5823,7 @@ class IntanGuiApp(tk.Tk):
         """Форматирует 3-этапный скрипт по intan_stim_pattern_guide.md."""
         if pre_setup_lines is None or pattern_lines is None:
             pre_setup_lines, pattern_lines = self.generate_pattern_commands()
-        load_preview = self._pattern_lines_for_load(pre_setup_lines, pattern_lines)
+        load_preview = self._pattern_lines_for_load(pre_setup_lines, pattern_lines, finalize=True)
         slot_est, spi_est, delay_est = self.estimate_stm32_pattern_slots(load_preview)
         lines = [
             "# STM32 intan_pattern.c — очередь слотов в RAM",
@@ -5805,21 +5876,23 @@ class IntanGuiApp(tk.Tk):
             self._format_pattern_add_raw(raw_pos, f"R{reg_pos} ch{channel} pos {current_ua} µA"),
         ]
 
-    def build_stim_pattern_body(self, channel, pulse_us=100, pause_us=100, positive=True):
-        """Один импульс: 4× PATTERN_ADD_RAW + 2× PATTERN_ADD_DELAY_US (прошивка STM32)."""
+    def build_stim_pattern_body(self, channel, pulse_us=100, pause_us=100, positive=True, *, trailing_pause=False):
+        """Импульс: pol + ON + delay + OFF; пауза после OFF — только если trailing_pause."""
         channel = int(channel)
         pol_mask = (1 << channel) if positive else 0
         en_mask = 1 << channel
         raw_pol = self._intan_raw_word(44, pol_mask, u_flag=False)
         raw_on = self._intan_raw_word(42, en_mask, u_flag=True)
         raw_off = self._intan_raw_word(42, 0x0000, u_flag=True)
-        return [
+        lines = [
             self._format_pattern_add_raw(raw_pol, f"R44 polarity ch{channel}"),
             self._format_pattern_add_raw(raw_on, f"R42 ON ch{channel} U=1"),
             f"PATTERN_ADD_DELAY_US {int(pulse_us)}",
             self._format_pattern_add_raw(raw_off, "R42 OFF all U=1"),
-            f"PATTERN_ADD_DELAY_US {int(pause_us)}",
         ]
+        if trailing_pause and int(pause_us) > 0:
+            lines.append(f"PATTERN_ADD_DELAY_US {int(pause_us)}")
+        return lines
 
     def build_stim_postrun_commands(self, repeat_count=1):
         """§3 Запуск и безопасное выключение."""

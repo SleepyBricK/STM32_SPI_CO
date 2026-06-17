@@ -794,6 +794,11 @@ class IntanController:
                     if delay_slots < 0:
                         raise ValueError(f"DELAY должен быть >= 0: {cmd_line}")
                     delay_us = intan_spi_slots_to_us(delay_slots)
+                    if self.verbose:
+                        self._log(
+                            f"⚠ DELAY {delay_slots} → PATTERN_ADD_DELAY_US {delay_us} "
+                            f"(legacy: N×1.28 µs SPI-slot, не delay_step Pi v5)"
+                        )
                     if delay_us > 0:
                         _reserve_slots(1)
                         self.spi.pattern_add_delay_us(delay_us)
@@ -1804,7 +1809,8 @@ class IntanTCPHandler(socketserver.StreamRequestHandler):
                 "status": "ok",
                 "cmd": "pattern_load",
                 "commands_count": commands_count,
-                "message": f"Паттерн загружен в память: {commands_count} команд",
+                "slots_count": commands_count,
+                "message": f"Паттерн загружен в STM32: {commands_count} слотов RAM",
             }
 
         if cmd == "pattern_run":
