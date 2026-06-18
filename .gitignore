@@ -35,3 +35,9 @@ Thumbs.db
 CMakeCache.txt
 CMakeFiles/
 compile_commands.json
+
+# Intan reference framework (STM32Cube projects; не коммитить бинарники/HAL tree)
+Intan RHS2116/Intan_RHD_RHS_STM32_Framework_v1_2/**/Debug/
+Intan RHS2116/Intan_RHD_RHS_STM32_Framework_v1_2/**/Release/
+Intan RHS2116/Intan_RHD_RHS_STM32_Framework_v1_2/**/Drivers/
+Intan RHS2116/Intan_RHD_RHS_STM32_Framework_v1_2/**/Middlewares/

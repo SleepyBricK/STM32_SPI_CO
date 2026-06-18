@@ -1,12 +1,11 @@
 /**
  * @file intan_spi.h
- * @brief Intan RHS2116 — логика SPI как в msu-neuro-terminal-linux (intan_spi.c):
- *        три отдельных CS-фрейма на READ/WRITE/CONVERT, по 32 бита за фрейм (HAL Size=1).
+ * @brief Intan RHS2116 — SPI: три отдельных CS-фрейма на READ/WRITE/CONVERT, 32 бита за фрейм.
  *
  * Целевая МК: STM32H743VIT6 (как в WeActSTM32H743.ioc, макрос сборки STM32H743xx).
  *
  * Пины (при необходимости поменяйте в этом файле):
- * - CS: PE11 (активный низкий)
+ * - CS: PA11 SPI2_NSS (INTAN_CS_HW_NSS=1, pulsed NSS) или PE11 GPIO/TIM1 (legacy).
  */
 
 #ifndef INTAN_SPI_H
@@ -41,9 +40,21 @@ static inline uint8_t Intan_HW_IsPresent(void)
 /** CONVERT: ADC в RX-слоте k относится к TX-слоту k − LATENCY. */
 #define INTAN_CONVERT_PIPELINE_LATENCY 2U
 
-/* Chip Select: выход, idle = high */
+/*
+ * INTAN_CS_HW_NSS=1: CS на PA11 = SPI2_NSS, аппаратный pulsed NSS (см. ST Community NSSP+MIDI).
+ * INTAN_CS_HW_NSS=0: CS на PE11, программный GPIO / TIM1_CH2.
+ */
+#ifndef INTAN_CS_HW_NSS
+#define INTAN_CS_HW_NSS  0
+#endif
+
+#if INTAN_CS_HW_NSS
+#define INTAN_CS_GPIO_PORT   GPIOA
+#define INTAN_CS_PIN         GPIO_PIN_11
+#else
 #define INTAN_CS_GPIO_PORT   GPIOE
 #define INTAN_CS_PIN         GPIO_PIN_11
+#endif
 
 typedef struct {
   uint8_t channel;
@@ -82,9 +93,10 @@ uint8_t Intan_SPI_IsReady(void);
 /** Вызывается из busy-wait SPI/DMA (например при длительном bench). NULL = off. */
 typedef void (*Intan_IdleHookFn)(void *ctx);
 void Intan_SetIdleHook(Intan_IdleHookFn fn, void *ctx);
+uint8_t Intan_TimslotBurstIsActive(void);
 
 /**
- * Минимальная последовательность после power-up (даташит / msu-neuro changelog):
+ * Минимальная последовательность после power-up (даташит RHS2116):
  * CLEAR ADC, R38=0xFFFF (power bug DC), очистка битов «weak» drive в R1 (маска 0x9000).
  * Не заменяет полный INIT_RECORD/INIT_STIM.
  */
@@ -97,6 +109,10 @@ HAL_StatusTypeDef Intan_WriteReg(uint8_t reg_addr, uint16_t value, uint8_t u_fla
 HAL_StatusTypeDef Intan_Convert(uint8_t channel, uint8_t flags, uint16_t *value);
 HAL_StatusTypeDef Intan_ConvertPipeline(uint32_t n, uint8_t channel, uint8_t flags, uint16_t *last_value);
 HAL_StatusTypeDef Intan_ConvertPipelineRead(uint32_t n, uint8_t channel, uint8_t flags, uint16_t *samples);
+HAL_StatusTypeDef Intan_ConvertPipelineReadRR(uint32_t n, uint8_t n_ch, uint8_t flags,
+                                              uint16_t *samples, uint8_t *phase_io);
+HAL_StatusTypeDef Intan_ConvertPipelineReadRange(uint32_t n, uint8_t first_ch, uint8_t n_ch,
+                                                 uint8_t flags, uint16_t *samples, uint8_t *phase_io);
 /** Conservative pipelined polling path: GPIO CS/timing from intan_xfer32(), no DMA/TIM CS. */
 HAL_StatusTypeDef Intan_ConvertPipelineSafeRead(uint32_t n, uint8_t channel, uint8_t flags,
                                                 uint16_t *samples);
@@ -125,9 +141,9 @@ typedef enum {
 
 void Intan_StreamDmaReset(void);
 HAL_StatusTypeDef Intan_StreamDmaStartSingle(uint32_t n, uint8_t channel, uint8_t flags,
-                                             uint16_t *samples);
+                                             uint16_t *samples, uint8_t continuing_sub);
 HAL_StatusTypeDef Intan_StreamDmaStartRange(uint32_t n, uint8_t first_ch, uint8_t n_ch, uint8_t flags,
-                                            uint16_t *samples, uint8_t *phase_io);
+                                            uint16_t *samples, uint8_t *phase_io, uint8_t continuing_sub);
 IntanStreamDmaState Intan_StreamDmaPoll(void);
 HAL_StatusTypeDef Intan_StreamDmaComplete(uint8_t halt_after);
 
@@ -154,10 +170,30 @@ void Intan_SetDmaStreamChannelCount(uint8_t channel_count);
 
 void Intan_SpiStats_Reset(void);
 uint32_t Intan_SpiStats_GetXfer32Count(void);
+uint32_t Intan_GetSampleClipCount(void);
+void Intan_BumpSampleClip(void);
 uint32_t Intan_GetLastUnpackRxOffset(void);
 uint8_t Intan_PipelineChannelIndex(uint8_t phase, uint32_t sample_index, uint32_t rx_offset,
                                    uint8_t n_ch);
 void Intan_SpiStats_AddXfer32(uint32_t count);
+
+/** NSS pulsed stream: MIDI idle cycles (0..15) между 32-bit кадрами; меньше → быстрее. */
+void Intan_SetStreamMidiCycles(uint8_t cycles);
+uint8_t Intan_GetStreamMidiCycles(void);
+uint32_t Intan_StreamMidiHal(void);
+/** SPI2 SCK делитель от kernel (2,4,8,16,32,64,128,256); только при idle stream. */
+HAL_StatusTypeDef Intan_SetSpiPrescalerDiv(uint32_t div);
+uint32_t Intan_GetSpiPrescalerDiv(void);
+
+/** Pack RHS2116 CONVERT command word (same wire format as Intan convert_command()). */
+uint32_t Intan_BuildConvertCmd(uint8_t channel, uint8_t flags);
+
+/** Intan Framework path: one SPI DMA sequence (HW NSS), non-blocking. */
+HAL_StatusTypeDef Intan_FwSpiDmaBegin(const uint32_t *tx_words, uint32_t *rx_words, uint32_t n_words);
+uint8_t Intan_FwSpiDmaPollDone(void);
+/** Re-arm an active FW DMA burst without full SPI/DMAMUX teardown (free-run only). */
+HAL_StatusTypeDef Intan_FwSpiDmaRestart(uint32_t n_words);
+void Intan_FwSpiDmaEnd(void);
 
 #ifdef __cplusplus
 }

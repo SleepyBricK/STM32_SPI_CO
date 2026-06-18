@@ -146,7 +146,7 @@ Velec_uV = 0.195 * ADC_code_amplitude
 - `scale_bits=1`: около `38 uV peak`.
 - `scale_bits=3`: около `380 uV peak`.
 
-GUI/server считает амплитуду из `sin_accum/cos_accum` через zero-mean basis. Для ручной проверки используйте тот же алгоритм, что в `msu-neuro-terminal-linux/services/server/intan_tcp_server.py` в `_compute_impedance_metrics_from_accumulators`.
+Прошивка считает амплитуду из `sin_accum/cos_accum` через zero-mean basis (см. `IMPEDANCE_MEASURE` в `Core/Src/usb_stream_service.c`).
 
 ## Проверенный режим для 10 kOhm
 

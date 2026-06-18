@@ -1,1 +1,0 @@
-cmd_/home/orangepi/msu-neuro-terminal-linux/driver/Module.symvers :=  sed 's/ko$$/o/'  /home/orangepi/msu-neuro-terminal-linux/driver/modules.order | scripts/mod/modpost      -o /home/orangepi/msu-neuro-terminal-linux/driver/Module.symvers -e -i Module.symvers -T - 

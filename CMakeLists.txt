@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_pattern.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_uart_cli.c
     ${CMAKE_SOURCE_DIR}/Core/Src/intan_stream.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/intan_fw_acq.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usb_stream_frame.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usb_stream_ring.c
     ${CMAKE_SOURCE_DIR}/Core/Src/usb_stream_service.c
@@ -76,8 +77,10 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${STM32CUBE_H7_ROOT}/Drivers/STM32H7xx_HAL_Driver/Inc
 )
 
-# User: Intan RHS2116 on SPI2 (PE11 CS). OFF by default.
+# User: Intan RHS2116 on SPI2. OFF by default.
 option(WITH_INTAN_HW "Intan RHS2116 soldered on SPI2" OFF)
+# CS: PA11 SPI2_NSS pulsed (пайка к Intan CS). OFF = legacy PE11 GPIO/TIM1.
+option(INTAN_CS_HW_NSS "Intan CS via SPI2_NSS PA11 (pulsed NSS)" ON)
 # User: 32.768 kHz LSE on PC14/PC15. OFF if crystal not populated.
 option(BOARD_HAS_LSE "Board has 32.768 kHz LSE on PC14/PC15" OFF)
 # User: 480 MHz SYSCLK (VOS0) — основной режим проекта. 240 MHz — legacy (WorkingVER).
@@ -91,6 +94,7 @@ endif()
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     INTAN_HW_PRESENT=$<IF:$<BOOL:${WITH_INTAN_HW}>,1,0>
+    INTAN_CS_HW_NSS=$<IF:$<BOOL:${INTAN_CS_HW_NSS}>,1,0>
     BOARD_HAS_LSE=$<IF:$<BOOL:${BOARD_HAS_LSE}>,1,0>
     BOARD_SYSCLK_480=$<IF:$<BOOL:${BOARD_SYSCLK_480}>,1,0>
 )

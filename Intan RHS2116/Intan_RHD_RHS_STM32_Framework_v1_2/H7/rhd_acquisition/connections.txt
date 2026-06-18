@@ -1,0 +1,21 @@
+--- Power ---
+VDD: B6 - Labeled 3V3, CN8, left side, 4th from top			VDD
+GND: T6 - GND								GND
+
+--- Timing ---
+Interrupt_Monitor - CN11 left side, 1st from bot			PD9
+Main_Monitor - CN12 right side, 1st from top				PC8
+
+--- SPI ---
+SPI3 CS: B1 - CN11, right side, 16th from top (next to A2)		PA4
+SPI3 SCLK: B2 - CN11, left side, 1st from top				PC10
+SPI3 MOSI: B3 - CN12, right side, 11th from top				PB2
+SPI3 MISO: B4 - CN11, right side, 1st from top				PC11
+
+--- User communication ---
+ErrorCode_Bit_3 - CN12 right side, 4th from bot				PE0
+ErrorCode_Bit_2 - CN12 right side, 3rd from bot				PG8
+ErrorCode_Bit_1 - CN12 right side, 2nd from bot				PG5
+ErrorCode_Bit_0 - CN12 right side, 1st from bot				PG6
+LED_GREEN								PB0
+LED_RED (Error detected - check bits 3-0)				PB14

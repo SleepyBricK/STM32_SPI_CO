@@ -74,6 +74,22 @@ UsbCommand UsbCommands_ParseLine(const char *line)
     return cmd;
   }
 
+  if (streq_ci(tok, "NSS_MIDI"))
+  {
+    cmd.id = USB_CMD_NSS_MIDI;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_PSCL"))
+  {
+    cmd.id = USB_CMD_SPI_PSCL;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 0) : 0U;
+    return cmd;
+  }
+
   if (streq_ci(tok, "SYNTH_STREAM"))
   {
     tok = strtok_r(NULL, " \t", &ctx);
@@ -362,6 +378,32 @@ UsbCommand UsbCommands_ParseLine(const char *line)
   if (streq_ci(tok, "SPI_STREAM_REAL_LEGACY"))
   {
     cmd.id = USB_CMD_SPI_STREAM_REAL_LEGACY;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_STREAM_FW"))
+  {
+    cmd.id = USB_CMD_SPI_STREAM_FW;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg1 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg2 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    tok = strtok_r(NULL, " \t", &ctx);
+    cmd.arg3 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
+    return cmd;
+  }
+
+  if (streq_ci(tok, "SPI_STREAM_FW_MAX"))
+  {
+    cmd.id = USB_CMD_SPI_STREAM_FW_MAX;
     tok = strtok_r(NULL, " \t", &ctx);
     cmd.arg0 = (tok != NULL) ? (uint32_t)strtoul(tok, NULL, 10) : 0U;
     tok = strtok_r(NULL, " \t", &ctx);

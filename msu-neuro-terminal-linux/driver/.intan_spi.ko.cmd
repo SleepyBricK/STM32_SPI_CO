@@ -1,1 +1,0 @@
-cmd_/home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.ko := ld -r -EL  -maarch64elf -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T scripts/module.lds -o /home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.ko /home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.o /home/orangepi/msu-neuro-terminal-linux/driver/intan_spi.mod.o;  true

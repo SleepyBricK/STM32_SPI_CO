@@ -1,7 +1,6 @@
 /**
  * @file intan_app.h
  * @brief Высокоуровневые сценарии Intan RHS2116 (инициализация, стимуляция, бенч CONVERT).
- *        Согласовано с msu-neuro-terminal-linux (stimulate_channel0.py, intan_udp_recorder.py).
  */
 
 #ifndef INTAN_APP_H

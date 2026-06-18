@@ -1,0 +1,27 @@
+--- Power ---
+VDD: B6 - Labeled 3V3, CN8, left side, 4th from top			VDD
+GND: T6 - GND								GND
+
+--- Timing ---
+Interrupt_Monitor - CN11 left side, 1st from bot			PD9
+Main_Monitor - CN12 right side, 1st from top				PC8
+TIM2_ETR - CN11 right side, 14th from top				PA0	wired to SPI3 CS - used to trigger timer pulse train ultimately user for 32-pulse SPI1 SCLK
+TIM2_CH3 - CN12 left side, 13th from bot				PB10	not connected to anything, just can be probed to see TIM2 output used to internally trigger TIM1
+TIM1_CH1 - CN12 right side, 10th from bot				PE9	wired to SPI1 SCLK - carries 32-pulse SPI1 SCLK
+
+--- SPI ---
+SPI3 CS: B1 - CN11, right side, 16th from top (next to A2)		PA4	wired to SPI1 CS
+SPI1 CS: B1 - CN11, left side, 9th from top				PA15	wired to SPI3 CS
+SPI3 SCLK: B2 - CN11, left side, 1st from top				PC10
+SPI1 SCLK: CN11, right side, 15th from top (next to A1)			PA5	not connected to actual hardware, wired to TIM1_CH1 for internals
+SPI3 MOSI: B3 - CN12, right side, 11th from top				PB2
+SPI3 MISO: B4 - CN11, right side, 1st from top				PC11	(only rhd_acquisition, wired to SPI1 MOSI - not used in rhd2164_acquisition)
+SPI1 MOSI: B4 - CN11, left side, 13th from bot				PD7	wired to SPI3 MISO
+
+--- User communication ---
+ErrorCode_Bit_3 - CN12 right side, 4th from bot				PE0
+ErrorCode_Bit_2 - CN12 right side, 3rd from bot				PG8
+ErrorCode_Bit_1 - CN12 right side, 2nd from bot				PG5
+ErrorCode_Bit_0 - CN12 right side, 1st from bot				PG6
+LED_GREEN								PB0
+LED_RED (Error detected - check bits 3-0)				PB14

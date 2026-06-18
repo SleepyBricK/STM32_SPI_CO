@@ -16,6 +16,8 @@ void IntanStream_PushCounterBlock(uint32_t base, uint32_t count);
 void IntanStream_PushBlock(const uint16_t *src, uint32_t count);
 void IntanStream_PushBlockTaggedFromAdc(const uint16_t *adc, uint32_t count, uint8_t first_channel,
                                         uint8_t channel_count, uint8_t phase, uint32_t rx_offset);
+/** Push one Intan FW sequence: adc[0..15] → tagged words ch0..ch15. */
+void IntanStream_PushFwSequence16(const uint16_t adc_by_channel[16]);
 uint32_t IntanStream_PeekNextSample(void);
 uint8_t IntanStream_IsActive(void);
 

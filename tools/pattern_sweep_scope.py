@@ -14,9 +14,14 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
+from pattern_sweep_lib import (  # noqa: E402
+    DEFAULT_GAP_MS,
+    DEFAULT_REPEAT,
+    SWEEP_ON_US,
+    prep_and_load_sweep,
+)
 from usb_intan_lib import close_device, open_device, run_text_command  # noqa: E402
 
-SWEEP_ON_US = [500, 200, 100, 50, 20, 10]
 CURRENT_UA = 180
 CH = 2
 
@@ -26,30 +31,6 @@ def cmd(dev, text: str, *, timeout_ms: int = 120_000) -> str:
     if reply.startswith("ERR"):
         raise RuntimeError(f"{text!r} -> {reply}")
     return reply
-
-
-def prep_and_load_sweep(dev, ch: int, current_ua: int, on_us_list: list[int]) -> str:
-    reg_val = 0x8000 | (current_ua & 0xFF)
-    mask = 1 << ch
-    neg = (0x80 << 24) | ((64 + ch) << 16) | reg_val
-    pos = (0x80 << 24) | ((96 + ch) << 16) | reg_val
-
-    cmd(dev, "INIT_STIM")
-    cmd(dev, "WRITE 42 0 1 0")
-    cmd(dev, "CLEAR_COMP")
-    cmd(dev, f"WRITE {64 + ch} {reg_val:#x} 0 0")
-    cmd(dev, f"WRITE {96 + ch} {reg_val:#x} 0 0")
-
-    cmd(dev, "PATTERN_CLEAR")
-    cmd(dev, f"PATTERN_ADD_RAW {neg:#x}")
-    cmd(dev, f"PATTERN_ADD_RAW {pos:#x}")
-    cmd(dev, f"PATTERN_ADD_WRITE 44 {mask} 0 0")
-    for us in on_us_list:
-        cmd(dev, f"PATTERN_ADD_WRITE 42 {mask} 1 0")
-        cmd(dev, f"PATTERN_ADD_DELAY_US {us}")
-        cmd(dev, "PATTERN_ADD_WRITE 42 0 1 0")
-        cmd(dev, f"PATTERN_ADD_DELAY_US {us}")
-    return cmd(dev, "PATTERN_STATUS")
 
 
 def measure_pulses(t: np.ndarray, v: np.ndarray, thr: float) -> tuple[list[float], list[float], list[float]]:
@@ -76,7 +57,14 @@ def measure_pulses(t: np.ndarray, v: np.ndarray, thr: float) -> tuple[list[float
     return widths, rts, fts
 
 
-def capture_during_run(moku_addr: str, scope_input: int, repeat: int, dev) -> tuple[np.ndarray, np.ndarray, float]:
+def capture_during_run(
+    moku_addr: str,
+    scope_input: int,
+    repeat: int,
+    dev,
+    *,
+    gap_ms: int = DEFAULT_GAP_MS,
+) -> tuple[np.ndarray, np.ndarray, float]:
     from moku.instruments import Oscilloscope
 
     osc = Oscilloscope(moku_addr, force_connect=True)
@@ -85,44 +73,50 @@ def capture_during_run(moku_addr: str, scope_input: int, repeat: int, dev) -> tu
         osc.set_defaults()
         osc.set_frontend(scope_input, "1MOhm", "DC", "10Vpp")
         osc.set_source(scope_input, src)
-        osc.set_timebase(-0.001, 0.030, max_length=8192)
+        span_s = max(0.08, repeat * (gap_ms / 1000.0 + 0.02))
+        osc.set_timebase(-0.01, span_s, max_length=8192)
         osc.set_trigger(type="Edge", mode="Auto", edge="Rising", level=0.0, source=src)
         osc.set_acquisition_mode("Normal")
 
         best: dict[str, object] = {"score": -1.0}
         peaks: list[float] = []
-        stop = threading.Event()
+        pat_done = threading.Event()
 
-        def poll() -> None:
-            while not stop.is_set():
-                try:
-                    frame = osc.get_data(timeout=1, wait_reacquire=True, wait_complete=True)
-                    v = np.asarray(frame[f"ch{scope_input}"], dtype=float)
-                    t = np.asarray(frame["time"], dtype=float)
-                    peak = float(np.max(v))
-                    peaks.append(peak)
-                    thr = 0.35
-                    widths, _, _ = measure_pulses(t, v, thr)
-                    score = len(widths) * 1000 + peak
-                    if score > best["score"]:
-                        best["score"] = score
-                        best["t"] = t
-                        best["v"] = v
-                except Exception:
-                    pass
+        def run_pattern() -> None:
+            try:
+                cmd(dev, f"PATTERN_RUN {repeat}")
+                cmd(dev, "WRITE 42 0 1 0")
+            finally:
+                pat_done.set()
 
-        poller = threading.Thread(target=poll, daemon=True)
-        poller.start()
+        th = threading.Thread(target=run_pattern, daemon=True)
+        th.start()
         t0 = time.time()
-        cmd(dev, f"PATTERN_RUN {repeat}")
-        cmd(dev, "WRITE 42 0 1 0")
+        while not pat_done.is_set():
+            try:
+                frame = osc.get_data(timeout=1, wait_reacquire=True, wait_complete=True)
+                v = np.asarray(frame[f"ch{scope_input}"], dtype=float)
+                t = np.asarray(frame["time"], dtype=float)
+                peak = float(np.max(v))
+                ptp = float(np.max(v) - np.min(v))
+                peaks.append(peak)
+                thr = max(0.35, float(np.median(v)) + 0.25 * ptp)
+                widths, _, _ = measure_pulses(t, v, thr)
+                score = len(widths) * 1000 + peak
+                if score > best["score"]:
+                    best["score"] = score
+                    best["t"] = t
+                    best["v"] = v
+            except Exception as exc:
+                print(f"  poll warn: {exc}")
+            time.sleep(0.03)
+
+        th.join(timeout=max(120.0, repeat * (gap_ms / 1000.0 + 1.0)))
         elapsed = time.time() - t0
-        stop.set()
-        poller.join(timeout=3.0)
 
         if peaks:
             print(f"Poll peaks: max={max(peaks):.3f} V, samples={len(peaks)}")
-        if "t" not in best or best.get("score", -1) < 100:
+        if "t" not in best or best.get("score", -1) < 0.5:
             raise RuntimeError(
                 f"Не удалось снять стим на Input{scope_input} "
                 f"(peak poll={max(peaks) if peaks else 0:.3f} V)"
@@ -184,7 +178,8 @@ def main() -> int:
     parser.add_argument("--scope-input", type=int, default=1)
     parser.add_argument("--ch", type=int, default=CH)
     parser.add_argument("--current-ua", type=int, default=CURRENT_UA)
-    parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--repeat", type=int, default=DEFAULT_REPEAT)
+    parser.add_argument("--gap-ms", type=int, default=DEFAULT_GAP_MS)
     parser.add_argument("--no-reset", action="store_true")
     parser.add_argument("--plot", default="tools/pattern_sweep_result.png")
     args = parser.parse_args()
@@ -194,15 +189,19 @@ def main() -> int:
     print("=" * 70)
     print(f"ch{args.ch}, {args.current_ua} µA, 10 kΩ, Input{args.scope_input}")
     print(f"ON widths (µs): {SWEEP_ON_US}  (OFF delay = ON)")
-    print(f"PATTERN_RUN repeat: {args.repeat}")
+    print(f"PATTERN_RUN repeat: {args.repeat}, gap between sweeps: {args.gap_ms} ms")
     print()
 
     dev, ifn = open_device(reset=not args.no_reset)
     try:
-        status = prep_and_load_sweep(dev, args.ch, args.current_ua, SWEEP_ON_US)
+        status = prep_and_load_sweep(
+            dev, args.ch, args.current_ua, SWEEP_ON_US, cmd, gap_ms=args.gap_ms
+        )
         print("Pattern:", status)
 
-        t, v, wall_s = capture_during_run(args.moku, args.scope_input, args.repeat, dev)
+        t, v, wall_s = capture_during_run(
+            args.moku, args.scope_input, args.repeat, dev, gap_ms=args.gap_ms
+        )
         print(f"Wall PATTERN_RUN {args.repeat}: {wall_s * 1e3:.1f} ms")
         print(f"Peak: {float(np.max(v)):.3f} V")
         print()

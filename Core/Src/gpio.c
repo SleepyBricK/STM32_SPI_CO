@@ -52,7 +52,7 @@ void MX_GPIO_Init(void)
   {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    /* Неиспользуемые PE (PE11 = CS Intan настраивается в intan_spi). */
+    /* Неиспользуемые PE; Intan CS: PA11 SPI2_NSS (HW) или PE11 GPIO (legacy). */
     GPIO_InitStruct.Pin = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_7 | GPIO_PIN_8
                         | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_12
                         | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15 | GPIO_PIN_0

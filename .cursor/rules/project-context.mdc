@@ -5,7 +5,7 @@ alwaysApply: true
 
 # WeActSTM32H743
 
-Перед изменениями или при неясной архитектуре **прочитайте корневой файл `AGENTS.md`**: там МК STM32H743VIT6, HSE 8 MHz, пины SPI2/USART1, договорённости по Intan RHS2116 (`intan_spi.c` / 32-битные кадры, CS PE11), сборка CMake и ссылка на `msu-neuro-terminal-linux/`.
+Перед изменениями или при неясной архитектуре **прочитайте корневой файл `AGENTS.md`**: там МК STM32H743VIT6, HSE 8 MHz, пины SPI2/USART1, договорённости по Intan RHS2116 (`intan_spi.c` / 32-битные кадры, CS PE11), сборка CMake и host-скрипты в `tools/`.
 
 ## Intan RHS2116: CS между каждой командой (обязательно)
 

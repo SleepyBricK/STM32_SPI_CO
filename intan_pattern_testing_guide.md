@@ -1,11 +1,10 @@
-# Гайд по тестированию Intan RHS2116 (STM32 + Pi + GUI + осциллограф)
+# Гайд по тестированию Intan RHS2116 (STM32 + host + осциллограф)
 
 Практический порядок проверки **стим-паттернов**, **таймингов** и **импеданса** для связки:
 
 ```text
 ПК ──USB── STM32 (0483:5741) ──SPI── Intan RHS2116
 ПК ──USB── Moku Go (осциллограф на нагрузке)
-ПК ──TCP:9000── Orange Pi ──USB── STM32   (опционально, через GUI)
 ```
 
 Типовая нагрузка для проверки: **10 kΩ между ch2 и GND**, ток **180 µA**, импульс **`PATTERN_ADD_DELAY_US 100`**.
@@ -15,7 +14,7 @@
 | Тема | Файл |
 |------|------|
 | Формат `PATTERN_*`, RAW-слова | [`intan_stim_pattern_guide.md`](intan_stim_pattern_guide.md) |
-| Orange Pi + GUI | [`intan_pi_gui_guide.md`](intan_pi_gui_guide.md) |
+| USB CLI (`PATTERN_*`, stream) | [`tools/usb_intan_cmd.py`](tools/usb_intan_cmd.py) |
 | `IMPEDANCE_MEASURE` | [`intan_impedance_guide.md`](intan_impedance_guide.md) |
 | Wall-clock bench | [`tools/test_pattern_timing.py`](tools/test_pattern_timing.py) |
 
@@ -94,11 +93,11 @@ python3 tools/usb_intan_cmd.py ID --no-reset
 | `sck_khz` | **25000** |
 | `ID` | chip=32 (RHS2116) |
 
-### 3.2. Orange Pi (если тест через GUI)
+### 3.2. USB CLI (host)
 
 ```bash
-python3 intan_server.py --backend usb --verbose
-lsusb -d 0483:5741
+python3 tools/usb_intan_cmd.py PING
+python3 tools/usb_intan_cmd.py ID --no-reset
 ```
 
 ### 3.3. Prep стима (перед паттерном)
@@ -109,7 +108,7 @@ python3 tools/usb_intan_cmd.py "WRITE 42 0 1 0" --no-reset
 python3 tools/usb_intan_cmd.py CLEAR_COMP --no-reset
 ```
 
-На Pi то же выполняется в `_prepare_pattern_load_state()` при `pattern_load`.
+На host то же через `tools/usb_intan_cmd.py` перед `PATTERN_LOAD`.
 
 ---
 
@@ -195,31 +194,28 @@ slots = 1 (polarity) + N × 4 + [+3 safety OFF на сервере]
 
 ---
 
-## 6. Тест C — GUI / Orange Pi
+## 6. Тест C — USB CLI (`PATTERN_*`)
 
-### 6.1. Порядок в GUI
+### 6.1. Порядок
 
-1. Подключиться к Pi (TCP **9000**).
-2. «📄 Пример» или паттерн из редактора.
-3. **Загрузить паттерn** → TCP `pattern_load`.
-4. **Запустить** → TCP `pattern_run` с `repeat_count`.
+1. `INIT_STIM`, `WRITE 42 0 1 0`, `CLEAR_COMP` (см. §3.3).
+2. Загрузить паттерн: `PATTERN_CLEAR`, серия `PATTERN_ADD_*`, `PATTERN_END`.
+3. Запуск: `PATTERN_RUN <repeat>`.
 
-Файл GUI: `msu-neuro-terminal-linux/services/gui/intan_gui_new.py`.
+Пример через `tools/usb_intan_cmd.py` или `tools/test_pattern_timing.py`.
 
-### 6.2. Что сверить в логе
+### 6.2. Что сверить
 
-- `commands_count` ≈ оценка слотов GUI (~**7** для одного импульса 100 µs: 6 + auto safety +3, если safety добавляет сервер).
+- `commands_count` в `PATTERN_STATUS` ≈ число слотов в паттерне.
 - Только **`PATTERN_ADD_DELAY_US`**, не legacy **`DELAY`**.
 - **Нет паузы после последнего OFF** (лишний хвост на осцилле).
 
-### 6.3. Типичные ошибки Pi/GUI
+### 6.3. Типичные ошибки
 
 | Симптом | Причина |
 |---------|---------|
 | Пауза ~300 µs при команде 100 µs между импульсами | **100 µs delay + ~150 µs SPI** (OFF + re-ON) — норма для wall-clock |
 | `DELAY 500` в паттерне | На STM32 → **640 µs** (N × 1.28 µs SPI-slot), **не** 500 ms |
-| Слотов в GUI ≠ Pi | Считать **слоты**; +3 auto safety на сервере |
-| `PATTERN_ADD_WRITE` не в load | Должен проходить в `pattern_load` (исправлено в GUI) |
 
 ---
 
@@ -359,6 +355,4 @@ actual_freq_millihz=1000000
 | `Core/Src/intan_pattern.c` | Очередь паттерна, DWT delay |
 | `Core/Src/intan_spi.c` | `Intan_DmaPathRelease`, SPI/CS |
 | `tools/test_pattern_timing.py` | Wall-clock bench |
-| `tools/usb_intan_cmd.py` | CLI USB |
-| `msu-neuro-terminal-linux/services/gui/intan_gui_new.py` | GUI паттернов |
-| `msu-neuro-terminal-linux/services/server/intan_tcp_server.py` | `pattern_load` / `pattern_run` |
+| `tools/usb_intan_cmd.py` | CLI USB (`PATTERN_LOAD`, `PATTERN_RUN`, …) |

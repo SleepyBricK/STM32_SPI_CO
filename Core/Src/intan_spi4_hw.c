@@ -64,6 +64,10 @@ HAL_StatusTypeDef Intan_SPI4_HwInit(SPI_HandleTypeDef *hspi)
   {
     SET_BIT(hspi->Instance->CR1, SPI_CR1_SSI);
   }
+  else
+  {
+    CLEAR_BIT(hspi->Instance->CR1, SPI_CR1_SSI);
+  }
 
   if ((hspi->Init.Mode & SPI_MODE_MASTER) == SPI_MODE_MASTER)
   {

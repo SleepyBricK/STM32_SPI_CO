@@ -29,6 +29,7 @@
 #include "intan_uart_cli.h"
 #include "usb_device.h"
 #include "usb_stream_service.h"
+#include "intan_fw_acq.h"
 #include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
@@ -138,8 +139,31 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     UsbVendorBulk_ProcessOutCommands();
+#if (INTAN_HW_PRESENT == 1)
+    if (IntanFw_StreamUsesHotLoop() != 0U && IntanFw_StreamIsActive() != 0U)
+    {
+      while (IntanFw_StreamIsActive() != 0U)
+      {
+        UsbStreamService_TxPump();
+        IntanFw_Process();
+        UsbStreamService_TxPump();
+      }
+    }
+    else
+    {
+      UsbStreamService_TxPump();
+      UsbStreamService_Process();
+      if (IntanFw_StreamIsActive() != 0U)
+      {
+        IntanFw_Process();
+      }
+      UsbStreamService_TxPump();
+    }
+#else
+    UsbStreamService_TxPump();
     UsbStreamService_Process();
     UsbStreamService_TxPump();
+#endif
     Intan_UART_CLI_Process();
   }
   /* USER CODE END 3 */
