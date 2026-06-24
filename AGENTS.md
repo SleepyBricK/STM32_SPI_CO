@@ -55,7 +55,7 @@
 - `INTAN_FW_KSPS_DEFAULT` = 40 kS/s/ch. Пропущенный или нулевой `ksps` также выбирает 40.
 - RR8 с `ksps >= 15` использует DWT phase-paced hot loop, а не TIM6.
 - Для production RR8 (`ksps=40`) перед стартом принудительно применяются `PSCL=8` и `MIDI=4`; `NSS_MIDI` и `SPI_PSCL` во время active/armed FW stream отвечают `ERR busy`. Legacy/solo и rate diagnostic пути остаются tunable.
-- `STOP` в hot loop принимается через OUT, завершает текущую DMA sequence на EOT и только затем abort'ит активный USB frame и сбрасывает ring. DMA sequence имеет 1 ms DWT deadline; fault/timeout останавливает stream, счётчик `fw_dma_err` доступен в `STATS`.
+- `STOP` в hot loop принимается через OUT, завершает текущую DMA sequence на EOT и только затем abort'ит активный USB frame и сбрасывает ring. DMA sequence имеет 1 ms DWT deadline; production RR8 останавливается и увеличивает `fw_dma_err` только по timeout. `Intan_FwSpiDmaHasError()` остаётся диагностическим: H7 master status (включая `SPI_SR_UDR`, slave-TX flag) даёт false positive и не используется в hot loop.
 - Валидировано: 10 s, `sample_clip=0`, `usb_ovf=0`; ch2 с 10 kOhm на GND около 64 uV RMS.
 - Не использовать для production: `ksps >= 55`, `SPI_STREAM_FW_MAX` и solo stream перед RR8.
 

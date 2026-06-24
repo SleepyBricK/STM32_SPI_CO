@@ -3411,7 +3411,19 @@ uint8_t Intan_FwSpiDmaPollDone(void)
 
 uint8_t Intan_FwSpiDmaHasError(void)
 {
-  const uint32_t spi_errors = SPI_SR_UDR | SPI_SR_OVR | SPI_SR_MODF;
+  /*
+   * UDR is defined by the H7 SPI as "underrun at slave transmission".
+   * SPI2 is configured as a master here, so it is not a valid indication
+   * that this full-duplex master DMA transaction has failed.  In particular,
+   * checking it after CSTART made the phase-1 recovery path stop an otherwise
+   * progressing RR8 stream.
+   *
+   * Keep this helper for diagnostics, but do not use it for RR8 hot-loop
+   * recovery: H7 SPI master status around CSTART/NSS can produce transient
+   * OVR/MODF indications despite a completed EOT transfer.  The hot loop
+   * treats only a missing EOT at its DWT deadline as a recovery failure.
+   */
+  const uint32_t spi_errors = SPI_SR_OVR | SPI_SR_MODF;
   const uint32_t dma_errors = DMA_LISR_TEIF0 | DMA_LISR_DMEIF0 | DMA_LISR_FEIF0 |
                               DMA_LISR_TEIF1 | DMA_LISR_DMEIF1 | DMA_LISR_FEIF1;
 

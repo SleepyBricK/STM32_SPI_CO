@@ -66,7 +66,7 @@ The binary stream uses `RHS1` frames of exactly 4096 bytes:
 
 The frame ABI is defined in [usb_stream_frame.h](Core/Inc/usb_stream_frame.h). `reserved` contains stream metadata: first channel, channel count, CONVERT flags, and channel-tag width.
 
-The USB PCD intentionally runs without peripheral DMA. The producer does not wait for USB; a full ring increments `usb_overflow_count`. `STOP` is accepted in the hot loop, completes the current SPI DMA sequence at EOT, then aborts an active frame transfer before the ring buffer is reset. A 1 ms DWT deadline aborts a failed Framework DMA sequence; `STATS` reports the cumulative `fw_dma_err` count.
+The USB PCD intentionally runs without peripheral DMA. The producer does not wait for USB; a full ring increments `usb_overflow_count`. `STOP` is accepted in the hot loop, completes the current SPI DMA sequence at EOT, then aborts an active frame transfer before the ring buffer is reset. Production RR8 recovery is timeout-only: a missing EOT at the 1 ms DWT deadline aborts the Framework DMA sequence and increments `fw_dma_err`. `Intan_FwSpiDmaHasError()` remains diagnostic only because H7 master SPI status can report false positives; `SPI_SR_UDR` is slave-TX-only.
 
 ## Commands
 

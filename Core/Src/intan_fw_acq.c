@@ -486,15 +486,19 @@ void IntanFw_Process(void)
 
     if (s_xfer_state == FW_XFER_WAIT)
     {
-      if (Intan_FwSpiDmaHasError() != 0U ||
-          (DWT->CYCCNT - s_xfer_start_cyc) > FW_SPI_DMA_TIMEOUT_CYC)
-      {
-        fw_abort_dma_failure();
-        return;
-      }
+      /*
+       * The H7 SPI status flags can be asserted during a valid master NSS
+       * sequence.  The RR8 hot path therefore recovers only on a missing EOT
+       * after the 1 ms DWT deadline; Intan_FwSpiDmaHasError() is diagnostic.
+       */
       if (Intan_FwSpiDmaPollDone() != 0U)
       {
         fw_spi_dma_complete();
+      }
+      else if ((DWT->CYCCNT - s_xfer_start_cyc) > FW_SPI_DMA_TIMEOUT_CYC)
+      {
+        fw_abort_dma_failure();
+        return;
       }
     }
 
