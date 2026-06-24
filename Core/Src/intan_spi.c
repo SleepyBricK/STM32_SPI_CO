@@ -3409,6 +3409,21 @@ uint8_t Intan_FwSpiDmaPollDone(void)
   return 1U;
 }
 
+uint8_t Intan_FwSpiDmaHasError(void)
+{
+  const uint32_t spi_errors = SPI_SR_UDR | SPI_SR_OVR | SPI_SR_MODF;
+  const uint32_t dma_errors = DMA_LISR_TEIF0 | DMA_LISR_DMEIF0 | DMA_LISR_FEIF0 |
+                              DMA_LISR_TEIF1 | DMA_LISR_DMEIF1 | DMA_LISR_FEIF1;
+
+  if (s_fw_spi_dma_active == 0U)
+  {
+    return 0U;
+  }
+
+  return (((INTAN_SPI_INSTANCE->SR & spi_errors) != 0U) ||
+          ((DMA1->LISR & dma_errors) != 0U)) ? 1U : 0U;
+}
+
 HAL_StatusTypeDef Intan_FwSpiDmaRestart(uint32_t n_words)
 {
   const uint32_t dma_stream0_flags = DMA_LIFCR_CFEIF0 | DMA_LIFCR_CDMEIF0 | DMA_LIFCR_CTEIF0 |

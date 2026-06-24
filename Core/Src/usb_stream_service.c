@@ -55,6 +55,7 @@ static uint16_t s_spi_buf[SPI_STREAM_AGG_MAX]
 
 static UsbStreamFrame *s_tx_frame;
 static uint8_t s_tx_active;
+static volatile uint8_t s_stop_requested;
 
 static void usb_stream_on_frame_tx_complete(uint32_t len);
 static void usb_stream_tx_pump(void);
@@ -543,7 +544,7 @@ static void usb_stats_reply(void)
   (void)snprintf(stats_line, sizeof(stats_line),
                  "samples=%lu frames_out=%lu spi_xfer32=%lu xfer_per_resp_x1000=%lu "
                  "usb_ovf=%lu spi_ovf=%lu tx_err=%lu sample_clip=%lu rx_off=%lu "
-                 "sysclk_mhz=%lu spi_khz=%lu sck_khz=%lu pscl=%lu nss_midi=%lu tim_p=%lu "
+                 "fw_dma_err=%lu sysclk_mhz=%lu spi_khz=%lu sck_khz=%lu pscl=%lu nss_midi=%lu tim_p=%lu "
                  "cyc_samp=%lu ksps_cyc_x10=%lu wall_cyc=%lu wall_ksps_x10=%lu",
                  (unsigned long)s_stats.samples_produced,
                  (unsigned long)s_stats.frames_sent,
@@ -554,6 +555,7 @@ static void usb_stats_reply(void)
                  (unsigned long)s_stats.usb_tx_errors,
                  (unsigned long)Intan_GetSampleClipCount(),
                  (unsigned long)Intan_GetLastUnpackRxOffset(),
+                 (unsigned long)IntanFw_GetDmaErrorCount(),
                  (unsigned long)(SystemCoreClock / 1000000U),
                  (unsigned long)(clk.spi_kernel_hz / 1000U),
                  (unsigned long)(clk.spi_sck_hz_calc / 1000U),
@@ -1504,8 +1506,9 @@ void UsbVendorBulk_ProcessOutCommands(void)
       break;
 
     case USB_CMD_STOP:
-      usb_stream_reset_all();
-      usb_reply_text("OK");
+      /* DataOut ISR only latches RX.  Defer teardown until FW reaches an EOT boundary. */
+      s_stop_requested = 1U;
+      IntanFw_RequestStop();
       break;
 
     case USB_CMD_STATS:
@@ -1520,6 +1523,10 @@ void UsbVendorBulk_ProcessOutCommands(void)
       {
         usb_reply_text("ERR nss_midi 0..15");
       }
+      else if (IntanFw_StreamIsBusy() != 0U)
+      {
+        usb_reply_text("ERR busy");
+      }
       else
       {
         Intan_SetStreamMidiCycles((uint8_t)cmd.arg0);
@@ -1532,7 +1539,11 @@ void UsbVendorBulk_ProcessOutCommands(void)
 #if (INTAN_HW_PRESENT == 0)
       usb_reply_text("ERR no intan hw");
 #else
-      if (Intan_SetSpiPrescalerDiv(cmd.arg0) != HAL_OK)
+      if (IntanFw_StreamIsBusy() != 0U)
+      {
+        usb_reply_text("ERR busy");
+      }
+      else if (Intan_SetSpiPrescalerDiv(cmd.arg0) != HAL_OK)
       {
         usb_reply_text("ERR spi_pscl busy or bad div");
       }
@@ -2043,12 +2054,35 @@ void UsbVendorBulk_ProcessOutCommands(void)
   }
 }
 
+void UsbStreamService_ProcessStopRequest(void)
+{
+  if (s_stop_requested == 0U)
+  {
+    return;
+  }
+
+  if (IntanFw_StreamIsBusy() != 0U)
+  {
+    return;
+  }
+
+  /* Now no SPI/DMA user can retain a ring buffer: abort IN before resetting the ring. */
+  usb_stream_reset_all();
+  s_stop_requested = 0U;
+  usb_reply_text("OK");
+}
+
 void UsbStreamService_Process(void)
 {
   UsbStreamFrame *frame;
   uint32_t chunk;
 
   IntanFw_Process();
+  UsbStreamService_ProcessStopRequest();
+  if (s_stop_requested != 0U)
+  {
+    return;
+  }
   usb_spi_stream_process();
 
   if (s_synth_active == 0U)

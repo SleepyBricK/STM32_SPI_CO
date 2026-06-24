@@ -191,6 +191,8 @@ uint32_t Intan_BuildConvertCmd(uint8_t channel, uint8_t flags);
 /** Intan Framework path: one SPI DMA sequence (HW NSS), non-blocking. */
 HAL_StatusTypeDef Intan_FwSpiDmaBegin(const uint32_t *tx_words, uint32_t *rx_words, uint32_t n_words);
 uint8_t Intan_FwSpiDmaPollDone(void);
+/** SPI/DMA fault observed while a Framework DMA sequence is active. */
+uint8_t Intan_FwSpiDmaHasError(void);
 /** Re-arm an active FW DMA burst without full SPI/DMAMUX teardown (free-run only). */
 HAL_StatusTypeDef Intan_FwSpiDmaRestart(uint32_t n_words);
 void Intan_FwSpiDmaEnd(void);

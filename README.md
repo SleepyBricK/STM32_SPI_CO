@@ -12,7 +12,7 @@ The validated acquisition command is:
 SPI_STREAM_FW <samples-per-channel> 255 0 40
 ```
 
-It captures channels `0..7` (RR8) at **40 kS/s/ch**. A missing or zero `ksps` argument resolves to the same safe default. This mode uses the DWT phase-paced acquisition path and is the only production configuration.
+It captures channels `0..7` (RR8) at **40 kS/s/ch**. A missing or zero `ksps` argument resolves to the same safe default. This mode uses the DWT phase-paced acquisition path and is the only production configuration. A production RR8 start restores the validated SPI timing (`PSCL=8`, `MIDI=4`); `NSS_MIDI` and `SPI_PSCL` return `ERR busy` while a Framework stream is active or armed.
 
 ## Hardware
 
@@ -66,7 +66,7 @@ The binary stream uses `RHS1` frames of exactly 4096 bytes:
 
 The frame ABI is defined in [usb_stream_frame.h](Core/Inc/usb_stream_frame.h). `reserved` contains stream metadata: first channel, channel count, CONVERT flags, and channel-tag width.
 
-The USB PCD intentionally runs without peripheral DMA. The producer does not wait for USB; a full ring increments `usb_overflow_count`. `STOP` and a new command abort an active frame transfer before the ring buffer is reset.
+The USB PCD intentionally runs without peripheral DMA. The producer does not wait for USB; a full ring increments `usb_overflow_count`. `STOP` is accepted in the hot loop, completes the current SPI DMA sequence at EOT, then aborts an active frame transfer before the ring buffer is reset. A 1 ms DWT deadline aborts a failed Framework DMA sequence; `STATS` reports the cumulative `fw_dma_err` count.
 
 ## Commands
 

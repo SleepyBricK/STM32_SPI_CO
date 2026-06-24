@@ -16,6 +16,8 @@
 
 #define INTAN_FW_TIM_IRQ_PRIO  2U
 #define FW_USB_Q_DEPTH         32U
+/* Eight 32-bit slots take about 11 us at the validated 25 MHz SCK; 1 ms is recovery only. */
+#define FW_SPI_DMA_TIMEOUT_CYC (SystemCoreClock / 1000U)
 
 typedef enum {
   FW_XFER_IDLE = 0,
@@ -43,6 +45,9 @@ static uint8_t s_freerun;
 static uint8_t s_dwt_pace;
 static uint32_t s_seq_interval_cyc;
 static uint32_t s_seq_not_before_cyc;
+static uint32_t s_xfer_start_cyc;
+static uint32_t s_dma_error_count;
+static volatile uint8_t s_stop_requested;
 
 static uint16_t s_usb_adc[INTAN_FW_CONVERT_SLOTS];
 static uint16_t s_usb_q[FW_USB_Q_DEPTH][INTAN_FW_CONVERT_SLOTS];
@@ -85,6 +90,15 @@ static HAL_StatusTypeDef fw_begin_acquisition(void);
 static void fw_apply_rate_tuning(uint32_t target_ch_ksps);
 static void fw_restore_rate_tuning(void);
 static void fw_dwt_pace_before_start(void);
+
+static void fw_abort_dma_failure(void)
+{
+  s_dma_error_count++;
+  Intan_FwSpiDmaEnd();
+  s_xfer_state = FW_XFER_IDLE;
+  Intan_DmaPathRelease();
+  IntanFw_StreamStop();
+}
 
 static uint32_t fw_tim6_input_hz(void)
 {
@@ -321,7 +335,7 @@ static void fw_spi_dma_complete(void)
   }
 
   keep_live = ((s_freerun != 0U || s_dwt_pace != 0U) && s_remaining > 0U && s_active != 0U &&
-               enqueue_ok != 0U)
+               enqueue_ok != 0U && s_stop_requested == 0U)
                   ? 1U
                   : 0U;
   if (keep_live != 0U && s_all_channels != 0U && s_usb_q_n >= FW_USB_Q_DEPTH)
@@ -335,6 +349,7 @@ static void fw_spi_dma_complete(void)
 
     if (Intan_FwSpiDmaRestart(INTAN_FW_WORDS_PER_SEQ) == HAL_OK)
     {
+      s_xfer_start_cyc = DWT->CYCCNT;
       s_xfer_state = FW_XFER_WAIT;
       return;
     }
@@ -380,7 +395,7 @@ static void fw_usb_flush_pending(void)
 
 static void fw_try_start_sequence(void)
 {
-  if (s_active == 0U || s_xfer_state == FW_XFER_WAIT)
+  if (s_active == 0U || s_xfer_state == FW_XFER_WAIT || s_stop_requested != 0U)
   {
     return;
   }
@@ -412,6 +427,7 @@ static void fw_try_start_sequence(void)
     return;
   }
 
+  s_xfer_start_cyc = DWT->CYCCNT;
   s_xfer_state = FW_XFER_WAIT;
 }
 
@@ -443,6 +459,12 @@ void IntanFw_Process(void)
 {
   uint32_t pass;
 
+  if (s_stop_requested != 0U && s_xfer_state == FW_XFER_IDLE)
+  {
+    IntanFw_StreamStop();
+    return;
+  }
+
   if (s_armed != 0U)
   {
     s_armed = 0U;
@@ -462,9 +484,25 @@ void IntanFw_Process(void)
   {
     fw_usb_flush_pending();
 
-    if (s_xfer_state == FW_XFER_WAIT && Intan_FwSpiDmaPollDone() != 0U)
+    if (s_xfer_state == FW_XFER_WAIT)
     {
-      fw_spi_dma_complete();
+      if (Intan_FwSpiDmaHasError() != 0U ||
+          (DWT->CYCCNT - s_xfer_start_cyc) > FW_SPI_DMA_TIMEOUT_CYC)
+      {
+        fw_abort_dma_failure();
+        return;
+      }
+      if (Intan_FwSpiDmaPollDone() != 0U)
+      {
+        fw_spi_dma_complete();
+      }
+    }
+
+    /* STOP is consumed only after the in-flight sequence has reached EOT. */
+    if (s_stop_requested != 0U && s_xfer_state == FW_XFER_IDLE)
+    {
+      IntanFw_StreamStop();
+      return;
     }
 
     fw_try_start_sequence();
@@ -585,6 +623,17 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
   s_target_ksps = target_ch_ksps;
   s_freerun = (target_ch_ksps == INTAN_FW_KSPS_FREERUN) ? 1U : 0U;
   s_dwt_pace = 0U;
+  s_stop_requested = 0U;
+
+  if (s_all_channels != 0U && target_ch_ksps == INTAN_FW_KSPS_DEFAULT)
+  {
+    /* Validated production RR8 is fixed; diagnostic rates retain fw_apply_rate_tuning(). */
+    if (Intan_SetSpiPrescalerDiv(8U) != HAL_OK)
+    {
+      return HAL_ERROR;
+    }
+    Intan_SetStreamMidiCycles(4U);
+  }
   if (s_freerun == 0U && s_all_channels != 0U && target_ch_ksps >= INTAN_FW_KSPS_DWT_PACE_MIN)
   {
     uint64_t hz = (uint64_t)target_ch_ksps * 1000ULL;
@@ -604,6 +653,11 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
   return HAL_OK;
 }
 
+void IntanFw_RequestStop(void)
+{
+  s_stop_requested = 1U;
+}
+
 void IntanFw_StreamStop(void)
 {
   fw_restore_rate_tuning();
@@ -611,6 +665,7 @@ void IntanFw_StreamStop(void)
   s_freerun = 0U;
   s_dwt_pace = 0U;
   s_stop_after_usb = 0U;
+  s_stop_requested = 0U;
   LL_TIM_DisableCounter(TIM6);
   LL_TIM_DisableIT_UPDATE(TIM6);
   s_active = 0U;
@@ -638,6 +693,11 @@ uint8_t IntanFw_StreamIsActive(void)
   return s_active;
 }
 
+uint8_t IntanFw_StreamIsBusy(void)
+{
+  return (s_active != 0U || s_armed != 0U) ? 1U : 0U;
+}
+
 uint8_t IntanFw_StreamIsFreerun(void)
 {
   return s_freerun;
@@ -651,6 +711,11 @@ uint8_t IntanFw_StreamUsesHotLoop(void)
 uint32_t IntanFw_GetSampleClipCount(void)
 {
   return Intan_GetSampleClipCount();
+}
+
+uint32_t IntanFw_GetDmaErrorCount(void)
+{
+  return s_dma_error_count;
 }
 
 #else /* INTAN_HW_PRESENT */
@@ -676,11 +741,20 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
   return HAL_ERROR;
 }
 
+void IntanFw_RequestStop(void)
+{
+}
+
 void IntanFw_StreamStop(void)
 {
 }
 
 uint8_t IntanFw_StreamIsActive(void)
+{
+  return 0U;
+}
+
+uint8_t IntanFw_StreamIsBusy(void)
 {
   return 0U;
 }
@@ -696,6 +770,11 @@ uint8_t IntanFw_StreamUsesHotLoop(void)
 }
 
 uint32_t IntanFw_GetSampleClipCount(void)
+{
+  return 0U;
+}
+
+uint32_t IntanFw_GetDmaErrorCount(void)
 {
   return 0U;
 }

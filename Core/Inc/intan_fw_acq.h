@@ -51,12 +51,17 @@ void IntanFw_Process(void);
  */
 HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags, uint32_t target_ch_ksps);
 
+/** Request a stop; IntanFw_Process consumes it after the current DMA sequence. */
+void IntanFw_RequestStop(void);
 void IntanFw_StreamStop(void);
 uint8_t IntanFw_StreamIsActive(void);
+/** Active or armed; tuning commands must not change an acquisition being started. */
+uint8_t IntanFw_StreamIsBusy(void);
 uint8_t IntanFw_StreamIsFreerun(void);
 /** Tight main-loop pump: FREERUN or DWT-paced RR8 (ksps >= INTAN_FW_KSPS_DWT_PACE_MIN). */
 uint8_t IntanFw_StreamUsesHotLoop(void);
 uint32_t IntanFw_GetSampleClipCount(void);
+uint32_t IntanFw_GetDmaErrorCount(void);
 
 #ifdef __cplusplus
 }

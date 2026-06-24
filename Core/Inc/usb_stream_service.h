@@ -20,6 +20,8 @@ typedef struct {
 
 void UsbStreamService_Init(void);
 void UsbVendorBulk_ProcessOutCommands(void);
+/** Complete a deferred STOP after IntanFw_Process reaches a sequence boundary. */
+void UsbStreamService_ProcessStopRequest(void);
 void UsbStreamService_Process(void);
 void UsbStreamService_TxPump(void);
 const UsbStreamStats *UsbStreamService_GetStats(void);

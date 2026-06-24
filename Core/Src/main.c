@@ -144,8 +144,11 @@ int main(void)
     {
       while (IntanFw_StreamIsActive() != 0U)
       {
+        /* Accept STOP while RR8 is DWT-paced; teardown remains deferred to an EOT boundary. */
+        UsbVendorBulk_ProcessOutCommands();
         UsbStreamService_TxPump();
         IntanFw_Process();
+        UsbStreamService_ProcessStopRequest();
         UsbStreamService_TxPump();
       }
     }
