@@ -50,6 +50,7 @@ static void intan_stream_finalize_frame(void)
   if (UsbStreamRing_MarkReady(s_cur) == 0U)
   {
     UsbStreamService_NoteUsbOverflow();
+    UsbStreamService_NoteSamplesDropped(s_cur_pos);
     UsbStreamRing_MarkFree(s_cur);
   }
   else
@@ -87,6 +88,7 @@ static void intan_stream_append_samples(const uint16_t *src, uint32_t count, uin
       if (s_cur == NULL)
       {
         UsbStreamService_NoteUsbOverflow();
+        UsbStreamService_NoteSamplesDropped(count - off);
         return;
       }
     }
@@ -148,6 +150,7 @@ static void intan_stream_append_tagged_from_adc(const uint16_t *adc, uint32_t co
       if (s_cur == NULL)
       {
         UsbStreamService_NoteUsbOverflow();
+        UsbStreamService_NoteSamplesDropped(count - off);
         return;
       }
     }
@@ -276,6 +279,7 @@ void IntanStream_PushFwSequence16(const uint16_t adc_by_channel[16])
     if (s_cur == NULL)
     {
       UsbStreamService_NoteUsbOverflow();
+      UsbStreamService_NoteSamplesDropped(16U);
       return;
     }
   }
@@ -287,6 +291,7 @@ void IntanStream_PushFwSequence16(const uint16_t adc_by_channel[16])
     if (s_cur == NULL)
     {
       UsbStreamService_NoteUsbOverflow();
+      UsbStreamService_NoteSamplesDropped(16U);
       return;
     }
   }

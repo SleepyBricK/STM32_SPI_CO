@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+import struct
 
 import usb.core
 import usb.util
@@ -14,6 +15,28 @@ EP_OUT = 0x01
 EP_IN = 0x81
 FRAME_SIZE = 4096
 FRAME_MAGIC = 0x52485331
+FRAME_VERSION = 1
+_RHS1_HEADER = struct.Struct("<IHHIIIIII")
+_RHS1_FLAG_CHANNEL_TAG = 0x0008
+
+
+def validate_rhs1_frame(frame: bytes, expected_frame_seq: int | None = None) -> tuple[int, ...]:
+    """Validate one complete RHS1 frame and return its unpacked 32-byte header."""
+    if len(frame) != FRAME_SIZE:
+        raise RuntimeError(f"RHS1 short frame: got {len(frame)} bytes, expected {FRAME_SIZE}")
+
+    header = _RHS1_HEADER.unpack_from(frame)
+    magic, version, flags, frame_seq, _, sample_count, _, _, _ = header
+    if magic != FRAME_MAGIC:
+        raise RuntimeError(f"RHS1 bad magic: 0x{magic:08X}, expected 0x{FRAME_MAGIC:08X}")
+    if version != FRAME_VERSION:
+        raise RuntimeError(f"RHS1 unsupported version: {version}, expected {FRAME_VERSION}")
+    max_samples = 1016 if (flags & _RHS1_FLAG_CHANNEL_TAG) else 2032
+    if sample_count > max_samples:
+        raise RuntimeError(f"RHS1 invalid sample_count: {sample_count}, max {max_samples}")
+    if expected_frame_seq is not None and frame_seq != (expected_frame_seq & 0xFFFFFFFF):
+        raise RuntimeError(f"RHS1 frame sequence gap: got {frame_seq}, expected {expected_frame_seq & 0xFFFFFFFF}")
+    return header
 
 
 def find_device(vid: int = VID, pid: int = PID) -> usb.core.Device:

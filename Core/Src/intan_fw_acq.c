@@ -47,6 +47,7 @@ static uint32_t s_seq_interval_cyc;
 static uint32_t s_seq_not_before_cyc;
 static uint32_t s_xfer_start_cyc;
 static uint32_t s_dma_error_count;
+static uint32_t s_late_sequence_count;
 static volatile uint8_t s_stop_requested;
 
 static uint16_t s_usb_adc[INTAN_FW_CONVERT_SLOTS];
@@ -270,6 +271,7 @@ static void fw_dwt_pace_before_start(void)
   if ((int32_t)(now - s_seq_not_before_cyc) >= (int32_t)s_seq_interval_cyc)
   {
     /* ≥1 slot late: resync phase to avoid compounding idle after long SPI. */
+    s_late_sequence_count += (now - s_seq_not_before_cyc) / s_seq_interval_cyc;
     s_seq_not_before_cyc = now;
   }
 
@@ -628,6 +630,7 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
   s_freerun = (target_ch_ksps == INTAN_FW_KSPS_FREERUN) ? 1U : 0U;
   s_dwt_pace = 0U;
   s_stop_requested = 0U;
+  s_late_sequence_count = 0U;
 
   if (s_all_channels != 0U && target_ch_ksps == INTAN_FW_KSPS_DEFAULT)
   {
@@ -722,6 +725,11 @@ uint32_t IntanFw_GetDmaErrorCount(void)
   return s_dma_error_count;
 }
 
+uint32_t IntanFw_GetLateSequenceCount(void)
+{
+  return s_late_sequence_count;
+}
+
 #else /* INTAN_HW_PRESENT */
 
 void TIM6_DAC_IRQHandler(void)
@@ -779,6 +787,11 @@ uint32_t IntanFw_GetSampleClipCount(void)
 }
 
 uint32_t IntanFw_GetDmaErrorCount(void)
+{
+  return 0U;
+}
+
+uint32_t IntanFw_GetLateSequenceCount(void)
 {
   return 0U;
 }

@@ -15,6 +15,17 @@ set(STM32CUBE_H7_ROOT "${CMAKE_SOURCE_DIR}/../Repository/STM32Cube_FW_H7_V1.13.0
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
+execute_process(
+  COMMAND git rev-parse --short=12 HEAD
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  OUTPUT_VARIABLE WEACT_GIT_HASH
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(NOT WEACT_GIT_HASH)
+  set(WEACT_GIT_HASH "unknown")
+endif()
+
 add_executable(${PROJECT_NAME})
 add_subdirectory(cmake/stm32cubemx)
 
@@ -61,6 +72,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
+  BUILD_TYPE=\"${CMAKE_BUILD_TYPE}\"
+  BUILD_GIT_HASH=\"${WEACT_GIT_HASH}\"
   INTAN_HW_PRESENT=$<IF:$<BOOL:${WITH_INTAN_HW}>,1,0>
   INTAN_CS_HW_NSS=$<IF:$<BOOL:${INTAN_CS_HW_NSS}>,1,0>
   BOARD_HAS_LSE=$<IF:$<BOOL:${BOARD_HAS_LSE}>,1,0>

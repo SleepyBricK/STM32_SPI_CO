@@ -13,9 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from usb_intan_lib import EP_IN, FRAME_SIZE, close_device, open_device, run_text_command
+from usb_intan_lib import EP_IN, FRAME_SIZE, close_device, open_device, run_text_command, validate_rhs1_frame
 
-HDR = struct.Struct("<IHHIIIIII")
 UV = 0.195
 MID = 32768.0
 FLAG_TAG = 0x0008
@@ -34,12 +33,14 @@ def capture_single(dev, ch: int, n: int, ksps: int) -> tuple[np.ndarray, str]:
     if not reply.startswith("OK"):
         raise RuntimeError(f"single cmd failed: {reply}")
     codes: list[int] = []
+    expected_seq = 0
     deadline = time.perf_counter() + max(300.0, n / max(ksps, 1) * 2.0 + 120.0)
     while len(codes) < n:
         if time.perf_counter() > deadline:
             raise TimeoutError(f"single ch{ch}: got {len(codes)}/{n}")
         p = bytes(dev.read(EP_IN, FRAME_SIZE, timeout=60000))
-        _, _, _, _, _, sc, _, _, _ = HDR.unpack_from(p, 0)
+        _, _, _, seq, _, sc, _, _, _ = validate_rhs1_frame(p, expected_seq)
+        expected_seq = seq + 1
         for i in range(sc):
             codes.append(struct.unpack_from("<H", p, 32 + 2 * i)[0])
     stats = run_text_command(dev, "STATS", timeout_ms=15000, drain_before=False).strip()
@@ -55,12 +56,14 @@ def capture_fw16(dev, n_per_ch: int, ksps: int) -> tuple[list[np.ndarray], str]:
         raise RuntimeError(f"fw16 cmd failed: {reply}")
     buckets: list[list[int]] = [[] for _ in range(N_CH)]
     idx = 0
+    expected_seq = 0
     deadline = time.perf_counter() + max(300.0, (n_per_ch / max(ksps, 1)) * 2.0 + 120.0)
     while idx < total:
         if time.perf_counter() > deadline:
             raise TimeoutError(f"fw16: got {idx}/{total}")
         p = bytes(dev.read(EP_IN, FRAME_SIZE, timeout=60000))
-        _, _, flags, _, _, sc, _, _, meta = HDR.unpack_from(p, 0)
+        _, _, flags, seq, _, sc, _, _, meta = validate_rhs1_frame(p, expected_seq)
+        expected_seq = seq + 1
         tagged = (flags & FLAG_TAG) != 0
         if tagged:
             if (meta & 0xFF) != 0 or ((meta >> 8) & 0xFF) != N_CH:

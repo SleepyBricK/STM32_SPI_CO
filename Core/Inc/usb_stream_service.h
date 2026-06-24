@@ -14,6 +14,8 @@ typedef struct {
   uint32_t usb_overflow_count;
   uint32_t spi_overflow_count;
   uint32_t usb_tx_errors;
+  uint32_t usb_disconnect_count;
+  uint32_t samples_dropped;
   uint32_t spi_xfer32_count;
   uint32_t responses_pushed;
 } UsbStreamStats;
@@ -30,6 +32,7 @@ void UsbStreamService_NoteSample(void);
 void UsbStreamService_NoteSamples(uint32_t count);
 void UsbStreamService_NoteFrameProduced(void);
 void UsbStreamService_NoteUsbOverflow(void);
+void UsbStreamService_NoteSamplesDropped(uint32_t count);
 void UsbStreamService_NoteSpiOverflow(void);
 uint32_t UsbStreamService_GetSpiOverflowCount(void);
 uint32_t UsbStreamService_GetUsbOverflowCount(void);

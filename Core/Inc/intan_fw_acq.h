@@ -62,6 +62,7 @@ uint8_t IntanFw_StreamIsFreerun(void);
 uint8_t IntanFw_StreamUsesHotLoop(void);
 uint32_t IntanFw_GetSampleClipCount(void);
 uint32_t IntanFw_GetDmaErrorCount(void);
+uint32_t IntanFw_GetLateSequenceCount(void);
 
 #ifdef __cplusplus
 }

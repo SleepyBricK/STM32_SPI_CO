@@ -53,11 +53,15 @@ static uint16_t s_spi_buf[SPI_STREAM_AGG_MAX]
     __attribute__((section(".dma_buffer"), aligned(32)));
 #endif
 
-static UsbStreamFrame *s_tx_frame;
-static uint8_t s_tx_active;
+static volatile UsbStreamFrame *s_tx_frame;
+static volatile uint8_t s_tx_active;
+static volatile uint8_t s_tx_complete_pending;
 static volatile uint8_t s_stop_requested;
+static uint8_t s_disconnect_stop_requested;
+static uint32_t s_usb_disconnect_seen;
 
 static void usb_stream_on_frame_tx_complete(uint32_t len);
+static void usb_stream_reap_tx_complete(void);
 static void usb_stream_tx_pump(void);
 static void usb_spi_idle_hook(void *ctx);
 
@@ -110,22 +114,52 @@ static uint32_t usb_stream_rate_ksps_x10(uint32_t samples, uint32_t elapsed_ms)
 static void usb_stream_on_frame_tx_complete(uint32_t len)
 {
   (void)len;
+  /* USB completion runs in ISR context; main releases the ring buffer. */
+  s_tx_complete_pending = 1U;
+}
 
-  if (s_tx_frame != NULL)
+static void usb_stream_reap_tx_complete(void)
+{
+  UsbStreamFrame *frame;
+  uint32_t primask;
+
+  if (s_tx_complete_pending == 0U)
   {
-    UsbStreamRing_MarkFree(s_tx_frame);
-    s_tx_frame = NULL;
+    return;
   }
 
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if (s_tx_complete_pending == 0U)
+  {
+    if (primask == 0U)
+    {
+      __enable_irq();
+    }
+    return;
+  }
+  frame = (UsbStreamFrame *)s_tx_frame;
+  s_tx_frame = NULL;
   s_tx_active = 0U;
-  s_stats.frames_sent++;
-  usb_stream_tx_pump();
+  s_tx_complete_pending = 0U;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  if (frame != NULL)
+  {
+    UsbStreamRing_MarkFree(frame);
+    s_stats.frames_sent++;
+  }
 }
 
 static void usb_stream_tx_pump(void)
 {
   UsbStreamFrame *frame;
   uint8_t st;
+
+  usb_stream_reap_tx_complete();
 
   if (s_tx_active != 0U)
   {
@@ -276,6 +310,7 @@ static void usb_stream_reset_all(void)
   }
   s_tx_active = 0U;
   s_tx_frame = NULL;
+  s_tx_complete_pending = 0U;
   IntanStream_Reset();
   UsbStreamRing_Reset();
   Intan_StreamDmaReset();
@@ -516,7 +551,7 @@ static void usb_spi_stream_process(void)
 
 static void usb_stats_reply(void)
 {
-  char stats_line[384];
+  char stats_line[448];
   IntanSpiDiagSnapshot clk;
   uint32_t xfer_per_resp_x1000 = 0U;
   uint32_t ksps_from_cyc_x10 = 0U;
@@ -545,7 +580,8 @@ static void usb_stats_reply(void)
                  "samples=%lu frames_out=%lu spi_xfer32=%lu xfer_per_resp_x1000=%lu "
                  "usb_ovf=%lu spi_ovf=%lu tx_err=%lu sample_clip=%lu rx_off=%lu "
                  "fw_dma_err=%lu sysclk_mhz=%lu spi_khz=%lu sck_khz=%lu pscl=%lu nss_midi=%lu tim_p=%lu "
-                 "cyc_samp=%lu ksps_cyc_x10=%lu wall_cyc=%lu wall_ksps_x10=%lu",
+                 "cyc_samp=%lu ksps_cyc_x10=%lu wall_cyc=%lu wall_ksps_x10=%lu "
+                 "usb_disconnect=%lu fw_late_seq=%lu samples_dropped=%lu build_type=%s git=%s",
                  (unsigned long)s_stats.samples_produced,
                  (unsigned long)s_stats.frames_sent,
                  (unsigned long)s_stats.spi_xfer32_count,
@@ -565,7 +601,12 @@ static void usb_stats_reply(void)
                  (unsigned long)clk.sample_period_avg_cycles,
                  (unsigned long)ksps_from_cyc_x10,
                  (unsigned long)clk.wall_cyc_per_sample,
-                 (unsigned long)wall_ksps_x10);
+                 (unsigned long)wall_ksps_x10,
+                 (unsigned long)s_stats.usb_disconnect_count,
+                 (unsigned long)IntanFw_GetLateSequenceCount(),
+                 (unsigned long)s_stats.samples_dropped,
+                 BUILD_TYPE,
+                 BUILD_GIT_HASH);
   usb_reply_text(stats_line);
 }
 
@@ -1464,6 +1505,11 @@ void UsbStreamService_NoteUsbOverflow(void)
   s_stats.usb_overflow_count++;
 }
 
+void UsbStreamService_NoteSamplesDropped(uint32_t count)
+{
+  s_stats.samples_dropped += count;
+}
+
 void UsbStreamService_NoteSpiOverflow(void)
 {
   s_stats.spi_overflow_count++;
@@ -2056,6 +2102,27 @@ void UsbVendorBulk_ProcessOutCommands(void)
 
 void UsbStreamService_ProcessStopRequest(void)
 {
+  if (g_usb_ev_disconnect != s_usb_disconnect_seen)
+  {
+    s_usb_disconnect_seen = g_usb_ev_disconnect;
+    s_stats.usb_disconnect_count++;
+    s_disconnect_stop_requested = 1U;
+    IntanFw_RequestStop();
+  }
+
+  if (s_disconnect_stop_requested != 0U)
+  {
+    if (IntanFw_StreamIsBusy() != 0U)
+    {
+      return;
+    }
+
+    /* The ISR only latched disconnect; endpoint abort and ring reset run in main. */
+    usb_stream_reset_all();
+    s_disconnect_stop_requested = 0U;
+    return;
+  }
+
   if (s_stop_requested == 0U)
   {
     return;
