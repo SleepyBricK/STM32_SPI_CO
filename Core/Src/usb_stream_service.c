@@ -59,6 +59,7 @@ static volatile uint8_t s_tx_complete_pending;
 static volatile uint8_t s_stop_requested;
 static uint8_t s_disconnect_stop_requested;
 static uint32_t s_usb_disconnect_seen;
+static uint32_t s_usb_reset_seen;
 
 static void usb_stream_on_frame_tx_complete(uint32_t len);
 static void usb_stream_reap_tx_complete(void);
@@ -2102,9 +2103,10 @@ void UsbVendorBulk_ProcessOutCommands(void)
 
 void UsbStreamService_ProcessStopRequest(void)
 {
-  if (g_usb_ev_disconnect != s_usb_disconnect_seen)
+  if (g_usb_ev_disconnect != s_usb_disconnect_seen || g_usb_ev_reset != s_usb_reset_seen)
   {
     s_usb_disconnect_seen = g_usb_ev_disconnect;
+    s_usb_reset_seen = g_usb_ev_reset;
     s_stats.usb_disconnect_count++;
     s_disconnect_stop_requested = 1U;
     IntanFw_RequestStop();

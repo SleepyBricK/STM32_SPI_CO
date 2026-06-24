@@ -1,0 +1,23 @@
+Phase 2 hardware validation — 2026-06-24
+Firmware: Release-HW, git=66e9b652b896 (+ USB reset link-down fix)
+Fixture: ch2 → 1 kOhm → GND
+
+Automated (tools/phase2_hw_test.py)
+  [PASS] STATS fingerprint: build=Release git=66e9b652b896 pscl=8 midi=4
+  [PASS] NSS_MIDI idle
+  [PASS] SPI lock during stream: nss_midi=4 pscl=8 after NSS_MIDI 2 attempt
+  [PASS] STOP during RR8: OK, fw_dma_err=0
+  [PASS] RHS1 strict: 32 frames, magic/version/seq OK
+  [PASS] USB disconnect counter: 0→1 (host bus reset)
+
+30 s RR8 capture (phase2_validate_ch2_1k_30s)
+  clip=0 usb_ovf=0 fw_dma_err=0 samples_dropped=0
+  fw_late_seq=11538 (~0.96% of 1.2M sequences)
+  ch2 RMS=75.5 µV med=-25 µV
+  rate≈39.0 kS/s/ch
+
+10 s long suite
+  ch2 RR8 clip=0 RMS=75 µV
+  ch2 solo clip=394 (legacy solo path, not production)
+
+Graphs: tools/testing/phase2_validate_ch2_1k_30s_*.png

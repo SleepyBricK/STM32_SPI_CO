@@ -103,6 +103,21 @@ def close_device(dev: usb.core.Device, ifn: int = 0) -> None:
     usb.util.dispose_resources(dev)
 
 
+def read_text_during_stream(dev: usb.core.Device, command: str, timeout_ms: int = 5000) -> str:
+    """Send a command while RHS1 frames may be on IN; return first text reply."""
+    payload = (command.strip() + "\n").encode("ascii")
+    dev.write(EP_OUT, payload, timeout=timeout_ms)
+    deadline = time.perf_counter() + timeout_ms / 1000.0
+    while time.perf_counter() < deadline:
+        try:
+            data = bytes(dev.read(EP_IN, FRAME_SIZE, timeout=500))
+        except Exception:
+            break
+        if len(data) < 64 and data[:1].isalpha():
+            return data.rstrip(b"\0").decode("ascii", errors="replace").strip()
+    return ""
+
+
 def run_text_command(
     dev: usb.core.Device,
     command: str,
