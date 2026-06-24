@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 2 hardware validation before phase 3."""
+"""Phase 3 hardware validation: acquisition safety and reset/fault observability."""
 
 from __future__ import annotations
 
@@ -48,14 +48,17 @@ def test_stats_fingerprint(dev) -> None:
     p = parse_stats(st)
     ok = (
         p.get("build_type") == "Release"
-        and p.get("git", "").startswith("66e9b65")
+        and p.get("git") not in {None, "", "unknown"}
         and p.get("pscl") == "8"
         and p.get("nss_midi") == "4"
+        and p.get("iwdg_reset") in {"0", "1"}
+        and p.get("last_fault") in {"0", "1", "2", "3", "4", "5"}
     )
     record(
-        "STATS fingerprint",
+        "STATS fingerprint / phase 3 observability",
         PASS if ok else FAIL,
-        f"build={p.get('build_type')} git={p.get('git')} pscl={p.get('pscl')} midi={p.get('nss_midi')}",
+        f"build={p.get('build_type')} git={p.get('git')} pscl={p.get('pscl')} midi={p.get('nss_midi')} "
+        f"iwdg_reset={p.get('iwdg_reset')} last_fault={p.get('last_fault')}",
     )
 
 
@@ -149,7 +152,7 @@ def test_usb_disconnect(dev, ifn) -> None:
 
 
 def main() -> int:
-    print("=== Phase 2 HW test suite ===\n")
+    print("=== Phase 3 HW test suite ===\n")
     dev, ifn = open_device(reset=True)
     time.sleep(0.5)
     try:

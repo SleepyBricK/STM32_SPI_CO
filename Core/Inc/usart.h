@@ -50,6 +50,8 @@ void UART_EarlyMinInit(uint32_t kernel_hz);
 /** Ранний printf на строку — вывод отключён. */
 void UART_EarlyPrint(const char *line);
 void UART_SosBlinkPB6(void);
+/** Fault indication on PB6: groups of blinks, repeated forever. */
+void UART_SosBlinkPattern(uint8_t groups, uint8_t blinks_per_group);
 
 /* USER CODE END Prototypes */
 

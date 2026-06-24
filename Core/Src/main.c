@@ -22,6 +22,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "rtc.h"
+#include "iwdg.h"
 #include "spi.h"
 #include "usart.h"
 #include "gpio.h"
@@ -92,6 +93,7 @@ int main(void)
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+  Iwdg_CaptureResetCause();
 
   /* USER CODE BEGIN Init */
   UART_EarlyMinInit(64000000U);
@@ -128,6 +130,7 @@ int main(void)
   Intan_UART_CLI_Init();
   USB_DEVICE_Init();
   UsbStreamService_Init();
+  MX_IWDG_Init();
 
   /* USER CODE END 2 */
 
@@ -150,6 +153,8 @@ int main(void)
         IntanFw_Process();
         UsbStreamService_ProcessStopRequest();
         UsbStreamService_TxPump();
+        Iwdg_RefreshIfHealthy((IntanFw_HasFatalError() == 0U &&
+                               UsbStreamService_IsDisconnectTeardownInProgress() == 0U) ? 1U : 0U);
       }
     }
     else
@@ -168,6 +173,8 @@ int main(void)
     UsbStreamService_TxPump();
 #endif
     Intan_UART_CLI_Process();
+    Iwdg_RefreshIfHealthy((IntanFw_HasFatalError() == 0U &&
+                           UsbStreamService_IsDisconnectTeardownInProgress() == 0U) ? 1U : 0U);
   }
   /* USER CODE END 3 */
 }

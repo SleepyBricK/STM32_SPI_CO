@@ -26,6 +26,8 @@ void UsbVendorBulk_ProcessOutCommands(void);
 void UsbStreamService_ProcessStopRequest(void);
 void UsbStreamService_Process(void);
 void UsbStreamService_TxPump(void);
+/** Disconnect/reset was observed and main-loop teardown has not completed. */
+uint8_t UsbStreamService_IsDisconnectTeardownInProgress(void);
 const UsbStreamStats *UsbStreamService_GetStats(void);
 
 void UsbStreamService_NoteSample(void);

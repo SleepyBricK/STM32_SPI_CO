@@ -9,6 +9,8 @@
 #include "intan_app.h"
 #include "intan_pattern.h"
 #include "intan_fw_acq.h"
+#include "iwdg.h"
+#include "fault_handler.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -582,7 +584,7 @@ static void usb_stats_reply(void)
                  "usb_ovf=%lu spi_ovf=%lu tx_err=%lu sample_clip=%lu rx_off=%lu "
                  "fw_dma_err=%lu sysclk_mhz=%lu spi_khz=%lu sck_khz=%lu pscl=%lu nss_midi=%lu tim_p=%lu "
                  "cyc_samp=%lu ksps_cyc_x10=%lu wall_cyc=%lu wall_ksps_x10=%lu "
-                 "usb_disconnect=%lu fw_late_seq=%lu samples_dropped=%lu build_type=%s git=%s",
+                 "usb_disconnect=%lu fw_late_seq=%lu samples_dropped=%lu iwdg_reset=%lu last_fault=%lu build_type=%s git=%s",
                  (unsigned long)s_stats.samples_produced,
                  (unsigned long)s_stats.frames_sent,
                  (unsigned long)s_stats.spi_xfer32_count,
@@ -606,6 +608,8 @@ static void usb_stats_reply(void)
                  (unsigned long)s_stats.usb_disconnect_count,
                  (unsigned long)IntanFw_GetLateSequenceCount(),
                  (unsigned long)s_stats.samples_dropped,
+                 (unsigned long)Iwdg_WasReset(),
+                 (unsigned long)FaultHandler_GetLastFault(),
                  BUILD_TYPE,
                  BUILD_GIT_HASH);
   usb_reply_text(stats_line);
@@ -2139,6 +2143,11 @@ void UsbStreamService_ProcessStopRequest(void)
   usb_stream_reset_all();
   s_stop_requested = 0U;
   usb_reply_text("OK");
+}
+
+uint8_t UsbStreamService_IsDisconnectTeardownInProgress(void)
+{
+  return s_disconnect_stop_requested;
 }
 
 void UsbStreamService_Process(void)

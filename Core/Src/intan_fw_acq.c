@@ -47,6 +47,7 @@ static uint32_t s_seq_interval_cyc;
 static uint32_t s_seq_not_before_cyc;
 static uint32_t s_xfer_start_cyc;
 static uint32_t s_dma_error_count;
+static volatile uint8_t s_dma_failure_latched;
 static uint32_t s_late_sequence_count;
 static volatile uint8_t s_stop_requested;
 
@@ -95,6 +96,7 @@ static void fw_dwt_pace_before_start(void);
 static void fw_abort_dma_failure(void)
 {
   s_dma_error_count++;
+  s_dma_failure_latched = 1U;
   Intan_FwSpiDmaEnd();
   s_xfer_state = FW_XFER_IDLE;
   Intan_DmaPathRelease();
@@ -630,6 +632,7 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
   s_freerun = (target_ch_ksps == INTAN_FW_KSPS_FREERUN) ? 1U : 0U;
   s_dwt_pace = 0U;
   s_stop_requested = 0U;
+  s_dma_failure_latched = 0U;
   s_late_sequence_count = 0U;
 
   if (s_all_channels != 0U && target_ch_ksps == INTAN_FW_KSPS_DEFAULT)
@@ -725,6 +728,11 @@ uint32_t IntanFw_GetDmaErrorCount(void)
   return s_dma_error_count;
 }
 
+uint8_t IntanFw_HasFatalError(void)
+{
+  return s_dma_failure_latched;
+}
+
 uint32_t IntanFw_GetLateSequenceCount(void)
 {
   return s_late_sequence_count;
@@ -787,6 +795,11 @@ uint32_t IntanFw_GetSampleClipCount(void)
 }
 
 uint32_t IntanFw_GetDmaErrorCount(void)
+{
+  return 0U;
+}
+
+uint8_t IntanFw_HasFatalError(void)
 {
   return 0U;
 }

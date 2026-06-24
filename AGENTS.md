@@ -73,6 +73,12 @@ Legacy `SPI_STREAM_REAL*`, RR/range и slot-DMA команды остаются 
 
 RHS1 metadata: `reserved[7:0]` -- first channel, `[15:8]` -- channel count, `[23:16]` -- CONVERT flags, `[26:24]` -- bits per channel tag.
 
+## Надёжность (фаза 3)
+
+- IWDG1 имеет nominal timeout 3 s и обновляется только healthy main path. После FW DMA deadline abort или во время disconnect teardown его не кормить.
+- `iwdg_reset` в `STATS` отражает текущий reset от IWDG и сохраняется в RTC backup register. `last_fault` хранится в `.noinit` D3 SRAM: 1=Hard, 2=MemManage, 3=BusFault, 4=UsageFault, 5=NMI.
+- PB6: HardFault — три группы по три вспышки; остальные fault — 2/4/5/6 вспышек с паузой.
+
 ## UART
 
 USART1: PB6 TX, PB7 RX, 115200 8N1. Передача обычных сообщений и CLI-ответов отключена; RX parser сохранён. При Error_Handler/HardFault на PB6 выводится SOS миганием, без UART-текста.

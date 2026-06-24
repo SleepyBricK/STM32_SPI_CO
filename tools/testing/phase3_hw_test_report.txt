@@ -1,0 +1,24 @@
+Phase 3 hardware validation — 2026-06-24
+Firmware: Release-HW, git=3899a494912b
+Fixture: ch2 → 1 kOhm → GND
+
+New in phase 3:
+  - IWDG1 nominal 3 s, refresh from healthy main/RR8 hot-loop
+  - Unified fault handlers + PB6 blink patterns (Hard/Mem/Bus/Usage/NMI)
+  - STATS: iwdg_reset, last_fault
+
+Automated (tools/phase2_hw_test.py — phase 3 section)
+  [PASS] STATS: iwdg_reset=0 last_fault=0 build=Release
+  [PASS] NSS_MIDI idle / SPI lock during stream
+  [PASS] STOP during RR8
+  [PASS] RHS1 strict
+  [PASS] USB disconnect counter 0→1
+
+30 s RR8 capture (phase3_validate_ch2_1k_30s)
+  clip=0 usb_ovf=0 fw_dma_err=0 samples_dropped=0
+  iwdg_reset=0 last_fault=0
+  fw_late_seq=1690
+  ch2 RMS=77.2 µV med=-25 µV
+  rate≈39.4 kS/s/ch
+
+Graphs: tools/testing/phase3_validate_ch2_1k_30s_*.png

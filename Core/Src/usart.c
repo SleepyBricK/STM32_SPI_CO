@@ -57,7 +57,13 @@ void UART_EarlyPrint(const char *line)
 
 void UART_SosBlinkPB6(void)
 {
-  uint32_t i;
+  UART_SosBlinkPattern(3U, 3U);
+}
+
+void UART_SosBlinkPattern(uint8_t groups, uint8_t blinks_per_group)
+{
+  uint32_t group;
+  uint32_t blink;
 
   RCC->AHB4ENR |= RCC_AHB4ENR_GPIOBEN;
   (void)RCC->AHB4ENR;
@@ -65,12 +71,16 @@ void UART_SosBlinkPB6(void)
 
   for (;;)
   {
-    for (i = 0U; i < 6U; i++)
+    for (group = 0U; group < groups; group++)
     {
-      GPIOB->BSRR = GPIO_PIN_6;
-      for (volatile uint32_t d = 0U; d < 200000U; d++) {}
-      GPIOB->BSRR = (uint32_t)GPIO_PIN_6 << 16U;
-      for (volatile uint32_t d = 0U; d < 200000U; d++) {}
+      for (blink = 0U; blink < blinks_per_group; blink++)
+      {
+        GPIOB->BSRR = GPIO_PIN_6;
+        for (volatile uint32_t d = 0U; d < 200000U; d++) {}
+        GPIOB->BSRR = (uint32_t)GPIO_PIN_6 << 16U;
+        for (volatile uint32_t d = 0U; d < 200000U; d++) {}
+      }
+      for (volatile uint32_t d = 0U; d < 600000U; d++) {}
     }
     for (volatile uint32_t d = 0U; d < 1200000U; d++) {}
   }

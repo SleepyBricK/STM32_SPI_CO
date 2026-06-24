@@ -68,6 +68,8 @@ The frame ABI is defined in [usb_stream_frame.h](Core/Inc/usb_stream_frame.h). `
 
 The USB PCD intentionally runs without peripheral DMA. The producer does not wait for USB; a full ring increments `usb_overflow_count` and `samples_dropped`. `STOP` and USB disconnect are deferred to main, complete the current SPI DMA sequence at EOT, then abort an active frame transfer before the ring buffer is reset. Production RR8 recovery is timeout-only: a missing EOT at the 1 ms DWT deadline aborts the Framework DMA sequence and increments `fw_dma_err`; a DWT phase resync increments `fw_late_seq`. `STATS` appends these counters, `usb_disconnect`, and the CMake build fingerprint (`build_type`, `git`). `Intan_FwSpiDmaHasError()` remains diagnostic only because H7 master SPI status can report false positives; `SPI_SR_UDR` is slave-TX-only.
 
+IWDG1 has a nominal 3 s timeout and is refreshed only from the healthy main path. `STATS` adds `iwdg_reset` and retained `last_fault` (`1..5`: Hard/Mem/Bus/Usage/NMI); fault context is retained in `.noinit` D3 SRAM and the watchdog-reset indication is mirrored in an RTC backup register.
+
 ## Commands
 
 Basic control:

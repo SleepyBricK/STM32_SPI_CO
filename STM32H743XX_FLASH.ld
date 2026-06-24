@@ -227,6 +227,14 @@ SECTIONS
   } >DTCMRAM
   PROVIDE( __non_tls_bss_start = ADDR(.bss) );
 
+  /* Retained across system/IWDG reset; used only for the last fault record. */
+  .noinit (NOLOAD) : ALIGN(4)
+  {
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM_D3
+
   .dma_buffer (NOLOAD) : ALIGN(32)
   {
     *(.dma_buffer)

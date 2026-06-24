@@ -41,6 +41,7 @@ else()
 endif()
 
 target_sources(${PROJECT_NAME} PRIVATE
+  ${CMAKE_SOURCE_DIR}/Core/Src/fault_handler.c
   ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi.c
   ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi_diag.c
   ${CMAKE_SOURCE_DIR}/Core/Src/intan_spi4_hw.c

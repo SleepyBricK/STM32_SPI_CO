@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "usart.h"
 #include "usbd_conf.h"
+#include "fault_handler.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,7 +53,6 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -67,77 +67,68 @@
 /**
   * @brief This function handles Non maskable interrupt.
   */
-void NMI_Handler(void)
+__attribute__((naked)) void NMI_Handler(void)
 {
-  /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
-  /* USER CODE END NonMaskableInt_IRQn 0 */
-  /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
-   while (1)
-  {
-  }
-  /* USER CODE END NonMaskableInt_IRQn 1 */
+  __asm volatile ("tst lr, #4\n"
+                  "ite eq\n"
+                  "mrseq r1, msp\n"
+                  "mrsne r1, psp\n"
+                  "movs r0, #5\n"
+                  "b fault_handler_enter\n");
 }
 
 /**
   * @brief This function handles Hard fault interrupt.
   */
-void HardFault_Handler(void)
+__attribute__((naked)) void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-  UART_EarlyMinInit(64000000U);
-  UART_SosBlinkPB6();
+  __asm volatile ("tst lr, #4\n"
+                  "ite eq\n"
+                  "mrseq r1, msp\n"
+                  "mrsne r1, psp\n"
+                  "movs r0, #1\n"
+                  "b fault_handler_enter\n");
   /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
 }
 
 /**
   * @brief This function handles Memory management fault.
   */
-void MemManage_Handler(void)
+__attribute__((naked)) void MemManage_Handler(void)
 {
-  /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
-  /* USER CODE END MemoryManagement_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    /* USER CODE END W1_MemoryManagement_IRQn 0 */
-  }
+  __asm volatile ("tst lr, #4\n"
+                  "ite eq\n"
+                  "mrseq r1, msp\n"
+                  "mrsne r1, psp\n"
+                  "movs r0, #2\n"
+                  "b fault_handler_enter\n");
 }
 
 /**
   * @brief This function handles Pre-fetch fault, memory access fault.
   */
-void BusFault_Handler(void)
+__attribute__((naked)) void BusFault_Handler(void)
 {
-  /* USER CODE BEGIN BusFault_IRQn 0 */
-
-  /* USER CODE END BusFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_BusFault_IRQn 0 */
-    /* USER CODE END W1_BusFault_IRQn 0 */
-  }
+  __asm volatile ("tst lr, #4\n"
+                  "ite eq\n"
+                  "mrseq r1, msp\n"
+                  "mrsne r1, psp\n"
+                  "movs r0, #3\n"
+                  "b fault_handler_enter\n");
 }
 
 /**
   * @brief This function handles Undefined instruction or illegal state.
   */
-void UsageFault_Handler(void)
+__attribute__((naked)) void UsageFault_Handler(void)
 {
-  /* USER CODE BEGIN UsageFault_IRQn 0 */
-
-  /* USER CODE END UsageFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
-    /* USER CODE END W1_UsageFault_IRQn 0 */
-  }
+  __asm volatile ("tst lr, #4\n"
+                  "ite eq\n"
+                  "mrseq r1, msp\n"
+                  "mrsne r1, psp\n"
+                  "movs r0, #4\n"
+                  "b fault_handler_enter\n");
 }
 
 /**
