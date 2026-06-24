@@ -129,8 +129,14 @@ static uint32_t s_dma_tx_word __attribute__((section(".dma_buffer"), aligned(32)
 static uint32_t s_dma_tx_words[INTAN_DMA_CHUNK_SLOTS] __attribute__((section(".dma_buffer"), aligned(32)));
 static uint32_t s_dma_rx_words[INTAN_DMA_CHUNK_SLOTS] __attribute__((section(".dma_buffer"), aligned(32)));
 
-/* RHS2116: tCSOFF — CS high минимум 100 нс между 32-битными циклами; tCS1 — 20 нс от CS↓ до SCLK. */
-static void intan_delay_ns(uint32_t ns)
+/* RHS2116: tCSOFF -- CS high минимум 100 нс между 32-битными циклами. */
+#if INTAN_CS_HW_NSS
+#define INTAN_LEGACY_UNUSED  __attribute__((unused))
+#else
+#define INTAN_LEGACY_UNUSED
+#endif
+
+static void INTAN_LEGACY_UNUSED intan_delay_ns(uint32_t ns)
 {
   uint32_t cycles =
       (uint32_t)(((uint64_t)SystemCoreClock * (uint64_t)ns + 999999999ULL) / 1000000000ULL);
@@ -220,7 +226,7 @@ static void intan_unpack_convert_block(uint16_t *samples, uint32_t n, uint32_t r
   }
 }
 
-static void intan_cs_low(void)
+static void INTAN_LEGACY_UNUSED intan_cs_low(void)
 {
 #if !INTAN_CS_HW_NSS
   INTAN_CS_GPIO_PORT->BSRR = ((uint32_t)INTAN_CS_PIN << 16);
@@ -229,7 +235,7 @@ static void intan_cs_low(void)
 #endif
 }
 
-static void intan_cs_high(void)
+static void INTAN_LEGACY_UNUSED intan_cs_high(void)
 {
 #if !INTAN_CS_HW_NSS
   INTAN_CS_GPIO_PORT->BSRR = (uint32_t)INTAN_CS_PIN;
@@ -362,8 +368,10 @@ static HAL_StatusTypeDef intan_xfer32_repeat_fast(uint32_t tx_word, uint32_t n, 
   uint32_t last_rx = 0U;
   __IO uint32_t *txdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->TXDR;
   __IO uint32_t *rxdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->RXDR;
+#if !INTAN_CS_HW_NSS
   const uint32_t cs_set = (uint32_t)INTAN_CS_PIN;
   const uint32_t cs_reset = ((uint32_t)INTAN_CS_PIN << 16);
+#endif
 
   if (!g_intan_spi_ready || n == 0U)
   {
@@ -683,11 +691,6 @@ uint8_t Intan_PipelineChannelIndex(uint8_t phase, uint32_t sample_index, uint32_
   return (uint8_t)ch_idx;
 }
 
-static void intan_pipeline_layout_remember(uint32_t n, uint32_t *chunk_slots, uint32_t *rx_offset)
-{
-  intan_pipeline_layout_remember_poll(n, chunk_slots, rx_offset);
-}
-
 static void intan_pipeline_mark_done(void)
 {
   if (s_dma_stream_continuous != 0U)
@@ -761,7 +764,7 @@ static void intan_dma_block_halt(void)
 #endif
 }
 
-static void intan_timslot_tim_kick(uint8_t fresh_start)
+static void INTAN_LEGACY_UNUSED intan_timslot_tim_kick(uint8_t fresh_start)
 {
   if (fresh_start != 0U)
   {
@@ -1171,7 +1174,9 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
   const uint32_t dma_stream0_done = DMA_LISR_TCIF0;
   const uint32_t dma_stream1_done = DMA_LISR_TCIF1;
   uint32_t period_ticks;
+#if !INTAN_CS_HW_NSS
   uint32_t low_ticks;
+#endif
   uint32_t old_midi;
   uint32_t chunk_slots;
   uint32_t rx_offset;
@@ -1196,7 +1201,6 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
     return HAL_ERROR;
   }
   period_ticks = INTAN_DMA_TIMSLOT_PERIOD_SCK_CYCLES;
-  low_ticks = 0U;
 #else
   if (intan_dma_compute_tim_ticks(INTAN_DMA_TIMCS_PERIOD_SCK_CYCLES, INTAN_DMA_TIMCS_HIGH_NS,
                                   &period_ticks, &low_ticks) != HAL_OK)
@@ -1263,10 +1267,9 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsRead(uint32_t n, uint8_t channel,
   return HAL_OK;
 }
 
-static HAL_StatusTypeDef intan_timslot_dma_subblock(uint32_t n, uint8_t channel, uint8_t flags,
-                                                    uint16_t *samples, uint32_t *period_ticks,
-                                                    uint32_t *low_ticks, uint32_t *old_midi,
-                                                    uint8_t *tim_ready, uint8_t continuing_sub)
+static HAL_StatusTypeDef INTAN_LEGACY_UNUSED intan_timslot_dma_subblock(
+    uint32_t n, uint8_t channel, uint8_t flags, uint16_t *samples, uint32_t *period_ticks,
+    uint32_t *low_ticks, uint32_t *old_midi, uint8_t *tim_ready, uint8_t continuing_sub)
 {
   const uint32_t dma_stream0_done = DMA_LISR_TCIF0;
   const uint32_t dma_stream1_done = DMA_LISR_TCIF1;
@@ -1376,11 +1379,10 @@ static HAL_StatusTypeDef intan_timslot_dma_subblock(uint32_t n, uint8_t channel,
   return HAL_OK;
 }
 
-static HAL_StatusTypeDef intan_timslot_dma_subblock_range(uint32_t n, uint8_t first_ch, uint8_t n_ch,
-                                                          uint8_t flags, uint16_t *samples,
-                                                          uint8_t *phase_io, uint32_t *period_ticks,
-                                                          uint32_t *low_ticks, uint32_t *old_midi,
-                                                          uint8_t *tim_ready, uint8_t continuing_sub)
+static HAL_StatusTypeDef INTAN_LEGACY_UNUSED intan_timslot_dma_subblock_range(
+    uint32_t n, uint8_t first_ch, uint8_t n_ch, uint8_t flags, uint16_t *samples,
+    uint8_t *phase_io, uint32_t *period_ticks, uint32_t *low_ticks, uint32_t *old_midi,
+    uint8_t *tim_ready, uint8_t continuing_sub)
 {
   const uint32_t dma_stream0_done = DMA_LISR_TCIF0;
   const uint32_t dma_stream1_done = DMA_LISR_TCIF1;
@@ -1582,8 +1584,10 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsReadRR(uint32_t n, uint8_t n_ch, 
 {
   const uint32_t dma_stream0_done = DMA_LISR_TCIF0;
   const uint32_t dma_stream1_done = DMA_LISR_TCIF1;
+#if !INTAN_CS_HW_NSS
   uint32_t period_ticks;
   uint32_t low_ticks;
+#endif
   uint32_t old_midi;
   uint32_t chunk_slots;
   uint32_t rx_offset;
@@ -1616,8 +1620,6 @@ HAL_StatusTypeDef Intan_ConvertPipelineDmaTimCsReadRR(uint32_t n, uint8_t n_ch, 
     intan_dma_timcs_recover(old_midi);
     return HAL_ERROR;
   }
-  period_ticks = INTAN_DMA_TIMSLOT_PERIOD_SCK_CYCLES;
-  low_ticks = 0U;
 #else
   if (intan_dma_compute_tim_ticks(INTAN_DMA_TIMCS_PERIOD_SCK_CYCLES, INTAN_DMA_TIMCS_HIGH_NS,
                                   &period_ticks, &low_ticks) != HAL_OK)
@@ -2284,8 +2286,10 @@ HAL_StatusTypeDef Intan_ConvertPipelineRead(uint32_t n, uint8_t channel, uint8_t
                                 0x00U, 0x00U);
   __IO uint32_t *txdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->TXDR;
   __IO uint32_t *rxdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->RXDR;
+#if !INTAN_CS_HW_NSS
   const uint32_t cs_set = (uint32_t)INTAN_CS_PIN;
   const uint32_t cs_reset = ((uint32_t)INTAN_CS_PIN << 16);
+#endif
   uint32_t slots;
 
   if (!g_intan_spi_ready || samples == NULL)
@@ -2357,8 +2361,10 @@ HAL_StatusTypeDef Intan_ConvertPipelineReadRR(uint32_t n, uint8_t n_ch, uint8_t 
   uint32_t rx = 0U;
   __IO uint32_t *txdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->TXDR;
   __IO uint32_t *rxdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->RXDR;
+#if !INTAN_CS_HW_NSS
   const uint32_t cs_set = (uint32_t)INTAN_CS_PIN;
   const uint32_t cs_reset = ((uint32_t)INTAN_CS_PIN << 16);
+#endif
   uint32_t slots;
   uint8_t phase = 0U;
 
@@ -2451,8 +2457,10 @@ HAL_StatusTypeDef Intan_ConvertPipelineReadRange(uint32_t n, uint8_t first_ch, u
   uint32_t rx = 0U;
   __IO uint32_t *txdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->TXDR;
   __IO uint32_t *rxdr32 = (__IO uint32_t *)&INTAN_SPI_INSTANCE->RXDR;
+#if !INTAN_CS_HW_NSS
   const uint32_t cs_set = (uint32_t)INTAN_CS_PIN;
   const uint32_t cs_reset = ((uint32_t)INTAN_CS_PIN << 16);
+#endif
   uint32_t slots;
   uint8_t phase = 0U;
 

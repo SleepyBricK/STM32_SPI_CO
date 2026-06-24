@@ -19,7 +19,7 @@ HDR = struct.Struct("<IHHIIIIII")
 UV = 0.195
 MID = 32768.0
 FLAG_TAG = 0x0008
-from fw_constants import N_CH
+from fw_constants import N_CH, FW_KSPS_DEFAULT
 
 
 def prep(dev) -> None:
@@ -215,7 +215,7 @@ def main() -> int:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration", type=float, default=5.0, help="секунд на канал")
-    ap.add_argument("--ksps", type=int, default=5)
+    ap.add_argument("--ksps", type=int, default=40, help="kS/s per channel (production: 40)")
     ap.add_argument("--warmup-skip", type=float, default=0.5, help="секунд прогрева, отбрасываемых на графике/trace")
     ap.add_argument("--reset", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()

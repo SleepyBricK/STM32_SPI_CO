@@ -1,24 +1,24 @@
 ---
-description: Контекст репозитория WeActSTM32H743 — читать перед работой при потере контекста
+description: Контекст WeActSTM32H743 для Cursor и Codex
 alwaysApply: true
 ---
 
 # WeActSTM32H743
 
-Перед изменениями или при неясной архитектуре **прочитайте корневой файл `AGENTS.md`**: там МК STM32H743VIT6, HSE 8 MHz, пины SPI2/USART1, договорённости по Intan RHS2116 (`intan_spi.c` / 32-битные кадры, CS PE11), сборка CMake и host-скрипты в `tools/`.
+Глобальное правило `~/.cursor/rules/codex-delegation.mdc` и MCP `codex` (`~/.cursor/mcp.json`) уже настроены — дублировать в User Rules не нужно.
 
-## Intan RHS2116: CS между каждой командой (обязательно)
+## Codex (этот workspace)
 
-**CS = PE11**, активный низкий. Каждый 32-битный кадр RHS2116 — **отдельная CS-транзакция**: `CS↓ → 32 bit SPI → CS↑`. Между **любыми** двумя кадрами CS **обязан** быть HIGH (tCSOFF ≥ ~100 ns; в коде — запас).
+Рабочая папка: `/Users/warforterritory/STM32Cube/WeActSTM32H743`.
 
-- **WRITE / READ / CONVERT** — это **3 отдельных** CS-транзакции, не один длинный CS↓ на три слова.
-- **`PATTERN_ADD_RAW`** — один слот = один CS-цикл (`Intan_Xfer32Word`).
-- **`PATTERN_ADD_WRITE/READ/CONVERT`** — **3 слота = 3 CS-цикла** (как `Intan_WriteReg`), не группировать под одним CS.
-- **Slot-DMA stream** (`SPI_STREAM_*_SLOT`) — CS↑ **между каждым** 32-bit словом (TIM1 + PE11).
-- **Запрещено** для стима и triggered-регистров: держать CS низким на несколько слов, grouped SPI, «ускорение» без CS↑ — ломает pipeline и стим-сигнал.
+При вызове Codex указывай `cwd` на эту директорию. В `prompt` ссылайся на корневой `AGENTS.md` — он источник правды по плате, SPI2, USB HS и production capture.
 
-Эталон: `Intan_Xfer32Word()` / `intan_xfer32()` в `Core/Src/intan_spi.c`. Подробности — § Intan RHS2116 в `AGENTS.md`, `intan_stim_pattern_guide.md`.
+MCP: `codex` (в рантайме может быть с префиксом проекта, например `project-0-…-codex`). Инструменты: `codex`, `codex-reply`.
 
-**USB-код в основном проекте удалён** — пользователь переписывает с нуля. Эталон USB: `WorkingVER/STM32H743/`.
+## Ключевые ограничения
 
-В `Core/Src/main.c` в заголовке указана отсылка к `AGENTS.md`. Пользователь предпочитает ответы **на русском**. Соблюдайте блоки `USER CODE` в файлах STM32Cube.
+- Production acquisition: `SPI_STREAM_FW n 255 0 40` — RR8, 40 kS/s/ch.
+- CS целевой платы: PA11 / SPI2_NSS, `INTAN_CS_HW_NSS=ON`; PE11 — только legacy path.
+- Каждый 32-битный кадр RHS2116 требует отдельного CS-цикла.
+- USB V2 уже реализован в корневом `Core/`; `WorkingVER/STM32H743/` — исторический CDC reference.
+- Не ломайте STM32Cube блоки `USER CODE`. Ответы пользователю — на русском.

@@ -1,6 +1,7 @@
 #include "usb_vendor_bulk.h"
 #include "usbd_ctlreq.h"
 #include "usbd_conf.h"
+#include "stm32h7xx_ll_usb.h"
 
 #define VENDOR_BULK_CONFIG_DESC_SIZE     32U
 #define VENDOR_BULK_INTERFACE            0U
@@ -222,6 +223,36 @@ uint8_t USBD_VENDOR_BULK_TransmitFrame(const uint8_t *buf, uint32_t len)
   }
 
   return (uint8_t)USBD_OK;
+}
+
+void USBD_VENDOR_BULK_AbortFrame(void)
+{
+  PCD_HandleTypeDef *hpcd;
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  if ((s_pdev != NULL) && (s_frame_active != 0U))
+  {
+    uint32_t USBx_BASE;
+
+    hpcd = (PCD_HandleTypeDef *)s_pdev->pData;
+    if (hpcd != NULL)
+    {
+      (void)HAL_PCD_EP_Abort(hpcd, VENDOR_BULK_IN_EP);
+      (void)HAL_PCD_EP_Flush(hpcd, VENDOR_BULK_IN_EP);
+
+      /* Discard completion state from the transfer which was just aborted. */
+      USBx_BASE = (uint32_t)hpcd->Instance;
+      USBx_INEP(VENDOR_BULK_IN_EP & EP_ADDR_MSK)->DIEPINT =
+          USB_OTG_DIEPINT_XFRC | USB_OTG_DIEPINT_EPDISD;
+    }
+    s_frame_active = 0U;
+    s_frame_len = 0U;
+  }
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
 }
 
 void USBD_VENDOR_BULK_SetTxCompleteCallback(USBD_VENDOR_BULK_TxCompleteFn cb)

@@ -29,8 +29,8 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=2000, help="samples per channel")
     ap.add_argument(
         "--ksps-list",
-        default="5,8,10,12,15,18,20,25,30,35,40",
-        help="comma-separated kS/s to try",
+        default="40",
+        help="comma-separated kS/s (production: 40 only)",
     )
     ap.add_argument("--reset", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()

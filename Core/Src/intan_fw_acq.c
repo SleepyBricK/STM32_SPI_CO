@@ -14,9 +14,8 @@
 #include "stm32h7xx_ll_tim.h"
 #include <string.h>
 
-#define INTAN_FW_DEFAULT_KSPS  20000U
 #define INTAN_FW_TIM_IRQ_PRIO  2U
-#define FW_USB_Q_DEPTH         16U
+#define FW_USB_Q_DEPTH         32U
 
 typedef enum {
   FW_XFER_IDLE = 0,
@@ -50,6 +49,9 @@ static uint16_t s_usb_q[FW_USB_Q_DEPTH][INTAN_FW_CONVERT_SLOTS];
 static uint8_t s_usb_q_w;
 static uint8_t s_usb_q_r;
 static uint8_t s_usb_q_n;
+static uint8_t s_saved_midi;
+static uint8_t s_spi_tuned;
+static uint32_t s_saved_pscl;
 
 static void fw_tim6_hw_init(void);
 static void fw_tim6_set_rate_hz(uint32_t hz);
@@ -80,6 +82,9 @@ static void fw_usb_flush_pending(void);
 static void fw_try_start_sequence(void);
 static HAL_StatusTypeDef fw_pipeline_warmup(void);
 static HAL_StatusTypeDef fw_begin_acquisition(void);
+static void fw_apply_rate_tuning(uint32_t target_ch_ksps);
+static void fw_restore_rate_tuning(void);
+static void fw_dwt_pace_before_start(void);
 
 static uint32_t fw_tim6_input_hz(void)
 {
@@ -115,7 +120,7 @@ static void fw_tim6_set_rate_hz(uint32_t hz)
 
   if (hz == 0U)
   {
-    hz = INTAN_FW_DEFAULT_KSPS * 1000U;
+    hz = INTAN_FW_KSPS_DEFAULT * 1000U;
   }
   if (hz < 100U)
   {
@@ -197,6 +202,71 @@ static HAL_StatusTypeDef fw_spi_wait_done(uint32_t timeout_cyc)
   return HAL_OK;
 }
 
+static void fw_apply_rate_tuning(uint32_t target_ch_ksps)
+{
+  s_spi_tuned = 0U;
+
+  if (s_freerun != 0U || s_all_channels == 0U)
+  {
+    return;
+  }
+
+  if (target_ch_ksps >= INTAN_FW_KSPS_HIGH_RATE)
+  {
+    s_saved_midi = Intan_GetStreamMidiCycles();
+    Intan_SetStreamMidiCycles(INTAN_FW_KSPS_HIGH_MIDI);
+    s_spi_tuned = 1U;
+  }
+
+  if (target_ch_ksps >= INTAN_FW_KSPS_FAST_SPI)
+  {
+    s_saved_pscl = Intan_GetSpiPrescalerDiv();
+    if (Intan_SetSpiPrescalerDiv(INTAN_FW_KSPS_FAST_PSCL) == HAL_OK)
+    {
+      s_spi_tuned = 1U;
+    }
+  }
+}
+
+static void fw_restore_rate_tuning(void)
+{
+  if (s_spi_tuned != 0U)
+  {
+    Intan_SetStreamMidiCycles(s_saved_midi);
+    if (s_saved_pscl != 0U)
+    {
+      (void)Intan_SetSpiPrescalerDiv(s_saved_pscl);
+      s_saved_pscl = 0U;
+    }
+    s_spi_tuned = 0U;
+  }
+}
+
+/** Wait for next phase tick, then advance (interval from sequence start, not SPI end). */
+static void fw_dwt_pace_before_start(void)
+{
+  uint32_t now;
+
+  if (s_dwt_pace == 0U)
+  {
+    return;
+  }
+
+  now = DWT->CYCCNT;
+  if ((int32_t)(now - s_seq_not_before_cyc) >= (int32_t)s_seq_interval_cyc)
+  {
+    /* ≥1 slot late: resync phase to avoid compounding idle after long SPI. */
+    s_seq_not_before_cyc = now;
+  }
+
+  while (s_active != 0U && (int32_t)(DWT->CYCCNT - s_seq_not_before_cyc) < 0)
+  {
+    fw_usb_flush_pending();
+  }
+
+  s_seq_not_before_cyc += s_seq_interval_cyc;
+}
+
 static HAL_StatusTypeDef fw_pipeline_warmup(void)
 {
   uint32_t pass;
@@ -241,11 +311,6 @@ static void fw_spi_dma_complete(void)
 
   s_remaining--;
 
-  if (s_dwt_pace != 0U)
-  {
-    s_seq_not_before_cyc = DWT->CYCCNT + s_seq_interval_cyc;
-  }
-
   if (s_remaining == 0U)
   {
     s_stop_after_usb = 1U;
@@ -266,13 +331,7 @@ static void fw_spi_dma_complete(void)
 
   if (keep_live != 0U)
   {
-    if (s_dwt_pace != 0U)
-    {
-      while (s_active != 0U && (int32_t)(DWT->CYCCNT - s_seq_not_before_cyc) < 0)
-      {
-        fw_usb_flush_pending();
-      }
-    }
+    fw_dwt_pace_before_start();
 
     if (Intan_FwSpiDmaRestart(INTAN_FW_WORDS_PER_SEQ) == HAL_OK)
     {
@@ -340,13 +399,7 @@ static void fw_try_start_sequence(void)
     return;
   }
 
-  if (s_dwt_pace != 0U)
-  {
-    while (s_active != 0U && (int32_t)(DWT->CYCCNT - s_seq_not_before_cyc) < 0)
-    {
-      fw_usb_flush_pending();
-    }
-  }
+  fw_dwt_pace_before_start();
 
   if ((s_freerun != 0U || s_dwt_pace != 0U) && s_all_channels != 0U && s_usb_q_n >= FW_USB_Q_DEPTH)
   {
@@ -405,7 +458,7 @@ void IntanFw_Process(void)
     return;
   }
 
-  for (pass = 0U; pass < ((s_freerun != 0U || s_dwt_pace != 0U) ? 128U : 64U); pass++)
+  for (pass = 0U; pass < ((s_freerun != 0U || s_dwt_pace != 0U) ? 256U : 64U); pass++)
   {
     fw_usb_flush_pending();
 
@@ -522,6 +575,11 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
   IntanFw_StreamStop();
   Intan_SpiStats_Reset();
 
+  if (target_ch_ksps == 0U)
+  {
+    target_ch_ksps = INTAN_FW_KSPS_DEFAULT;
+  }
+
   s_flags = flags;
   s_remaining = n;
   s_target_ksps = target_ch_ksps;
@@ -538,6 +596,8 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
       s_seq_interval_cyc = 100U;
     }
   }
+
+  fw_apply_rate_tuning(target_ch_ksps);
   fw_build_mosi_sequence();
   s_armed = 1U;
 
@@ -546,6 +606,7 @@ HAL_StatusTypeDef IntanFw_StreamStart(uint32_t n, uint8_t channel, uint8_t flags
 
 void IntanFw_StreamStop(void)
 {
+  fw_restore_rate_tuning();
   s_armed = 0U;
   s_freerun = 0U;
   s_dwt_pace = 0U;

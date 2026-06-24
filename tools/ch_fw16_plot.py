@@ -19,7 +19,7 @@ HDR = struct.Struct("<IHHIIIIII")
 UV = 0.195
 MID = 32768.0
 FLAG_TAG = 0x0008
-from fw_constants import N_CH
+from fw_constants import N_CH, FW_KSPS_DEFAULT
 
 
 def prep(dev) -> None:
@@ -75,7 +75,7 @@ def capture_fw16(dev, n_per_ch: int, ksps: int) -> tuple[list[np.ndarray], float
 def main() -> int:
     ap = argparse.ArgumentParser(description="Plot SPI_STREAM_FW all-8 channels")
     ap.add_argument("--n", type=int, default=400, help="samples per channel")
-    ap.add_argument("--ksps", type=int, default=5, help="sequence rate kS/s (per-channel rate)")
+    ap.add_argument("--ksps", type=int, default=FW_KSPS_DEFAULT, help="sequence rate kS/s (production: 40)")
     ap.add_argument(
         "--show-s",
         type=float,

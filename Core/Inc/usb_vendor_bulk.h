@@ -26,6 +26,8 @@ typedef void (*USBD_VENDOR_BULK_TxCompleteFn)(uint32_t len);
 
 uint8_t USBD_VENDOR_BULK_Transmit(uint8_t *buf, uint16_t len);
 uint8_t USBD_VENDOR_BULK_TransmitFrame(const uint8_t *buf, uint32_t len);
+/** Cancel an in-flight stream frame before its backing buffer is reused. */
+void USBD_VENDOR_BULK_AbortFrame(void);
 void USBD_VENDOR_BULK_SetTxCompleteCallback(USBD_VENDOR_BULK_TxCompleteFn cb);
 uint8_t USBD_VENDOR_BULK_TxIdle(void);
 uint8_t USBD_VENDOR_BULK_PollRx(uint8_t *buf, uint16_t max_len, uint16_t *len_out);

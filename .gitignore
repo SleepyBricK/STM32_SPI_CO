@@ -1,5 +1,6 @@
 # Build outputs
 build/
+build*/
 **/build/
 *.o
 *.elf
@@ -20,6 +21,7 @@ EWARM/**/*.ewt
 # IDE / editor
 .vscode/
 .idea/
+.cursor/mcp.json
 *.swp
 *~
 
@@ -35,6 +37,18 @@ Thumbs.db
 CMakeCache.txt
 CMakeFiles/
 compile_commands.json
+
+# Local captures and analysis output
+soak.log
+tools/CC4/
+tools/*.code-workspace
+tools/*.png
+tools/*.csv
+tools/*_stats.txt
+tools/fw_ch_scan_*.txt
+tools/testing/*.csv
+tools/testing/*.png
+tools/third_party/
 
 # Intan reference framework (STM32Cube projects; не коммитить бинарники/HAL tree)
 Intan RHS2116/Intan_RHD_RHS_STM32_Framework_v1_2/**/Debug/
