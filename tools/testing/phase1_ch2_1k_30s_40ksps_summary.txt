@@ -1,0 +1,21 @@
+cmd=SPI_STREAM_FW 1200000 255 0 40
+ksps_per_ch=40
+duration_s=30.0
+channels=0..7
+wall_s=31.075
+sample_clip=0
+stats=samples=9600000 frames_out=4725 spi_xfer32=9600024 xfer_per_resp_x1000=105 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0
+utc=2026-06-24T11:02:57.144939+00:00
+uv_per_code=0.195
+adc_mid=32768
+
+ ch        n       med      med_uv      RMS µV
+------------------------------------------------
+  0   1180000  0x7654     -482.8     4099.3
+  1   1180000  0x71B9     -712.7     4326.9
+  2   1180000  0x7FD6       -8.2       85.8
+  3   1180000  0x6DE8     -903.2     4139.9
+  4   1180000  0xB6A3     2727.5     4749.1
+  5   1180000  0xB074     2418.8     4725.6
+  6   1180000  0xA9E2     2090.8     4939.5
+  7   1180000  0x6EF7     -850.4     4130.8

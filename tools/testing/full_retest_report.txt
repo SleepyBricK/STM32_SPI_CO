@@ -1,0 +1,25 @@
+Full hardware retest — 2026-06-24
+Firmware: Release-HW flashed, git=5ab5ff9eb410
+Fixture: ch2 → 1 kOhm → GND
+
+[PASS] PING → PONG
+[PASS] phase2_hw_test.py (phases 1–3)
+  - STATS: build=Release pscl=8 nss_midi=4 iwdg_reset=0 last_fault=0
+  - NSS_MIDI idle OK
+  - SPI lock during RR8 (nss_midi=4 pscl=8 after NSS_MIDI 2)
+  - STOP during RR8 → OK, fw_dma_err=0
+  - RHS1 strict 32 frames
+  - USB link-down counter 0→1
+
+[PASS] ch_fw_long_suite.py --duration 10 --ksps 40
+  - ch2 RR8: RMS=75 µV clip=0 (all ch0–ch7 RR8 clip=0)
+  - ch2 solo: clip=466 (legacy solo path, not production)
+
+[PASS] ch_fw_record_csv.py --duration 30 --ksps 40
+  - rows=1_200_000/ch wall=30.45s rate≈39.4 kS/s/ch
+  - clip=0 usb_ovf=0 fw_dma_err=0 samples_dropped=0
+  - fw_late_seq=1738 iwdg_reset=0 last_fault=0
+  - ch2 RMS=75.7 µV med=-25 µV
+
+Graphs: tools/testing/full_retest_ch2_1k_30s_*.png
+10s suite: tools/ch_fw8_10s_40ksps.png, tools/ch2_fw_solo_vs_rr8_10s.png
