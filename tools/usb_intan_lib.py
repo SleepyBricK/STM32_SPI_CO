@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import dataclass
 import sys
 import time
 import struct
@@ -18,6 +20,18 @@ FRAME_MAGIC = 0x52485331
 FRAME_VERSION = 1
 _RHS1_HEADER = struct.Struct("<IHHIIIIII")
 _RHS1_FLAG_CHANNEL_TAG = 0x0008
+_RHS1_RR8_FIRST_CHANNEL = 0
+_RHS1_RR8_CHANNELS = 8
+
+
+@dataclass
+class Rhs1FwDecodeState:
+    """State for decoding RR8 FW samples across RHS1 frame boundaries."""
+
+    expected_seq: int | None = 0
+    global_idx: int = 0
+    seq_gaps: int = 0
+    strict_seq: bool = False
 
 
 def validate_rhs1_frame(frame: bytes, expected_frame_seq: int | None = None) -> tuple[int, ...]:
@@ -37,6 +51,47 @@ def validate_rhs1_frame(frame: bytes, expected_frame_seq: int | None = None) -> 
     if expected_frame_seq is not None and frame_seq != (expected_frame_seq & 0xFFFFFFFF):
         raise RuntimeError(f"RHS1 frame sequence gap: got {frame_seq}, expected {expected_frame_seq & 0xFFFFFFFF}")
     return header
+
+
+def iter_rhs1_fw_samples(
+    frame: bytes,
+    state: Rhs1FwDecodeState,
+    *,
+    n_ch: int = _RHS1_RR8_CHANNELS,
+) -> Iterator[tuple[int, int]]:
+    """Decode one RHS1 RR8 frame into (channel, adc_code) samples.
+
+    Untagged frames do not carry channel numbers, so channel assignment must use
+    the frame header phase. Host-side dropped USB frames must not shift channels.
+    """
+    header = validate_rhs1_frame(frame, None)
+    _, _, flags, frame_seq, first_sc, sample_count, _, _, meta = header
+
+    if state.expected_seq is not None:
+        expected = state.expected_seq & 0xFFFFFFFF
+        if frame_seq != expected:
+            state.seq_gaps += 1
+            if state.strict_seq:
+                raise RuntimeError(f"RHS1 frame sequence gap: got {frame_seq}, expected {expected}")
+        state.expected_seq = frame_seq + 1
+
+    tagged = (flags & _RHS1_FLAG_CHANNEL_TAG) != 0
+    if tagged:
+        first_ch = meta & 0xFF
+        ch_count = (meta >> 8) & 0xFF
+        if first_ch != _RHS1_RR8_FIRST_CHANNEL or ch_count != n_ch:
+            raise RuntimeError(f"bad RR8 meta 0x{meta:08X}")
+
+    for i in range(sample_count):
+        if tagged:
+            word = struct.unpack_from("<I", frame, 32 + i * 4)[0]
+            ch = (word >> 16) & 0xF
+            adc = word & 0xFFFF
+        else:
+            adc = struct.unpack_from("<H", frame, 32 + i * 2)[0]
+            ch = (first_sc + i) % n_ch
+        state.global_idx += 1
+        yield ch, adc
 
 
 def find_device(vid: int = VID, pid: int = PID) -> usb.core.Device:

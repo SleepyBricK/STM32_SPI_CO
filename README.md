@@ -4,6 +4,8 @@ Firmware for a custom **STM32H743VIT6** board with USB HS Vendor Bulk streaming 
 
 The development context, board constraints, and production operating mode live in [AGENTS.md](AGENTS.md).
 
+Полная документация: [docs/README.md](docs/README.md).
+
 ## Production mode
 
 The validated acquisition command is:
