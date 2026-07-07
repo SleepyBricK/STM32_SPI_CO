@@ -19,6 +19,7 @@
 | [07_host_tools.md](07_host_tools.md) | Python tools, захват, валидация, ожидаемые `STATS` |
 | [08_development.md](08_development.md) | Структура репозитория, сборка, отладка, правила изменений |
 | [09_troubleshooting.md](09_troubleshooting.md) | Типичные проблемы: USB, clipping, DMA, CS, disconnect |
+| [10_validation_report.md](10_validation_report.md) | Полный отчёт по всем тестам и аппаратной валидации |
 
 ## Специализированные гайды
 
