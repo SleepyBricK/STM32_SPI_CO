@@ -1,0 +1,4 @@
+mcp>=1.0.0
+pyvisa>=1.14.0
+pyvisa-py>=0.7.0
+numpy>=1.24.0

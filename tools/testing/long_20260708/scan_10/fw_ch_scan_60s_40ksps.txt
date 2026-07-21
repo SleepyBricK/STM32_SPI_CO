@@ -1,0 +1,14 @@
+PING: PONG
+ID: OK ID chip=0x0020 raw32=0x00000020
+STATS: samples=19200000 frames_out=9449 spi_xfer32=19200027 xfer_per_resp_x1000=105 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=0 fw_late_seq=5074 samples_dropped=0 iwdg_reset=1 last_fault=0 build_type=Release git=5ab5ff9eb410
+
+
+rr8 ch0: n=2380000 med=0x801F rms=285.7µV rate=39.5 clip=0
+rr8 ch1: n=2380000 med=0x77BB rms=4445.9µV rate=39.5 clip=0
+rr8 ch2: n=2380000 med=0x9C6D rms=4528.6µV rate=39.5 clip=0
+rr8 ch3: n=2380000 med=0xB568 rms=4397.7µV rate=39.5 clip=0
+rr8 ch4: n=2380000 med=0xA6D8 rms=3700.2µV rate=39.5 clip=0
+rr8 ch5: n=2380000 med=0xAE65 rms=3912.6µV rate=39.5 clip=0
+rr8 ch6: n=2380000 med=0xB273 rms=3897.0µV rate=39.5 clip=0
+rr8 ch7: n=2380000 med=0x8FB9 rms=4414.8µV rate=39.5 clip=0
+stats=samples=19200000 frames_out=9449 spi_xfer32=19200024 xfer_per_resp_x1000=105 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=0 fw_late_seq=5033 samples_dropped=0 iwdg_reset=1 last_fault=0 build_type=Release git=5ab5ff9eb410

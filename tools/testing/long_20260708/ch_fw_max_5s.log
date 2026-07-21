@@ -1,0 +1,9 @@
+=== SPI_STREAM_FW_MAX  n=150000/ch  (target ~5.0s) ===
+SPI_STREAM_FW_MAX  n=150000/ch  wall=2.25s
+  per-ch kS/s=66.6  aggregate=532.6  clip=0  usb_ovf=0
+ch0: med=0x8006 RMS=244µV n=150000 clip=0
+ch2: med=0x9E67 RMS=4582µV n=150000 clip=0
+stats -> /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch_fw_max_2s_stats.txt
+saved /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch_fw_max8_2s.png
+saved /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch0_ch2_gnd_max_2s.png
+saved /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch2_fw_max_zoom_1s_2s.png

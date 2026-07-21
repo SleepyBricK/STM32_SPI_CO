@@ -1,0 +1,26 @@
+=== Health ===
+PING: PONG
+ID: OK ID chip=0x0020 raw32=0x00000020
+STATS: samples=19200000 frames_out=9449 spi_xfer32=19200027 xfer_per_resp_x1000=105 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=0 fw_late_seq=5011 samples_dropped=0 iwdg_reset=1 last_fault=0 build_type=Release git=5ab5ff9eb410
+
+=== Solo scan: skipped (production RR8 only) ===
+
+=== RR8 SPI_STREAM_FW 2400000 255 0 40 ===
+STATS: samples=19200000 frames_out=9449 spi_xfer32=19200024 xfer_per_resp_x1000=105 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=0 fw_late_seq=4992 samples_dropped=0 iwdg_reset=1 last_fault=0 build_type=Release git=5ab5ff9eb410
+
+RR8 per-channel
+ ch        n       med      RMS µV      rate    clip
+----------------------------------------------------
+  0  2380000  0x8020       319.8     39.5       0
+  1  2380000  0x77BE      4463.3     39.5       0
+  2  2380000  0x9F31      4531.2     39.5       0
+  3  2380000  0xB735      4397.2     39.5       0
+  4  2380000  0xA79D      3739.2     39.5       0
+  5  2380000  0xAF6E      3923.2     39.5       0
+  6  2380000  0xB2FD      3926.7     39.5       0
+  7  2380000  0x953E      4424.0     39.5       0
+
+saved tools/testing/long_20260708/scan_07/fw_ch_scan_60s_40ksps.txt
+saved tools/testing/long_20260708/scan_07/fw_ch_scan_60s_40ksps_rr8.png
+
+PASS

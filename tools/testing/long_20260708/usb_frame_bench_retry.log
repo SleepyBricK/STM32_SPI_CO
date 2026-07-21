@@ -1,0 +1,5 @@
+run=1/5 samples=50000 errors=0 elapsed=0.008746s ksps=5716.9 payload_MBps=11.434
+run=2/5 samples=50000 errors=0 elapsed=0.008237s ksps=6070.4 payload_MBps=12.141
+run=3/5 samples=50000 errors=0 elapsed=0.009426s ksps=5304.7 payload_MBps=10.609
+run=4/5 samples=50000 errors=0 elapsed=0.008944s ksps=5590.1 payload_MBps=11.180
+run=5/5 samples=50000 errors=0 elapsed=0.008595s ksps=5817.4 payload_MBps=11.635

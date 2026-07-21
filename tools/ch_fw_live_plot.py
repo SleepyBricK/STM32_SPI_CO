@@ -62,6 +62,18 @@ def prep(dev) -> None:
     run_text_command(dev, "CLEAR_ADC", timeout_ms=30000, drain_before=True)
 
 
+def open_live_device(*, reset: bool) -> tuple[object, int]:
+    """Open USB for live viewer. With --no-reset, STOP first (active stream blocks drain_in)."""
+    if reset:
+        dev, ifn = open_device(reset=True)
+        time.sleep(0.3)
+        return dev, ifn
+    print("USB: open без reset — STOP предыдущего stream…", flush=True)
+    dev, ifn = open_device(reset=False, drain=False)
+    run_text_command(dev, "STOP", timeout_ms=15000, drain_before=True)
+    return dev, ifn
+
+
 class ChannelRing:
     """Fixed-size ring buffer of µV samples (one channel)."""
 
@@ -501,9 +513,7 @@ def main() -> int:
     cap = max(1000, int(args.window_s * args.ksps * 1000))
     ylim_uv = None if args.ylim_uv <= 0.0 else args.ylim_uv
 
-    dev, ifn = open_device(reset=args.reset)
-    if args.reset:
-        time.sleep(0.3)
+    dev, ifn = open_live_device(reset=args.reset)
 
     cmd = fw_stream_cmd(STREAM_SAMPLES_INDEFINITE, args.ksps)
     rings = {ch: ChannelRing(cap) for ch in channels}
@@ -575,7 +585,7 @@ def main() -> int:
             warmup_s=args.warmup_s,
             stats_interval_s=args.stats_interval,
         )
-        print("(live until window close / Q)")
+        print("Открываю окно GUI…  (закрыть: Q / Esc)", flush=True)
         app = QtWidgets.QApplication(sys.argv)
         win = LivePlotWindow(
             dev,
@@ -592,6 +602,8 @@ def main() -> int:
         )
         win.resize(1100, 700 if len(channels) <= 2 else 900)
         win.show()
+        win.raise_()
+        win.activateWindow()
         worker.start()
         ret = int(app.exec())
         if win.stop_reply:

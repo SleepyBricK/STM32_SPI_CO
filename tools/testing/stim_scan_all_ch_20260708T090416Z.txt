@@ -1,0 +1,14 @@
+Stim channel scan  UTC=20260708T090416Z  180µA  10kΩ  expect~1.800V  ON=0.3s
+
+ ch  mask    V_max   I_est_uA     err%          R40  verdict
+--------------------------------------------------------------
+  0  ERROR: zero-size array to reduction operation maximum which has no identity
+  1     2   0.0171        1.7   -99.1       0x0003       no
+  2     4   0.0171        1.7   -99.1       0x0007       no
+  3     8   0.0171        1.7   -99.1       0x000D       no
+  4    16   0.0171        1.7   -99.1       0x0011       no
+  5    32   0.0171        1.7   -99.1       0x0021       no
+  6    64   0.0171        1.7   -99.1       0x0041       no
+  7   128   0.0171        1.7   -99.1       0x0001       no
+
+Ни один канал не дал ~1.8 V — проверьте 10kΩ, stim_en, щуп Rigol CH1

@@ -230,6 +230,11 @@ def main() -> int:
         help=f"kS/s на канал (production: {FW_KSPS_DEFAULT})",
     )
     ap.add_argument(
+        "--allow-diagnostic-rate",
+        action="store_true",
+        help="разрешить non-production rate; результат нельзя считать production capture",
+    )
+    ap.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -264,8 +269,11 @@ def main() -> int:
     ap.add_argument("--no-plots", action="store_true", help="только CSV, без PNG")
     args = ap.parse_args()
 
-    if args.ksps != FW_KSPS_DEFAULT:
-        print(f"warning: production rate is {FW_KSPS_DEFAULT} kS/s/ch; requested {args.ksps}")
+    if args.ksps != FW_KSPS_DEFAULT and not args.allow_diagnostic_rate:
+        ap.error(
+            f"production RR8 is fixed at {FW_KSPS_DEFAULT} kS/s/ch; "
+            "pass --allow-diagnostic-rate to override"
+        )
 
     n_per_ch = max(1, int(args.duration * args.ksps * 1000))
     out = args.output

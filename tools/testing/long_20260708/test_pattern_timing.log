@@ -1,0 +1,30 @@
+samples=1200000 frames_out=591 spi_xfer32=1210625 xfer_per_resp_x1000=1008 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=0 fw_late_seq=0 samples_dropped=0 iwdg_reset=1 last_fault=0 build_type=Release git=5ab5ff9eb410
+sysclk_mhz=480
+
+=== GUI pattern ch2 single pulse 100 µs ===
+  loaded: OK PATTERN_STATUS loaded=1 running=0 slots=6 spi=5 delays=1 err=0
+  repeat=  100  wall=   67.53 ms  per_iter=   675.3 µs  (runs: ['65.57', '67.53', '69.30'])
+  repeat=  500  wall=  116.72 ms  per_iter=   233.4 µs  (runs: ['116.72', '116.67', '117.39'])
+  repeat= 1000  wall=  174.75 ms  per_iter=   174.8 µs  (runs: ['177.18', '174.75', '172.60'])
+  → slope (extra per repeat): 119.1 µs/iter
+  → expected delay-only part: ~100 µs/iter (+ SPI fixed overhead)
+
+=== Two pulses ON100 OFF100 ON100 (3×100µs delays) ===
+  loaded: OK PATTERN_STATUS loaded=1 running=0 slots=8 spi=5 delays=3 err=0
+  repeat=  100  wall=   89.36 ms  per_iter=   893.6 µs  (runs: ['89.25', '89.39', '89.36'])
+  repeat=  500  wall=  213.34 ms  per_iter=   426.7 µs  (runs: ['212.73', '213.34', '214.01'])
+  → slope (extra per repeat): 310.0 µs/iter
+  → expected delay-only part: ~300 µs/iter (+ SPI fixed overhead)
+
+=== Baseline: 1000 µs delay only ===
+  loaded: OK PATTERN_STATUS loaded=1 running=0 slots=2 spi=1 delays=1 err=0
+  repeat=   50  wall=  105.72 ms  per_iter=  2114.4 µs  (runs: ['101.52', '105.72', '107.65'])
+  repeat=  200  wall=  258.11 ms  per_iter=  1290.5 µs  (runs: ['258.18', '252.40', '258.11'])
+  repeat=  500  wall=  559.45 ms  per_iter=  1118.9 µs  (runs: ['554.02', '559.69', '559.45'])
+  → slope (extra per repeat): 1008.3 µs/iter
+  → expected delay-only part: ~1000 µs/iter (+ SPI fixed overhead)
+
+Interpretation:
+  slope ≈ sum(PATTERN_ADD_DELAY_US) per iteration (+ ~fixed SPI/post-OFF)
+  if slope ≈ delay/3  → DWT runs ~3× too fast (clock mismatch)
+  if slope ≈ delay×3  → DWT runs ~3× too slow

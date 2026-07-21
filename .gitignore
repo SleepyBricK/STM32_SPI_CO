@@ -48,6 +48,8 @@ tools/*_stats.txt
 tools/fw_ch_scan_*.txt
 tools/testing/*.csv
 tools/testing/*.png
+tools/testing/**/*.csv
+tools/testing/**/*.png
 tools/third_party/
 
 # Intan reference framework (STM32Cube projects; не коммитить бинарники/HAL tree)

@@ -1,0 +1,11 @@
+=== ch2 solo  n=2400000 ksps=40 (~60.0s) ===
+=== FW8  n=2400000/ch ksps=40 (~60.0s) ===
+ch2 solo (после 0.5s skip): med=0x925F RMS=4482µV n=2380000 clip=2944
+ch2 rr8 (после 0.5s skip): med=0x9527 RMS=4551µV n=2380000 clip=0
+ch0 rr8 (после 0.5s skip): med=0x8010 RMS=354µV n=2380000 clip=0
+... (10 lines) -> /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch_fw_long_60s_stats.txt
+saved /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch_fw8_60s_40ksps.png
+saved /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch_fw8_60s_40ksps_rms.png
+saved /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch2_fw_solo_vs_rr8_60s.png
+saved /Users/warforterritory/STM32Cube/WeActSTM32H743/tools/ch2_fw_zoom_1s_60s.png
+wall_timeout budget ~300s

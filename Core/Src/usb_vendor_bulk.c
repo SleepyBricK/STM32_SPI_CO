@@ -5,6 +5,7 @@
 
 #define VENDOR_BULK_CONFIG_DESC_SIZE     32U
 #define VENDOR_BULK_INTERFACE            0U
+#define VENDOR_BULK_RX_QUEUE_DEPTH        4U
 
 static uint8_t USBD_VENDOR_BULK_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
 static uint8_t USBD_VENDOR_BULK_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
@@ -54,15 +55,19 @@ __ALIGN_BEGIN static uint8_t USBD_VENDOR_BULK_DeviceQualifierDesc[USB_LEN_DEV_QU
 };
 
 __ALIGN_BEGIN static uint8_t s_rx[VENDOR_BULK_HS_MAX_PACKET] __ALIGN_END;
-__ALIGN_BEGIN static uint8_t s_pending_rx[VENDOR_BULK_HS_MAX_PACKET] __ALIGN_END;
+__ALIGN_BEGIN static uint8_t
+    s_pending_rx[VENDOR_BULK_RX_QUEUE_DEPTH][VENDOR_BULK_HS_MAX_PACKET] __ALIGN_END;
 __ALIGN_BEGIN static uint8_t s_txt_stash[VENDOR_BULK_HS_MAX_PACKET] __ALIGN_END;
 
 static USBD_HandleTypeDef *s_pdev;
 static volatile uint8_t s_txt_busy;
 static volatile uint8_t s_frame_active;
 static volatile uint32_t s_frame_len;
-static volatile uint8_t s_rx_pending;
-static volatile uint16_t s_rx_len;
+static volatile uint8_t s_rx_read;
+static volatile uint8_t s_rx_write;
+static volatile uint8_t s_rx_count;
+static volatile uint16_t s_rx_len[VENDOR_BULK_RX_QUEUE_DEPTH];
+static volatile uint32_t s_rx_overflow_count;
 static uint8_t s_alt;
 static USBD_VENDOR_BULK_TxCompleteFn s_tx_cb;
 
@@ -89,8 +94,10 @@ static uint8_t USBD_VENDOR_BULK_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   s_txt_busy = 0U;
   s_frame_active = 0U;
   s_frame_len = 0U;
-  s_rx_pending = 0U;
-  s_rx_len = 0U;
+  s_rx_read = 0U;
+  s_rx_write = 0U;
+  s_rx_count = 0U;
+  s_rx_overflow_count = 0U;
 
   USBD_LL_OpenEP(pdev, VENDOR_BULK_IN_EP, USBD_EP_TYPE_BULK, VENDOR_BULK_MAX_PACKET);
   USBD_LL_OpenEP(pdev, VENDOR_BULK_OUT_EP, USBD_EP_TYPE_BULK, VENDOR_BULK_MAX_PACKET);
@@ -107,7 +114,7 @@ static uint8_t USBD_VENDOR_BULK_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   s_pdev = NULL;
   s_txt_busy = 0U;
   s_frame_active = 0U;
-  s_rx_pending = 0U;
+  s_rx_count = 0U;
   return (uint8_t)USBD_OK;
 }
 
@@ -168,15 +175,26 @@ static uint8_t USBD_VENDOR_BULK_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 static uint8_t USBD_VENDOR_BULK_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
   uint32_t n;
+  uint8_t slot;
 
   if ((epnum & 0x7FU) == (VENDOR_BULK_OUT_EP & 0x7FU))
   {
     n = USBD_LL_GetRxDataSize(pdev, epnum);
-    if ((n > 0U) && (n <= VENDOR_BULK_MAX_PACKET) && (s_rx_pending == 0U))
+    if ((n > 0U) && (n <= VENDOR_BULK_MAX_PACKET))
     {
-      USBD_memcpy(s_pending_rx, s_rx, n);
-      s_rx_len = (uint16_t)n;
-      s_rx_pending = 1U;
+      if (s_rx_count < VENDOR_BULK_RX_QUEUE_DEPTH)
+      {
+        slot = s_rx_write;
+        USBD_memcpy(s_pending_rx[slot], s_rx, n);
+        s_rx_len[slot] = (uint16_t)n;
+        s_rx_write = (uint8_t)((slot + 1U) % VENDOR_BULK_RX_QUEUE_DEPTH);
+        s_rx_count++;
+      }
+      else
+      {
+        /* Keep the endpoint armed, but make saturation visible to STATS. */
+        s_rx_overflow_count++;
+      }
     }
     USBD_LL_PrepareReceive(pdev, VENDOR_BULK_OUT_EP, s_rx, VENDOR_BULK_MAX_PACKET);
   }
@@ -268,31 +286,47 @@ uint8_t USBD_VENDOR_BULK_TxIdle(void)
          (s_txt_busy == 0U);
 }
 
+uint32_t USBD_VENDOR_BULK_GetRxOverflowCount(void)
+{
+  return s_rx_overflow_count;
+}
+
 uint8_t USBD_VENDOR_BULK_PollRx(uint8_t *buf, uint16_t max_len, uint16_t *len_out)
 {
   uint16_t n;
+  uint8_t slot;
+  uint32_t primask;
 
-  if ((buf == NULL) || (len_out == NULL) || (s_rx_pending == 0U))
+  if ((buf == NULL) || (len_out == NULL) || (s_rx_count == 0U))
   {
     return 0U;
   }
 
+  primask = __get_PRIMASK();
   __disable_irq();
-  if (s_rx_pending == 0U)
+  if (s_rx_count == 0U)
   {
-    __enable_irq();
+    if (primask == 0U)
+    {
+      __enable_irq();
+    }
     return 0U;
   }
 
-  n = s_rx_len;
+  slot = s_rx_read;
+  n = s_rx_len[slot];
   if (n > max_len)
   {
     n = max_len;
   }
-  USBD_memcpy(buf, s_pending_rx, n);
-  s_rx_pending = 0U;
-  s_rx_len = 0U;
-  __enable_irq();
+  USBD_memcpy(buf, s_pending_rx[slot], n);
+  s_rx_len[slot] = 0U;
+  s_rx_read = (uint8_t)((slot + 1U) % VENDOR_BULK_RX_QUEUE_DEPTH);
+  s_rx_count--;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
 
   *len_out = n;
   return 1U;

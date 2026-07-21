@@ -16,6 +16,7 @@
 
 #define USB_CMD_RX_MAX        256U
 #define USB_REPLY_MAX         512U
+#define USB_REPLY_QUEUE_DEPTH 4U
 #define SPI_STREAM_CHUNK_MAX  (INTAN_DMA_CHUNK_SLOTS - (2U * INTAN_CONVERT_PIPELINE_LATENCY))
 /* Один DMA burst = один USB chunk (cold: n+4 слота, max n = 8188). */
 #define SPI_STREAM_AGG_MAX    SPI_STREAM_CHUNK_MAX
@@ -27,9 +28,22 @@
 #define SPI_REAL_PATH_FAST_POLLING    2U
 #define SPI_REAL_PATH_DMA_TIMSLOT     3U
 
+typedef enum
+{
+  USB_DEFERRED_NONE = 0,
+  USB_DEFERRED_WAIT_EOT,
+  USB_DEFERRED_READY
+} UsbDeferredCommandState;
+
 static UsbStreamStats s_stats;
 static uint8_t s_cmd_rx[USB_CMD_RX_MAX];
-static char s_reply[USB_REPLY_MAX];
+static char s_reply_queue[USB_REPLY_QUEUE_DEPTH][USB_REPLY_MAX];
+static uint16_t s_reply_len[USB_REPLY_QUEUE_DEPTH];
+static uint8_t s_reply_read;
+static uint8_t s_reply_write;
+static uint8_t s_reply_count;
+static UsbCommand s_deferred_cmd;
+static UsbDeferredCommandState s_deferred_cmd_state;
 
 static uint8_t s_synth_active;
 static uint32_t s_synth_remaining;
@@ -164,6 +178,23 @@ static void usb_stream_tx_pump(void)
 
   usb_stream_reap_tx_complete();
 
+  /*
+   * Text replies share the IN endpoint with RHS1 frames.  Send queued replies
+   * first so a fast command sequence cannot silently lose an acknowledgement.
+   */
+  if (s_reply_count != 0U)
+  {
+    st = USBD_VENDOR_BULK_Transmit(
+        (uint8_t *)s_reply_queue[s_reply_read], s_reply_len[s_reply_read]);
+    if (st == (uint8_t)USBD_OK)
+    {
+      s_reply_len[s_reply_read] = 0U;
+      s_reply_read = (uint8_t)((s_reply_read + 1U) % USB_REPLY_QUEUE_DEPTH);
+      s_reply_count--;
+    }
+    return;
+  }
+
   if (s_tx_active != 0U)
   {
     return;
@@ -197,24 +228,33 @@ static void usb_stream_tx_pump(void)
 static void usb_reply_text(const char *text)
 {
   int n;
+  uint8_t slot;
 
-  if (text == NULL)
+  if (text == NULL || s_reply_count >= USB_REPLY_QUEUE_DEPTH)
   {
+    if (text != NULL)
+    {
+      s_stats.usb_tx_errors++;
+    }
     return;
   }
 
-  n = snprintf(s_reply, sizeof(s_reply), "%s\n", text);
+  slot = s_reply_write;
+  n = snprintf(s_reply_queue[slot], USB_REPLY_MAX, "%s\n", text);
   if (n <= 0)
   {
     return;
   }
-  if ((size_t)n >= sizeof(s_reply))
+  if ((size_t)n >= USB_REPLY_MAX)
   {
-    n = (int)sizeof(s_reply) - 1;
-    s_reply[n] = '\0';
+    n = (int)USB_REPLY_MAX - 1;
+    s_reply_queue[slot][n] = '\0';
   }
 
-  (void)USBD_VENDOR_BULK_Transmit((uint8_t *)s_reply, (uint16_t)n);
+  s_reply_len[slot] = (uint16_t)n;
+  s_reply_write = (uint8_t)((slot + 1U) % USB_REPLY_QUEUE_DEPTH);
+  s_reply_count++;
+  usb_stream_tx_pump();
 }
 
 #if (INTAN_HW_PRESENT == 1)
@@ -554,7 +594,7 @@ static void usb_spi_stream_process(void)
 
 static void usb_stats_reply(void)
 {
-  char stats_line[448];
+  char stats_line[480];
   IntanSpiDiagSnapshot clk;
   uint32_t xfer_per_resp_x1000 = 0U;
   uint32_t ksps_from_cyc_x10 = 0U;
@@ -582,7 +622,7 @@ static void usb_stats_reply(void)
   (void)snprintf(stats_line, sizeof(stats_line),
                  "samples=%lu frames_out=%lu spi_xfer32=%lu xfer_per_resp_x1000=%lu "
                  "usb_ovf=%lu spi_ovf=%lu tx_err=%lu sample_clip=%lu rx_off=%lu "
-                 "fw_dma_err=%lu sysclk_mhz=%lu spi_khz=%lu sck_khz=%lu pscl=%lu nss_midi=%lu tim_p=%lu "
+                 "cmd_rx_ovf=%lu fw_dma_err=%lu sysclk_mhz=%lu spi_khz=%lu sck_khz=%lu pscl=%lu nss_midi=%lu tim_p=%lu "
                  "cyc_samp=%lu ksps_cyc_x10=%lu wall_cyc=%lu wall_ksps_x10=%lu "
                  "usb_disconnect=%lu fw_late_seq=%lu samples_dropped=%lu iwdg_reset=%lu last_fault=%lu build_type=%s git=%s",
                  (unsigned long)s_stats.samples_produced,
@@ -594,6 +634,7 @@ static void usb_stats_reply(void)
                  (unsigned long)s_stats.usb_tx_errors,
                  (unsigned long)Intan_GetSampleClipCount(),
                  (unsigned long)Intan_GetLastUnpackRxOffset(),
+                 (unsigned long)USBD_VENDOR_BULK_GetRxOverflowCount(),
                  (unsigned long)IntanFw_GetDmaErrorCount(),
                  (unsigned long)(SystemCoreClock / 1000000U),
                  (unsigned long)(clk.spi_kernel_hz / 1000U),
@@ -1484,6 +1525,10 @@ void UsbStreamService_Init(void)
 {
   memset(&s_stats, 0, sizeof(s_stats));
   Intan_SpiDiag_Init();
+  s_reply_read = 0U;
+  s_reply_write = 0U;
+  s_reply_count = 0U;
+  s_deferred_cmd_state = USB_DEFERRED_NONE;
   usb_stream_reset_all();
   Intan_SetIdleHook(usb_spi_idle_hook, NULL);
   USBD_VENDOR_BULK_SetTxCompleteCallback(usb_stream_on_frame_tx_complete);
@@ -1530,25 +1575,98 @@ uint32_t UsbStreamService_GetUsbOverflowCount(void)
   return s_stats.usb_overflow_count;
 }
 
+static uint8_t usb_command_requires_stream_reset(UsbCommandId id)
+{
+  switch (id)
+  {
+    case USB_CMD_SYNTH_STREAM:
+    case USB_CMD_SPI_STREAM:
+    case USB_CMD_SPI_STREAM_REAL:
+    case USB_CMD_SPI_STREAM_REAL_FAST:
+    case USB_CMD_SPI_STREAM_REAL_SLOT:
+    case USB_CMD_SPI_STREAM_REAL_LEGACY:
+    case USB_CMD_SPI_STREAM_FW:
+    case USB_CMD_SPI_STREAM_FW_MAX:
+    case USB_CMD_SPI_STREAM_RR8:
+    case USB_CMD_SPI_STREAM_RR8_REAL:
+    case USB_CMD_SPI_STREAM_RR8_REAL_SLOT:
+    case USB_CMD_SPI_STREAM_RR16_REAL:
+    case USB_CMD_SPI_STREAM_RANGE_REAL:
+    case USB_CMD_SPI_STREAM_RANGE_REAL_SLOT:
+    case USB_CMD_SPI_TO_RAM:
+    case USB_CMD_SPI_TO_RAM_FAST:
+    case USB_CMD_SPI_TO_RAM_RR8:
+    case USB_CMD_SPI_RATE:
+    case USB_CMD_SPI_RATE_FAST:
+    case USB_CMD_SPI_RATE_RR8:
+    case USB_CMD_ID:
+    case USB_CMD_READ:
+    case USB_CMD_WRITE:
+    case USB_CMD_INIT_RECORD:
+    case USB_CMD_INIT_STIM:
+    case USB_CMD_CLEAR_ADC:
+    case USB_CMD_CLEAR_COMP:
+    case USB_CMD_CONVERT:
+    case USB_CMD_IMPEDANCE_MEASURE:
+    case USB_CMD_PATTERN_CLEAR:
+    case USB_CMD_PATTERN_ADD_RAW:
+    case USB_CMD_PATTERN_ADD_WRITE:
+    case USB_CMD_PATTERN_ADD_READ:
+    case USB_CMD_PATTERN_ADD_CONVERT:
+    case USB_CMD_PATTERN_ADD_CLEAR_ADC:
+    case USB_CMD_PATTERN_ADD_CLEAR_COMP:
+    case USB_CMD_PATTERN_ADD_DELAY_CYC:
+    case USB_CMD_PATTERN_ADD_DELAY_US:
+    case USB_CMD_PATTERN_STATUS:
+    case USB_CMD_PATTERN_RUN:
+      return 1U;
+
+    default:
+      return 0U;
+  }
+}
+
 void UsbVendorBulk_ProcessOutCommands(void)
 {
   uint16_t rx_len;
   char line[USB_CMD_RX_MAX];
   UsbCommand cmd;
 
-  if (USBD_VENDOR_BULK_PollRx(s_cmd_rx, sizeof(s_cmd_rx), &rx_len) == 0U)
+  if (s_deferred_cmd_state == USB_DEFERRED_WAIT_EOT)
   {
     return;
   }
 
-  if (rx_len >= sizeof(line))
+  if (s_deferred_cmd_state == USB_DEFERRED_READY)
   {
-    rx_len = (uint16_t)(sizeof(line) - 1U);
+    cmd = s_deferred_cmd;
+    s_deferred_cmd_state = USB_DEFERRED_NONE;
   }
-  memcpy(line, s_cmd_rx, rx_len);
-  line[rx_len] = '\0';
+  else
+  {
+    if (USBD_VENDOR_BULK_PollRx(s_cmd_rx, sizeof(s_cmd_rx), &rx_len) == 0U)
+    {
+      return;
+    }
 
-  cmd = UsbCommands_ParseLine(line);
+    if (rx_len >= sizeof(line))
+    {
+      rx_len = (uint16_t)(sizeof(line) - 1U);
+    }
+    memcpy(line, s_cmd_rx, rx_len);
+    line[rx_len] = '\0';
+    cmd = UsbCommands_ParseLine(line);
+
+    if (usb_command_requires_stream_reset(cmd.id) != 0U &&
+        IntanFw_StreamIsBusy() != 0U)
+    {
+      /* Request an EOT-safe stop; dispatch this command after DMA is idle. */
+      s_deferred_cmd = cmd;
+      s_deferred_cmd_state = USB_DEFERRED_WAIT_EOT;
+      IntanFw_RequestStop();
+      return;
+    }
+  }
 
   switch (cmd.id)
   {
@@ -2126,23 +2244,38 @@ void UsbStreamService_ProcessStopRequest(void)
     /* The ISR only latched disconnect; endpoint abort and ring reset run in main. */
     usb_stream_reset_all();
     s_disconnect_stop_requested = 0U;
+    s_deferred_cmd_state = USB_DEFERRED_NONE;
     return;
   }
 
-  if (s_stop_requested == 0U)
+  if (s_stop_requested != 0U)
   {
+    if (IntanFw_StreamIsBusy() != 0U)
+    {
+      return;
+    }
+
+    /* Now no SPI/DMA user can retain a ring buffer: abort IN before resetting the ring. */
+    usb_stream_reset_all();
+    s_stop_requested = 0U;
+    s_deferred_cmd_state = USB_DEFERRED_NONE;
+    usb_reply_text("OK");
+
     return;
   }
 
-  if (IntanFw_StreamIsBusy() != 0U)
+  if (s_deferred_cmd_state == USB_DEFERRED_WAIT_EOT &&
+      IntanFw_StreamIsBusy() == 0U)
   {
-    return;
+    /*
+     * IntanFw_Process consumed RequestStop only after the in-flight DMA
+     * sequence reached EOT.  Dispatch immediately from this main-loop path:
+     * the DWT hot loop exits as soon as s_active becomes zero, so waiting for
+     * a later outer-loop pass can otherwise leave the request unserved.
+     */
+    s_deferred_cmd_state = USB_DEFERRED_READY;
+    UsbVendorBulk_ProcessOutCommands();
   }
-
-  /* Now no SPI/DMA user can retain a ring buffer: abort IN before resetting the ring. */
-  usb_stream_reset_all();
-  s_stop_requested = 0U;
-  usb_reply_text("OK");
 }
 
 uint8_t UsbStreamService_IsDisconnectTeardownInProgress(void)

@@ -54,9 +54,10 @@
 - `255` означает RR8: каналы 0..7, восемь `CONVERT` на последовательность.
 - `INTAN_FW_KSPS_DEFAULT` = 40 kS/s/ch. Пропущенный или нулевой `ksps` также выбирает 40.
 - RR8 с `ksps >= 15` использует DWT phase-paced hot loop, а не TIM6.
+- После EOT каждый RR8 DMA sequence полностью завершает и re-arm'ит SPI/DMA перед следующей sequence; нельзя возвращать CSTART-only restart, иначе при длительном захвате появляется общий побитовый уход ADC к нулю.
 - Для production RR8 (`ksps=40`) перед стартом принудительно применяются `PSCL=8` и `MIDI=4`; `NSS_MIDI` и `SPI_PSCL` во время active/armed FW stream отвечают `ERR busy`. Legacy/solo и rate diagnostic пути остаются tunable.
 - `STOP` в hot loop принимается через OUT, завершает текущую DMA sequence на EOT и только затем abort'ит активный USB frame и сбрасывает ring. DMA sequence имеет 1 ms DWT deadline; production RR8 останавливается и увеличивает `fw_dma_err` только по timeout. `Intan_FwSpiDmaHasError()` остаётся диагностическим: H7 master status (включая `SPI_SR_UDR`, slave-TX flag) даёт false positive и не используется в hot loop.
-- Валидировано: 10 s, `sample_clip=0`, `usb_ovf=0`; ch2 с 10 kOhm на GND около 64 uV RMS.
+- Валидировано: 300 s RR8, `sample_clip=0`, `usb_ovf=0`, `fw_dma_err=0`, `samples_dropped=0`; ch0 с 10 kOhm на GND имеет median около 16 uV и RMS около 139 uV.
 - Не использовать для production: `ksps >= 55`, `SPI_STREAM_FW_MAX` и solo stream перед RR8.
 
 Legacy `SPI_STREAM_REAL*`, RR/range и slot-DMA команды остаются диагностическими. Перед ними требуется `INIT_RECORD` и priming `CONVERT H=1`; не подменяйте ими RR8 production-path.
@@ -69,6 +70,9 @@ Legacy `SPI_STREAM_REAL*`, RR/range и slot-DMA команды остаются 
 - Ring: 32 фрейма, ready FIFO глубиной 64; буферы находятся в D2 SRAM и MPU-помечены non-cacheable.
 - USB PCD работает без peripheral DMA (`dma_enable=DISABLE`).
 - Один endpoint IN разделён текстовыми ответами и frame-потоком. При `STOP` или новой команде активный frame transfer прерывается на endpoint до сброса ring, чтобы не переиспользовать его буфер.
+- OUT-команды хранятся в статической FIFO из четырёх пакетов. Переполнение не теряется молча: счётчик `cmd_rx_ovf` появляется в `STATS`.
+- Текстовые ответы IN также хранятся в FIFO из четырёх сообщений и отправляются перед RHS1 frame, поэтому быстрые команды не теряют acknowledgement.
+- Команда, требующая reset потока, во время FW acquisition сначала вызывает `IntanFw_RequestStop()` и исполняется сразу после EOT текущей DMA sequence.
 - Producer не ждёт USB. При нехватке фреймов инкрементируется `usb_overflow_count`.
 
 RHS1 metadata: `reserved[7:0]` -- first channel, `[15:8]` -- channel count, `[23:16]` -- CONVERT flags, `[26:24]` -- bits per channel tag.

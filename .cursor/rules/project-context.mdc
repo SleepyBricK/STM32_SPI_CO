@@ -15,6 +15,8 @@ alwaysApply: true
 
 MCP: `codex` (в рантайме может быть с префиксом проекта, например `project-0-…-codex`). Инструменты: `codex`, `codex-reply`.
 
+MCP: `rigol-scope` — Rigol DHO804 по USB/SCPI (`tools/mcp_rigol_scope/`). Cursor: `.cursor/mcp.json`.
+
 ## Ключевые ограничения
 
 - Production acquisition: `SPI_STREAM_FW n 255 0 40` — RR8, 40 kS/s/ch.

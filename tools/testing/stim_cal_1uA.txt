@@ -1,0 +1,22 @@
+Stim current calibration  load=10000 Ω  ch=0
+Rigol=USB0::6833::1101::DHO8A272405662::0::INSTR  scope_ch=1
+
+STATS: samples=65024 frames_out=0 spi_xfer32=245979 xfer_per_resp_x1000=3782 usb_ovf=44204 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=1 fw_late_seq=0 samples_dropped=176816 iwdg_reset=1 last_fault=0 build_type=Release git=5ab5ff9eb410
+READ 34 before: OK READ reg=34 value=0x005E
+
+=== Reg34 step 1uA  R34=0x00e2  R35=0x00aa  step=1.0 µA/LSB ===
+ target µA  mag_nom    V_avg V  I_meas µA    err %
+        50       50     2.1248      212.5  +324.97
+       100      100     2.1675      216.8  +116.75
+       180      180     2.1675      216.8   +20.42
+       255      255     2.1675      216.8   -15.00
+  → median gain factor (I_meas / mag / step_ua): 1.6858
+
+ target µA  mag_cal    V_avg V  I_meas µA    err %
+        50       30     1.9286      192.9  +285.71
+       100       59     2.0537      205.4  +105.37
+       180      107     2.0480      204.8   +13.78
+       255      151     2.1675      216.8   -15.00
+
+OK READ reg=42 value=0x0000
+OK READ reg=40 value=0x0000

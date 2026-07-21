@@ -31,6 +31,8 @@ void USBD_VENDOR_BULK_AbortFrame(void);
 void USBD_VENDOR_BULK_SetTxCompleteCallback(USBD_VENDOR_BULK_TxCompleteFn cb);
 uint8_t USBD_VENDOR_BULK_TxIdle(void);
 uint8_t USBD_VENDOR_BULK_PollRx(uint8_t *buf, uint16_t max_len, uint16_t *len_out);
+/** Number of OUT command packets rejected because the static queue was full. */
+uint32_t USBD_VENDOR_BULK_GetRxOverflowCount(void);
 
 #ifdef __cplusplus
 }

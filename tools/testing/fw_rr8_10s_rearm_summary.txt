@@ -1,0 +1,21 @@
+cmd=SPI_STREAM_FW 400000 255 0 40
+ksps_per_ch=40
+duration_s=10.0
+channels=0..7
+wall_s=10.328
+sample_clip=0
+stats=samples=3200000 frames_out=1575 spi_xfer32=3200024 xfer_per_resp_x1000=1000 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 cmd_rx_ovf=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=0 fw_late_seq=4140 samples_dropped=0 iwdg_reset=0 last_fault=0 build_type=Release git=9e0c6a0d3ad1
+utc=2026-07-21T11:14:40.108495+00:00
+uv_per_code=0.195
+adc_mid=32768
+
+ ch        n       med      med_uv      RMS µV
+------------------------------------------------
+  0    380000  0x8052       16.0      137.8
+  1    380000  0x629D    -1467.0     4415.9
+  2    380000  0x75C2     -511.3     4640.8
+  3    380000  0x78E6     -354.5     4680.5
+  4    380000  0xB379     2569.5     4201.7
+  5    380000  0xAE42     2309.2     4450.1
+  6    380000  0xB6CD     2735.7     4466.5
+  7    380000  0x8292      128.3     4612.4

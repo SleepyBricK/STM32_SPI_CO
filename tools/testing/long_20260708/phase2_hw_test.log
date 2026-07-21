@@ -1,0 +1,18 @@
+=== Phase 3 HW test suite ===
+
+✓ STATS fingerprint / phase 3 observability: build=Release git=5ab5ff9eb410 pscl=8 midi=4 iwdg_reset=1 last_fault=0
+✓ NSS_MIDI idle: OK
+✓ SPI lock during stream: nss_midi=4 pscl=8
+✓ STOP during RR8: reply=OK frames~315 fw_dma_err=0
+✓ RHS1 strict: frames=32 validation_ok
+✓ USB disconnect counter: usb_disconnect 0 -> 1
+
+=== Summary ===
+  [PASS] STATS fingerprint / phase 3 observability: build=Release git=5ab5ff9eb410 pscl=8 midi=4 iwdg_reset=1 last_fault=0
+  [PASS] NSS_MIDI idle: OK
+  [PASS] SPI lock during stream: nss_midi=4 pscl=8
+  [PASS] STOP during RR8: reply=OK frames~315 fw_dma_err=0
+  [PASS] RHS1 strict: frames=32 validation_ok
+  [PASS] USB disconnect counter: usb_disconnect 0 -> 1
+
+All tests passed.

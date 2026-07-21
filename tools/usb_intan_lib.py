@@ -111,9 +111,13 @@ def bus_reset(vid: int = VID, pid: int = PID, settle_s: float = 1.5) -> usb.core
     return find_device(vid, pid)
 
 
-def drain_in(dev: usb.core.Device, timeout_ms: int = 50) -> int:
+def drain_in(dev: usb.core.Device, timeout_ms: int = 50, max_ms: float = 0.0) -> int:
+    """Drain EP IN. If max_ms > 0, stop after that wall time (avoids hang on active stream)."""
     total = 0
+    deadline = (time.perf_counter() + max_ms / 1000.0) if max_ms > 0.0 else None
     while True:
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
         try:
             chunk = bytes(dev.read(EP_IN, FRAME_SIZE, timeout=timeout_ms))
         except usb.core.USBTimeoutError:

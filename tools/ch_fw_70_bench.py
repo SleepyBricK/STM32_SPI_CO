@@ -24,8 +24,19 @@ def main() -> int:
     ap.add_argument("--ksps", type=int, default=FW_KSPS_DEFAULT, help="kS/s per channel (production: 40)")
     ap.add_argument("--duration", type=float, default=3.0, help="seconds per channel")
     ap.add_argument("--midi", type=int, default=None, help="optional NSS_MIDI before stream")
+    ap.add_argument(
+        "--allow-diagnostic-rate",
+        action="store_true",
+        help="allow a non-production rate; resulting data are not production-valid",
+    )
     ap.add_argument("--reset", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
+
+    if args.ksps != FW_KSPS_DEFAULT and not args.allow_diagnostic_rate:
+        ap.error(
+            f"production RR8 is fixed at {FW_KSPS_DEFAULT} kS/s/ch; "
+            "pass --allow-diagnostic-rate to override"
+        )
 
     n = max(1000, int(args.duration * args.ksps * 1000))
     dev, ifn = open_device(reset=args.reset)

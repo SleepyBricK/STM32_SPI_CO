@@ -16,7 +16,8 @@ def main() -> int:
     parser.add_argument(
         "--reset",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
+        help="reset USB device before command (unsafe during an active recording)",
     )
     parser.add_argument("--no-drain", action="store_true")
     args = parser.parse_args()

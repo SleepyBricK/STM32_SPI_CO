@@ -349,16 +349,15 @@ static void fw_spi_dma_complete(void)
 
   if (keep_live != 0U)
   {
-    fw_dwt_pace_before_start();
-
-    if (Intan_FwSpiDmaRestart(INTAN_FW_WORDS_PER_SEQ) == HAL_OK)
-    {
-      s_xfer_start_cyc = DWT->CYCCNT;
-      s_xfer_state = FW_XFER_WAIT;
-      return;
-    }
-
-    Intan_BumpSampleClip();
+    /*
+     * Re-arm SPI and DMA for every sequence.  A lightweight CSTART-only
+     * restart allowed the H7 peripheral state to accumulate over long RR8
+     * captures, eventually shifting every RHS2116 response toward zero.
+     */
+    Intan_FwSpiDmaEnd();
+    s_xfer_state = FW_XFER_IDLE;
+    fw_try_start_sequence();
+    return;
   }
 
   Intan_FwSpiDmaEnd();

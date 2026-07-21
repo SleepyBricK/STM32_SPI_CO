@@ -14,7 +14,7 @@ The validated acquisition command is:
 SPI_STREAM_FW <samples-per-channel> 255 0 40
 ```
 
-It captures channels `0..7` (RR8) at **40 kS/s/ch**. A missing or zero `ksps` argument resolves to the same safe default. This mode uses the DWT phase-paced acquisition path and is the only production configuration. A production RR8 start restores the validated SPI timing (`PSCL=8`, `MIDI=4`); `NSS_MIDI` and `SPI_PSCL` return `ERR busy` while a Framework stream is active or armed.
+It captures channels `0..7` (RR8) at **40 kS/s/ch**. A missing or zero `ksps` argument resolves to the same safe default. This mode uses the DWT phase-paced acquisition path and is the only production configuration. After every EOT, RR8 fully re-arms SPI/DMA before starting the next sequence; this prevents cumulative response-word drift in long captures. A production RR8 start restores the validated SPI timing (`PSCL=8`, `MIDI=4`); `NSS_MIDI` and `SPI_PSCL` return `ERR busy` while a Framework stream is active or armed.
 
 ## Hardware
 
@@ -68,7 +68,7 @@ The binary stream uses `RHS1` frames of exactly 4096 bytes:
 
 The frame ABI is defined in [usb_stream_frame.h](Core/Inc/usb_stream_frame.h). `reserved` contains stream metadata: first channel, channel count, CONVERT flags, and channel-tag width.
 
-The USB PCD intentionally runs without peripheral DMA. The producer does not wait for USB; a full ring increments `usb_overflow_count` and `samples_dropped`. `STOP` and USB disconnect are deferred to main, complete the current SPI DMA sequence at EOT, then abort an active frame transfer before the ring buffer is reset. Production RR8 recovery is timeout-only: a missing EOT at the 1 ms DWT deadline aborts the Framework DMA sequence and increments `fw_dma_err`; a DWT phase resync increments `fw_late_seq`. `STATS` appends these counters, `usb_disconnect`, and the CMake build fingerprint (`build_type`, `git`). `Intan_FwSpiDmaHasError()` remains diagnostic only because H7 master SPI status can report false positives; `SPI_SR_UDR` is slave-TX-only.
+The USB PCD intentionally runs without peripheral DMA. OUT commands are queued in four static slots; saturation increments `cmd_rx_ovf` in `STATS` instead of silently discarding a packet. Text replies use a separate four-slot FIFO and are transmitted before RHS1 frames, so command acknowledgements are not silently lost. The producer does not wait for USB; a full ring increments `usb_overflow_count` and `samples_dropped`. `STOP`, USB disconnect, and a command that requires stream reset are deferred to main, complete the current SPI DMA sequence at EOT, then abort an active frame transfer before the ring buffer is reset. Production RR8 recovery is timeout-only: a missing EOT at the 1 ms DWT deadline aborts the Framework DMA sequence and increments `fw_dma_err`; a DWT phase resync increments `fw_late_seq`. `STATS` appends these counters, `usb_disconnect`, and the CMake build fingerprint (`build_type`, `git`). `Intan_FwSpiDmaHasError()` remains diagnostic only because H7 master SPI status can report false positives; `SPI_SR_UDR` is slave-TX-only.
 
 IWDG1 has a nominal 3 s timeout and is refreshed only from the healthy main path. `STATS` adds `iwdg_reset` and retained `last_fault` (`1..5`: Hard/Mem/Bus/Usage/NMI); fault context is retained in `.noinit` D3 SRAM and the watchdog-reset indication is mirrored in an RTC backup register.
 

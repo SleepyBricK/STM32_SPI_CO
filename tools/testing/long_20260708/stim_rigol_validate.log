@@ -1,0 +1,38 @@
+Stim Rigol validation  UTC=20260708T095856Z
+ch=0  current=180 µA  load=10 kΩ  expected V=1.800
+rigol=USB0::6833::1101::DHO8A272405662::0::INSTR  scope_ch=1
+
+STATS: samples=1200000 frames_out=591 spi_xfer32=1200250 xfer_per_resp_x1000=1000 usb_ovf=0 spi_ovf=0 tx_err=0 sample_clip=0 rx_off=0 fw_dma_err=0 sysclk_mhz=480 spi_khz=200000 sck_khz=25000 pscl=8 nss_midi=4 tim_p=0 cyc_samp=0 ksps_cyc_x10=0 wall_cyc=0 wall_ksps_x10=0 usb_disconnect=0 fw_late_seq=0 samples_dropped=0 iwdg_reset=1 last_fault=0 build_type=Release git=5ab5ff9eb410
+
+=== Wall-clock DWT timing (channel-independent) ===
+
+=== 1000 µs delay only ===
+  loaded: OK PATTERN_STATUS loaded=1 running=0 slots=2 spi=1 delays=1 err=0
+  repeat=   50  wall=  103.77 ms  per_iter=  2075.4 µs  (runs: ['101.90', '107.54', '103.77'])
+  repeat=  200  wall=  255.09 ms  per_iter=  1275.4 µs  (runs: ['255.09', '252.30', '258.21'])
+  → slope (extra per repeat): 1008.8 µs/iter
+  → expected delay-only part: ~1000 µs/iter (+ SPI fixed overhead)
+
+=== ch0 single 100 µs pulse ===
+  loaded: OK PATTERN_STATUS loaded=1 running=0 slots=6 spi=5 delays=1 err=0
+  repeat=  100  wall=   68.70 ms  per_iter=   687.0 µs  (runs: ['64.29', '69.30', '68.70'])
+  repeat=  500  wall=  113.11 ms  per_iter=   226.2 µs  (runs: ['117.27', '113.11', '112.81'])
+  → slope (extra per repeat): 111.0 µs/iter
+  → expected delay-only part: ~100 µs/iter (+ SPI fixed overhead)
+
+=== Rigol amplitude cal (500 ms ON) ===
+V_max=2.1675 V  V_pp=2.2528 V  I_est=216.8 µA  err=+20.4%
+PASS amplitude
+
+=== Rigol pulse 100 µs ===
+width=2.0 µs  err=-98.0%  pulses=1
+
+=== Rigol duration sweep ===
+OK PATTERN_STATUS loaded=1 running=0 slots=54 spi=41 delays=13 err=0
+  #  exp_us   meas_us    err%   ok
+
+OK READ reg=42 value=0x0000
+OK READ reg=40 value=0x0000
+OK READ reg=50 value=0x0000
+
+Report: tools/testing/long_20260708/stim_rigol_ch0_20260708T095856Z_report.txt

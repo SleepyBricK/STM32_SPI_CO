@@ -66,8 +66,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="SPI_STREAM_FW_MAX throughput bench")
     ap.add_argument("--n", type=int, default=5000, help="samples per channel (sequences for ch=255)")
     ap.add_argument("--ch", type=int, default=255, help="255=all 16, or 0..15 single")
+    ap.add_argument(
+        "--allow-unsafe-fw-max",
+        action="store_true",
+        help="acknowledge that FW_MAX is diagnostic and not production-valid",
+    )
     ap.add_argument("--reset", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
+
+    if not args.allow_unsafe_fw_max:
+        ap.error("SPI_STREAM_FW_MAX is diagnostic; pass --allow-unsafe-fw-max to run it")
 
     dev, ifn = open_device(reset=args.reset)
     if args.reset:
